@@ -1,0 +1,180 @@
+{
+  "_comment": [
+    "SECURITY FINDINGS POLICY. Operator rule, 2026-09-08.",
+    "",
+    "The blanket rules are not negotiable by an agent:",
+    "  CRITICAL and HIGH  -- must fix. No acceptance path exists.",
+    "  MEDIUM             -- situation and posture dependent.",
+    "  LOW                -- acceptable.",
+    "",
+    "FOR A PRODUCTION RELEASE, every TRACTABLE medium and low is fixed too. The",
+    "exception is a medium or low that AN ATTACKER CANNOT REACH given the actual",
+    "posture and architecture -- those are allowed, and must be ANNOTATED so the",
+    "decision is revisitable rather than forgotten. A release is not blocked on an",
+    "unreachable low.",
+    "",
+    "The annotation is what makes this a decision instead of a silence. An",
+    "unannotated accepted finding is indistinguishable from a finding nobody",
+    "looked at -- the same defect as the stub contract, in a place where it costs",
+    "more."
+  ],
+  "version": 1,
+  "severity": {
+    "critical": {
+      "action": "must-fix",
+      "blocks_merge": true,
+      "acceptable": false,
+      "annotation_allowed": false,
+      "why": "no acceptance path. An agent may not annotate its way past a critical."
+    },
+    "high": {
+      "action": "must-fix",
+      "blocks_merge": true,
+      "acceptable": false,
+      "annotation_allowed": false,
+      "why": "blanket rule, same as critical"
+    },
+    "medium": {
+      "action": "fix-if-tractable",
+      "blocks_merge": false,
+      "blocks_release": true,
+      "acceptable": true,
+      "annotation_allowed": true,
+      "why": "situation and posture dependent. Fix it for a release unless it is genuinely unreachable, and say why."
+    },
+    "low": {
+      "action": "fix-if-tractable",
+      "blocks_merge": false,
+      "blocks_release": false,
+      "acceptable": true,
+      "annotation_allowed": true,
+      "why": "acceptable day to day; fixed for a release when tractable"
+    }
+  },
+  "acceptance_annotation": {
+    "_comment": [
+      "How a medium or low is accepted. Modelled on the stub contract for the same",
+      "reason: a marker with no reason is a way to silence the scanner, and a",
+      "reason someone can read is a claim they can disagree with.",
+      "",
+      "REACHABLE must argue from the POSTURE, not from the code being careful.",
+      "'input is validated' is a code claim and can regress silently. 'no path",
+      "from any network input reaches this argv, and the service binds loopback",
+      "only' is an architecture claim, and the architecture is what the operator",
+      "reasons about."
+    ],
+    "marker": "SEC-ACCEPTED",
+    "required_fields": [
+      "SEVERITY",
+      "REACHABLE",
+      "REVISIT"
+    ],
+    "example": "# SEC-ACCEPTED: S603 subprocess-without-shell\n# SEVERITY: low\n# REACHABLE: no \u2014 argv is a fixed list plus a repo path from the unit file; no\n#            network input reaches it, and the service has no shell\n# REVISIT: if this ever takes a path from a webhook body",
+    "rules": [
+      "critical and high may NEVER carry this marker; a scanner finding at those levels is a defect to fix",
+      "REACHABLE must state an architectural reason, not that the code is careful",
+      "an annotation without all three fields is treated as UNANNOTATED and the finding stands"
+    ]
+  },
+  "scanners": {
+    "_comment": "Self-hosted only. A scanner that is not installed is REPORTED AS ABSENT, never silently treated as clean -- that is the same lie as a skipped CI job reading as success.",
+    "secrets": {
+      "tool": "gitleaks",
+      "command": [
+        "gitleaks",
+        "detect",
+        "--no-banner",
+        "--redact",
+        "--report-format",
+        "json",
+        "--report-path",
+        "{tmpfile}"
+      ],
+      "severity_of_any_finding": "critical",
+      "why": "a committed credential is reachable by definition -- it is already published to everyone with repo access",
+      "_defect": "`--report-path -` does NOT write to stdout: gitleaks creates a file literally named `-` in the working directory and prints only its banner. Parsed from stdout it reports zero secrets for every repo forever, and litters each one with a file called `-`. The scanner substitutes a temp path for {tmpfile}. This config shipped the defect its own policy is meant to catch."
+    },
+    "python_sast": {
+      "tool": "ruff",
+      "command": [
+        "ruff",
+        "check",
+        "--select",
+        "S",
+        "--output-format",
+        "json",
+        "."
+      ],
+      "note": "flake8-bandit is built into ruff as the S rules, so Python SAST comes free with the house lint standard rather than needing a separate scanner",
+      "default_severity": "medium"
+    },
+    "sast": {
+      "tool": "semgrep",
+      "command": [
+        "semgrep",
+        "--config",
+        "auto",
+        "--json",
+        "--quiet"
+      ],
+      "severity_map": {
+        "ERROR": "high",
+        "WARNING": "medium",
+        "INFO": "low"
+      }
+    },
+    "deps": {
+      "tool": "osv-scanner",
+      "command": [
+        "osv-scanner",
+        "--format",
+        "json",
+        "-r",
+        "."
+      ],
+      "severity_from": "CVSS"
+    },
+    "rust_deps": {
+      "tool": "cargo-audit",
+      "command": [
+        "cargo",
+        "audit",
+        "--json"
+      ],
+      "applies_to": "rust"
+    },
+    "containers": {
+      "tool": "trivy",
+      "command": [
+        "trivy",
+        "fs",
+        "--quiet",
+        "--format",
+        "json",
+        "."
+      ],
+      "note": "present on fleet-ci-base:1 but not on host-a"
+    }
+  },
+  "gates": {
+    "merge": {
+      "blocks_on": [
+        "critical",
+        "high"
+      ],
+      "why": "the blanket rule. Everything else is release-time or annotated."
+    },
+    "release": {
+      "blocks_on": [
+        "critical",
+        "high",
+        "medium"
+      ],
+      "allows_annotated": [
+        "medium",
+        "low"
+      ],
+      "why": "every tractable medium and low is fixed for a release; an unreachable one is allowed WITH its annotation, and a release is never blocked on it"
+    }
+  }
+}

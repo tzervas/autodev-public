@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Curate autodev's own scoped RAG collection (``autodev-kb``) from source.
+
+This is the curation pipeline the ratified identity/sandbox design calls for
+(``autodev-service-identity-and-sandbox``): a SEPARATE Qdrant collection built
+by curating a deliberate, named subset of source documents — not a copy of
+points from any shared collection (``tzervas-dev-kb``, ``fleet-model-kb``,
+``fleet-csd-kb``, ``fleet-gap-kb``, ``fleet-harness-kb``).
+
+Scope (operator, 2026-09-07): the collection must be scoped to the tasks
+autodev is actually working — the relevant repos, relevant official docs, and
+the intended paradigms/patterns/tools. Explicitly NOT a copy of the big store.
+
+**What is in MANIFEST and why**
+
+Autodev's Forgejo collaborator grant covers exactly two repos —
+``tzervas/CogSynDelta`` and ``tzervas/memory-gate`` — so the curated corpus
+mirrors that write scope 1:1: knowledge about a repo autodev cannot touch is
+not "relevant to the tasks being worked". Within each repo:
+
+- CogSynDelta: ``AGENTS.md`` (conventions/paradigms/patterns/tools — the repo's
+  own dev contract), every ``docs/adr/*.md`` (not ``archive/`` — superseded),
+  the architecture/contract/spec docs under ``docs/design/`` (corpus contract,
+  interconnect spec, licence verdicts, metrics methodology, model manifests,
+  training stack, region taxonomy, training superset, visual ingest,
+  completion plan, state-vs-plan), the decision/pre-registration documents
+  under ``docs/design/evidence/**`` (``PREREG.md``, ``GO_KILL.md``,
+  ``BATTERY-DEFECT.md``, ``README.md`` — every evidence dir's verdict, not its
+  raw survey/analysis dumps), and ``program/REMAINING.md`` (the live task
+  board — the single "what to work on" reference).
+- memory-gate: ``README.md``, every ``docs/adr/*.md``, ``docs/security/*.md``,
+  and the ``memory-lifecycle-contract`` spec + tasks.
+
+**Deliberately excluded** (and why): ``docs/plain/``, ``docs/foundations/``,
+``docs/technical/`` (reader-facing tracks for humans, not dev-loop material);
+``docs/archive/``, ``docs/adr/archive/`` (superseded); the dataset-sourcing
+catalogues (``DATASET-FACTORY-CATALOGUE*``, ``AUDIO-CORPUS-AUDIT``,
+``REASON-CORPUS-CANDIDATES*`` — data-sourcing side, not architecture/code
+material) and the raw ``ANALYSIS.md``/survey files under ``evidence/**``
+(kept only the verdict files, to stay a decision corpus, not a data dump);
+every OTHER repo in the fleet (fleet-ai-platform, gpu-pack, model-matrix,
+dataset-factory, csd-autodev itself, ternary-track, mycelium, weird-paradigms,
+...) — none of them are repos autodev can write to; the Obsidian vaults and
+their Qdrant collections entirely (autodev does not touch Obsidian, per the
+ratified design — RAG only); anything secrets-adjacent or topology-shaped
+(none matched in the included set — checked by hand).
+
+**Two-phase run, because embedding needs CUDA and curation should not**
+
+    # Phase 1 (any host, no CUDA): chunk MANIFEST into a review-able JSONL.
+    ./scripts/csd-autodev-rag-curate chunk --out /path/to/chunks.jsonl
+
+    # Phase 2 (CUDA host only, e.g. host-gpu-c over an SSH reverse tunnel back
+    # to the Qdrant host): embed and upsert.
+    ./scripts/csd-autodev-rag-curate embed --in /path/to/chunks.jsonl \\
+        --qdrant http://127.0.0.1:6333 --collection autodev-kb
+
+Point ids are UUID5 of (repo, path, heading-index, content sha256) — re-running
+phase 2 on an unchanged corpus is a no-op upsert; a changed file's old chunks
+for that path are deleted first (``vault_path`` payload filter), matching the
+fleet's established idempotent-reindex pattern.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import uuid
+from pathlib import Path
+
+REPO_ROOT = Path(
+    os.environ.get("AUTODEV_CURATE_ROOT", Path.home() / "code/personal/tzervas")
+)
+
+# Pinned per memory-gate ADR-0003 (docs/adr/0003-qdrant-qwen3-1024.md) and the
+# fleet-wide Qdrant binding (ADR-0001 in fleet-ai-platform): Qwen3-Embedding-0.6B,
+# exactly 1024-d, Cosine. Never mix a different model/dim into this collection.
+EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+EMBED_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+EMBED_DIM = 1024
+COLLECTION = "autodev-kb"
+
+# (repo, relpath) — repo is the directory name under REPO_ROOT and the Forgejo
+# repo name (tzervas/<repo>); relpath is repo-relative.
+MANIFEST: tuple[tuple[str, str], ...] = (
+    ("CogSynDelta", "AGENTS.md"),
+    ("CogSynDelta", "program/REMAINING.md"),
+    ("CogSynDelta", "docs/adr/0001-use-uv-package-manager.md"),
+    ("CogSynDelta", "docs/adr/0002-tiered-memory-architecture.md"),
+    ("CogSynDelta", "docs/adr/0003-quantum-module-stubbing.md"),
+    ("CogSynDelta", "docs/adr/0004-graceful-degradation-patterns.md"),
+    ("CogSynDelta", "docs/adr/0005-conventional-commits.md"),
+    ("CogSynDelta", "docs/adr/0006-google-style-docstrings.md"),
+    ("CogSynDelta", "docs/adr/0007-hybridized-granular-scoring-metrics.md"),
+    ("CogSynDelta", "docs/adr/0008-compression-fidelity-recovery.md"),
+    ("CogSynDelta", "docs/adr/0009-algebraic-training-optimization.md"),
+    ("CogSynDelta", "docs/adr/0009-reference-materials.md"),
+    ("CogSynDelta", "docs/adr/0009-supplement-algebraic-training-research.md"),
+    ("CogSynDelta", "docs/adr/0010-ternary-bitnet-exploration.md"),
+    ("CogSynDelta", "docs/adr/0011-libs-submodule-structure.md"),
+    ("CogSynDelta", "docs/adr/0012-vsa-hopfield-memory-integration.md"),
+    ("CogSynDelta", "docs/adr/0013-vjepa2-energy-planning.md"),
+    ("CogSynDelta", "docs/adr/0014-matryoshka-qinco2-compression.md"),
+    ("CogSynDelta", "docs/adr/0015-lan-gpu-model-pool.md"),
+    ("CogSynDelta", "docs/adr/0016-consumer-gpu-share.md"),
+    ("CogSynDelta", "docs/adr/README.md"),
+    ("CogSynDelta", "docs/design/CORPUS-CONTRACT.md"),
+    ("CogSynDelta", "docs/design/INTERCONNECT-MODULE-SPEC.md"),
+    ("CogSynDelta", "docs/design/LICENCE-FOR-OPEN-WEIGHTS.md"),
+    ("CogSynDelta", "docs/design/MATRIX-PIPELINE.md"),
+    ("CogSynDelta", "docs/design/METRICS-METHODOLOGY.md"),
+    ("CogSynDelta", "docs/design/MODEL-MANIFESTS.md"),
+    ("CogSynDelta", "docs/design/MODERN-TRAINING-STACK.md"),
+    ("CogSynDelta", "docs/design/REGION-TAXONOMY-AND-INTERCONNECT.md"),
+    ("CogSynDelta", "docs/design/TRAINING-SUPERSET.md"),
+    ("CogSynDelta", "docs/design/VISUAL-INGEST-PIPELINE.md"),
+    ("CogSynDelta", "docs/design/COMPLETION-PLAN-2026-09-06.md"),
+    ("CogSynDelta", "docs/design/STATE-VS-PLAN-2026-09-06.md"),
+    ("CogSynDelta", "docs/design/evidence/e1-episodic-store-2026-09-06/README.md"),
+    ("CogSynDelta", "docs/design/evidence/g22-visual-prereg-run1-2026-09-05/README.md"),
+    ("CogSynDelta", "docs/design/evidence/g22-visual-prereg-run2-2026-09-05/README.md"),
+    ("CogSynDelta", "docs/design/evidence/g48-reason-e1-2026-09-06/README.md"),
+    ("CogSynDelta", "docs/design/evidence/g6-ternary-memory-gate-2026-09-04/README.md"),
+    (
+        "CogSynDelta",
+        "docs/design/evidence/g6-ternary-memory-gate-2026-09-04/sources/README.md",
+    ),
+    (
+        "CogSynDelta",
+        "docs/design/evidence/g-e5-reason-latent-step-2026-09-06/BATTERY-DEFECT.md",
+    ),
+    ("CogSynDelta", "docs/design/evidence/g-e5-reason-latent-step-2026-09-06/GO_KILL.md"),
+    ("CogSynDelta", "docs/design/evidence/g-e5-reason-latent-step-2026-09-06/PREREG.md"),
+    ("CogSynDelta", "docs/design/evidence/g-e5-reason-latent-step-2026-09-06/README.md"),
+    (
+        "CogSynDelta",
+        "docs/design/evidence/memory-retrieval-diagnosis-2026-09-06/README.md",
+    ),
+    ("CogSynDelta", "docs/design/evidence/prereg-rank-gate-4000-2026-09-06/PREREG.md"),
+    ("CogSynDelta", "docs/design/evidence/reason-e2-2026-09-06/GO_KILL.md"),
+    ("CogSynDelta", "docs/design/evidence/reason-e2-2026-09-06/README.md"),
+    ("CogSynDelta", "docs/design/evidence/reason-region-diagnosis-2026-09-06/README.md"),
+    ("CogSynDelta", "docs/design/evidence/text-promotions-2026-09-06/README.md"),
+    ("CogSynDelta", "docs/design/evidence/visual-ptq-sensitivity-2026-09-06/README.md"),
+    ("CogSynDelta", "docs/design/evidence/w1-token-rank-2026-09-02/README.md"),
+    ("CogSynDelta", "docs/design/evidence/w2c-untrained-baselines-2026-09-03/README.md"),
+    ("CogSynDelta", "docs/design/evidence/w4-control-arm-2026-09-03/README.md"),
+    ("CogSynDelta", "docs/design/evidence/w4-masked-token-loss-2026-09-03/README.md"),
+    ("CogSynDelta", "docs/design/evidence/w4-production-runs-2026-09-03/README.md"),
+    ("memory-gate", "README.md"),
+    ("memory-gate", "docs/adr/0001-memory-lifecycle-contract.md"),
+    ("memory-gate", "docs/adr/0002-sqlite-durable-store.md"),
+    ("memory-gate", "docs/adr/0003-qdrant-qwen3-1024.md"),
+    ("memory-gate", "docs/security/chromadb-cve-2026-45829.md"),
+    ("memory-gate", "specs/memory-lifecycle-contract/spec.md"),
+    ("memory-gate", "specs/memory-lifecycle-contract/tasks.md"),
+)
+
+NAMESPACE = uuid.UUID("6f2a2c9e-1b1d-4e8a-9c9b-2f6b1c9a3d10")  # fixed, arbitrary
+
+
+def chunk_body(body: str, min_len: int = 80, max_len: int = 2500):
+    """Heading-bounded chunker (same shape as the vault indexer's ``chunks()``)."""
+    parts = re.split(r"(?m)^(#{1,6} .+)$", body)
+    cur_h = ""
+    buf = parts[0] if parts else ""
+    i = 1
+    while i < len(parts):
+        heading = parts[i]
+        rest = parts[i + 1] if i + 1 < len(parts) else ""
+        piece = (heading + "\n" + rest).strip()
+        if len(buf) + len(piece) > max_len and len(buf) >= min_len:
+            yield cur_h, buf.strip()
+            buf = piece
+            cur_h = heading.lstrip("# ").strip()
+        else:
+            buf = (buf + "\n\n" + piece).strip()
+            if heading.startswith("#"):
+                cur_h = heading.lstrip("# ").strip()
+        i += 2
+    if buf.strip():
+        yield cur_h, buf.strip()
+
+
+def cmd_chunk(args: argparse.Namespace) -> int:
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_files = 0
+    n_chunks = 0
+    missing: list[str] = []
+    with out_path.open("w", encoding="utf-8") as out:
+        for repo, rel in MANIFEST:
+            fp = REPO_ROOT / repo / rel
+            if not fp.is_file():
+                missing.append(f"{repo}/{rel}")
+                continue
+            text = fp.read_text(encoding="utf-8", errors="replace")
+            n_files += 1
+            for idx, (heading, body) in enumerate(chunk_body(text)):
+                if len(body.strip()) < 40:
+                    continue
+                content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                point_id = str(
+                    uuid.uuid5(NAMESPACE, f"{repo}:{rel}:{idx}:{content_hash}")
+                )
+                rec = {
+                    "id": point_id,
+                    "repo": repo,
+                    "path": rel,
+                    "heading": heading or Path(rel).stem,
+                    "chunk_index": idx,
+                    "content_hash": content_hash,
+                    "text": body,
+                }
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                n_chunks += 1
+    print(
+        f"chunk: manifest={len(MANIFEST)} files_ok={n_files} "
+        f"files_missing={len(missing)} "
+        f"chunks={n_chunks} -> {out_path}",
+        file=sys.stderr,
+    )
+    for m in missing:
+        print(f"  MISSING (manifest drift, not embedded): {m}", file=sys.stderr)
+    receipt = {
+        "manifest_count": len(MANIFEST),
+        "files_embedded": n_files,
+        "files_missing": missing,
+        "chunks": n_chunks,
+        "collection": COLLECTION,
+        "embed_model": EMBED_MODEL,
+        "embed_revision": EMBED_REVISION,
+        "embed_dim": EMBED_DIM,
+    }
+    receipt_path = out_path.with_suffix(".receipt.json")
+    receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    print(f"chunk: receipt -> {receipt_path}", file=sys.stderr)
+    return 0 if not missing else 1
+
+
+def cmd_embed(args: argparse.Namespace) -> int:
+    import torch
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import (
+        Distance,
+        FieldCondition,
+        Filter,
+        FilterSelector,
+        MatchAny,
+        PayloadSchemaType,
+        PointStruct,
+    )
+    from transformers import AutoModel, AutoTokenizer
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required to embed autodev-kb; refusing CPU.")
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dev = torch.device("cuda")
+    print(
+        f"embedder={EMBED_MODEL}@{EMBED_REVISION[:12]} "
+        f"device={torch.cuda.get_device_name(0)} "
+        f"dtype={dtype}",
+        file=sys.stderr,
+    )
+    tok = AutoTokenizer.from_pretrained(
+        EMBED_MODEL, revision=EMBED_REVISION, padding_side="left"
+    )
+    model = AutoModel.from_pretrained(
+        EMBED_MODEL, revision=EMBED_REVISION, dtype=dtype, attn_implementation="sdpa"
+    ).to(dev)
+    model.eval()
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        enc = tok(
+            texts, padding=True, truncation=True, max_length=1024, return_tensors="pt"
+        )
+        enc = {k: v.to(dev) for k, v in enc.items()}
+        with torch.inference_mode():
+            last = model(**enc).last_hidden_state
+            mask = enc["attention_mask"]
+            left_padding = mask[:, -1].sum() == mask.shape[0]
+            if left_padding:
+                pooled = last[:, -1]
+            else:
+                seq_len = mask.sum(dim=1) - 1
+                pooled = last[torch.arange(last.shape[0], device=dev), seq_len]
+            vec = torch.nn.functional.normalize(pooled.float(), p=2, dim=1)
+        return vec.cpu().numpy().tolist()
+
+    dim = len(embed(["warmup"])[0])
+    if dim != EMBED_DIM:
+        raise SystemExit(f"embedder dim={dim} != pinned {EMBED_DIM}; refusing to upsert")
+
+    client = QdrantClient(url=args.qdrant, timeout=30)
+    names = [c.name for c in client.get_collections().collections]
+    if args.collection not in names:
+        raise SystemExit(
+            f"collection {args.collection} does not exist; create it first "
+            f"(size={EMBED_DIM}, distance=Cosine) — never auto-create here."
+        )
+    info = client.get_collection(args.collection)
+    size = info.config.params.vectors.size  # type: ignore[union-attr]
+    dist = info.config.params.vectors.distance  # type: ignore[union-attr]
+    if size != EMBED_DIM or dist != Distance.COSINE:
+        raise SystemExit(
+            f"collection {args.collection} is size={size} distance={dist}; "
+            f"expected {EMBED_DIM}/Cosine. Refusing to mutate an existing collection's "
+            "dimension or metric."
+        )
+    for field in ("repo", "path", "content_hash"):
+        try:
+            client.create_payload_index(
+                args.collection, field, field_schema=PayloadSchemaType.KEYWORD
+            )
+        except Exception as exc:
+            print(f"payload index {field}: {exc}", file=sys.stderr)
+
+    recs = [
+        json.loads(line)
+        for line in Path(args.in_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    paths = sorted({r["path"] for r in recs})
+    # Idempotent re-run: drop this manifest's prior points before upserting fresh ones,
+    # same shape as the vault indexer's delete_paths().
+    if not args.no_delete_first:
+        client.delete(
+            collection_name=args.collection,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key="path", match=MatchAny(any=paths))]
+                )
+            ),
+        )
+        print(f"deleted prior points for {len(paths)} paths", file=sys.stderr)
+
+    batch = 8
+    upserted = 0
+    for i in range(0, len(recs), batch):
+        group = recs[i : i + batch]
+        vecs = embed([r["text"] for r in group])
+        points = [
+            PointStruct(
+                id=r["id"],
+                vector=vecs[j],
+                payload={
+                    "repo": r["repo"],
+                    "path": r["path"],
+                    "vault_path": r["path"],
+                    "heading": r["heading"],
+                    "chunk_index": r["chunk_index"],
+                    "content_hash": r["content_hash"],
+                    "text": r["text"],
+                    "source": "curated-from-source",
+                    "curated_at": args.curated_at,
+                },
+            )
+            for j, r in enumerate(group)
+        ]
+        client.upsert(collection_name=args.collection, points=points, wait=True)
+        upserted += len(points)
+        print(f"upserted {upserted}/{len(recs)}", file=sys.stderr)
+
+    print(f"embed: done. collection={args.collection} points={upserted}", file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_chunk = sub.add_parser(
+        "chunk", help="Chunk MANIFEST into a JSONL (no CUDA needed)."
+    )
+    p_chunk.add_argument("--out", required=True)
+    p_chunk.set_defaults(func=cmd_chunk)
+
+    p_embed = sub.add_parser(
+        "embed", help="Embed a chunk JSONL and upsert into Qdrant (CUDA required)."
+    )
+    p_embed.add_argument("--in", dest="in_path", required=True)
+    p_embed.add_argument("--qdrant", default="http://127.0.0.1:6333")
+    p_embed.add_argument("--collection", default=COLLECTION)
+    p_embed.add_argument("--curated-at", default="")
+    p_embed.add_argument("--no-delete-first", action="store_true")
+    p_embed.set_defaults(func=cmd_embed)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

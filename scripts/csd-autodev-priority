@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Autodev owns both GPUs. Prime WebUI off. Comfy is lock-wrap, not mask.
+# Never docker-stop fleet-localai. Never mask the Comfy unit.
+set -euo pipefail
+ACTION="${1:-status}"
+STEER="${CSD_STEER:-/fleet-data/cabal/csd-steer.json}"
+
+# WebUIs belong on homelab only. Prime must not run Open WebUI.
+webui_homelab_only() {
+  docker update --restart=no fleet-open-webui >/dev/null 2>&1 || true
+  docker stop fleet-open-webui >/dev/null 2>&1 || true
+  echo "prime-webui: stopped (UI is homelab-only)"
+}
+
+webui_start() {
+  ssh -o BatchMode=yes homelab \
+    'sudo -n systemctl start fleet-open-webui.service' >/dev/null 2>&1 || true
+  echo "homelab-webui: running (backends are 3090/5080 APIs)"
+}
+
+# Observe only. Wrap is the scheduler. Do not mask; do not unmask (sudo).
+comfy_field() {
+  ssh -o BatchMode=yes host-gpu-b \
+    'en=$(systemctl is-enabled fleet-comfyui.service 2>/dev/null || echo unknown)
+     if grep -qs fleet-comfyui-locked \
+          /etc/systemd/system/fleet-comfyui.service.d/host-gpu-b-lock.conf
+     then
+       case "$en" in *masked*) echo masked ;; *) echo wrapped ;; esac
+     else
+       echo "$en"
+     fi' || echo unknown
+}
+
+case "$ACTION" in
+  on)
+    mkdir -p "$(dirname "$STEER")"
+    python3 - "$STEER" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = {}
+if p.is_file():
+    try:
+        d = json.loads(p.read_text())
+    except json.JSONDecodeError:
+        d = {}
+d["autodev_priority"] = True
+d["pause"] = False
+p.write_text(json.dumps(d, indent=2) + "\n")
+PY
+    echo "comfy: $(comfy_field) (lock wrap, not mask)"
+    webui_homelab_only
+    webui_start
+    ;;
+  off)
+    python3 - "$STEER" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = {}
+if p.is_file():
+    try:
+        d = json.loads(p.read_text())
+    except json.JSONDecodeError:
+        d = {}
+d["autodev_priority"] = False
+p.write_text(json.dumps(d, indent=2) + "\n")
+PY
+    webui_start
+    echo "comfy: $(comfy_field) (lock wrap; unmask is operator-once if still masked)"
+    ;;
+  status)
+    echo "steer=$(cat "$STEER" 2>/dev/null || echo '{}')"
+    docker inspect -f 'prime-webui={{.State.Status}}' fleet-open-webui 2>/dev/null || echo prime-webui=none
+    ssh -o BatchMode=yes homelab 'systemctl is-active fleet-open-webui.service' 2>/dev/null | awk '{print "homelab-webui="$1}'
+    echo "comfy=$(comfy_field)"
+    ssh -o BatchMode=yes host-gpu-b 'systemctl --user is-active forgejo-runner-gpu-tzervas.service' \
+      | awk '{print "gpu-runner="$1}'
+    ;;
+  *)
+    echo "usage: csd-autodev-priority on|off|status" >&2
+    exit 2
+    ;;
+esac

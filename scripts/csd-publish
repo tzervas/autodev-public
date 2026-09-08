@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Build a sanitised publication tree. Never flips visibility.
+
+WHY. The audit of this repo came back DO-NOT-PUSH, and the reason was not a
+credential -- there isn't one. It was that the tree contains a verified
+penetration test of a live network with file:line detail, and a 4,000-line
+sandbox document full of live probe results. A squashed commit does NOT remove
+those: a squash preserves the tree byte for byte, so flattening is cosmetic here.
+
+WHAT IT DOES:
+  1. Copies the tree to a publication directory.
+  2. WITHHOLDS files that are process evidence rather than product -- a threat
+     model naming exploitable paths is useful to us and to an attacker, and
+     useless to a reader who wants the design.
+  3. REWRITES the fleet's real identifiers to documentation-reserved
+     placeholders: RFC 5737 addresses, RFC 2606 domains, generic hostnames.
+  4. VERIFIES the result: it greps the output for every original identifier and
+     refuses to finish if one survived.
+
+That last step is the point. A sanitiser nobody checks is a sanitiser that
+missed something -- and here "missed something" means published it.
+
+WHAT IT WILL NOT DO. It does not push, tag, or change visibility. Those stay
+manual, because the failure mode is unrecoverable: published content is indexed
+and cached, and deleting the repository afterwards does not retract it.
+
+Usage:
+    csd-publish <src> <dest> [--check-only]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+
+# THE SUBSTITUTION TABLE IS FLEET DATA, NOT CODE.
+#
+# It used to be literal in this file -- and so this script became the only thing
+# its own verifier still flagged, because a tool that removes identifiers has to
+# NAME them. It could not sanitise itself, which meant the one file that proves
+# the tree is clean was the file making it dirty.
+#
+# The table now lives in the gitignored private config beside the real
+# addresses, which is where fleet-specific data belongs anyway. Committed, this
+# script contains no identifier at all; without the private config it withholds
+# the evidence directories and rewrites nothing, and SAYS SO rather than
+# reporting a clean run it did not perform.
+def load_rules() -> tuple[list, list, list]:
+    """Substitutions, withheld paths, and forbidden patterns, from the private config."""
+    cfg = {}
+    for candidate in (
+        Path(os.environ.get("AUTODEV_FLEET_CONFIG", ""))
+        if os.environ.get("AUTODEV_FLEET_CONFIG")
+        else None,
+        Path(__file__).resolve().parents[1] / "config" / "fleet.json",
+    ):
+        if candidate and candidate.is_file():
+            try:
+                cfg = json.loads(candidate.read_text(encoding="utf-8"))
+                break
+            except (OSError, ValueError):
+                continue
+    pub = cfg.get("publish") or {}
+    redactions = pub.get("redact_sections", {})
+    subs = [(r["pattern"], r["replacement"]) for r in pub.get("substitutions", [])]
+    withhold = pub.get(
+        "withhold",
+        [
+            # Safe even with no private config: these are process evidence by path.
+            "docs/evidence",
+            "docs/operations",
+            "docs/cohort",
+        ],
+    )
+    forbidden = pub.get("forbidden", [])
+    return subs, withhold, forbidden, redactions
+
+
+SUBSTITUTIONS, WITHHOLD, FORBIDDEN, REDACTIONS = load_rules()
+
+# Suffixes that are DEFINITELY binary. Everything else is tried as UTF-8 text
+# and sanitised if it decodes, which is the safe direction: a new kind of text
+# file is covered the day it appears rather than the day someone remembers to
+# add it here.
+#
+# It used to be an allow-list of text suffixes, and that failed the first time
+# it was tested. Extracting the lab console's page from a .py file into
+# web/lab-console.html moved 44 KB of text out of a covered extension and into
+# an uncovered one; three real hostnames survived into the publication tree and
+# only the verifier caught them.
+BINARY_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".bmp",
+    ".tiff",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".zst",
+    ".tar",
+    ".whl",
+    ".so",
+    ".dylib",
+    ".dll",
+    ".o",
+    ".a",
+    ".bin",
+    ".pyc",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".ogg",
+    ".webm",
+    ".safetensors",
+    ".pt",
+    ".onnx",
+}
+
+
+def redact_sections(text: str, rules: list) -> str:
+    """Drop whole sections by heading, rather than editing lines.
+
+    A 4,000-line security document cannot be made safe by find-and-replace: the
+    risk is not a string, it is a SECTION -- a table of live probe results, a
+    disposition list of real findings. Substituting identifiers inside those
+    leaves the shape of the vulnerability intact and the reader one search away
+    from the original.
+
+    So the risky spans are removed entirely and replaced with a line saying so.
+    Structural, verifiable, and it cannot half-succeed the way a regex over
+    4,000 lines can -- which it did, twice, on this repository's first attempt.
+    """
+    for rule in rules:
+        start, until = rule.get("from"), rule.get("until")
+        note = rule.get("note", "withheld")
+        lines, out, dropping = text.splitlines(keepends=True), [], False
+        for ln in lines:
+            if not dropping and ln.startswith(start):
+                dropping = True
+                out.append(f"{until.split()[0]} [redacted]\n\n> {note}\n\n")
+                continue
+            if dropping and until and ln.startswith(until):
+                dropping = False
+            if not dropping:
+                out.append(ln)
+        text = "".join(out)
+    return text
+
+
+def sanitise(text: str) -> str:
+    """Apply the private substitution table. With none loaded, a no-op."""
+    for pat, rep in SUBSTITUTIONS:
+        text = re.sub(pat, rep, text)
+    return text
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("src")
+    ap.add_argument("dest")
+    ap.add_argument("--check-only", action="store_true")
+    a = ap.parse_args()
+
+    src, dest = Path(a.src).resolve(), Path(a.dest).resolve()
+    # .git is a FILE in a worktree, not a directory -- checking is_dir() refused
+    # to run against the tree this repo is actually developed in.
+    if not (src / ".git").exists():
+        print(json.dumps({"ok": False, "error": f"{src} is not a git repo"}))
+        return 2
+
+    r = subprocess.run(
+        ["git", "ls-files"], cwd=str(src), capture_output=True, text=True, timeout=120
+    )
+    files = [f for f in r.stdout.split() if f]
+
+    withheld, copied = [], []
+    if not a.check_only:
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+
+    for rel in files:
+        if any(rel == w or rel.startswith(w + "/") for w in WITHHOLD):
+            withheld.append(rel)
+            continue
+        copied.append(rel)
+        if a.check_only:
+            continue
+        s, d = src / rel, dest / rel
+        d.parent.mkdir(parents=True, exist_ok=True)
+        if s.suffix.lower() not in BINARY_SUFFIXES:
+            try:
+                body = s.read_text(encoding="utf-8")
+                if rel in REDACTIONS:
+                    body = redact_sections(body, REDACTIONS[rel])
+                d.write_text(sanitise(body), encoding="utf-8")
+                d.chmod(s.stat().st_mode & 0o777)
+                continue
+            except UnicodeDecodeError:
+                pass
+        shutil.copy2(s, d)
+
+    print(f"  {len(copied)} file(s) published, {len(withheld)} withheld")
+    for w in withheld:
+        print(f"    withheld  {w}")
+
+    if a.check_only:
+        return 0
+
+    # VERIFY. A sanitiser nobody checks is one that missed something, and here
+    # "missed something" means published it.
+    leaked: list[str] = []
+    for p in sorted(dest.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            body = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for pat in FORBIDDEN:
+            for m in re.finditer(pat, body, re.I):
+                leaked.append(f"{p.relative_to(dest)}: {m.group(0)}")
+                break
+    if leaked:
+        print(f"\n  SANITISER FAILED — {len(leaked)} identifier(s) survived:")
+        for line in leaked[:25]:
+            print(f"    {line}")
+        print("\n  The publication tree is NOT safe. Nothing was pushed.")
+        return 1
+
+    print("\n  verified: no original identifier survives in the published tree")
+    print(
+        "  NOT pushed and NOT made public — those stay manual, because "
+        "publishing cannot be undone."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

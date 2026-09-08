@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Git as Forgejo identity autodev. Token from the CSD vault only.
+# Never inherits workstation ~/.secrets. Never prints TOKEN.
+set -euo pipefail
+export SECRET_VAULT="${SECRET_VAULT:-/fleet-data/cabal/csd-vault}"
+export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-$SECRET_VAULT/age.txt}"
+export GIT_USERNAME=autodev
+export GIT_AUTHOR_NAME=autodev
+export GIT_AUTHOR_EMAIL=autodev@example.com
+export GIT_COMMITTER_NAME=autodev
+export GIT_COMMITTER_EMAIL=autodev@example.com
+# Beside this script, so it is installed and readable wherever this is. The
+# old default pointed into the operator's home, which the service accounts
+# cannot execute -- every push failed as "could not read Username", which
+# looks like an auth problem and is not one.
+export GIT_ASKPASS="${GIT_ASKPASS:-$(dirname "$(readlink -f "$0")")/csd-askpass-token}"
+export GIT_TERMINAL_PROMPT=0
+exec /usr/local/bin/secret exec TOKEN=forgejo/token -- \
+  git -c credential.helper= \
+      -c credential.https://git.example.com.helper= \
+      "$@"

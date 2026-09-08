@@ -1,0 +1,42 @@
+[Unit]
+Description=One autodev cycle against the trust-ladder repo
+# A hard backstop that does not depend on the loop's own retry accounting being
+# correct. The tick can now emit an event to wake itself after a refused push,
+# and a self-emitted event is a self-retrigger: if that bound ever fails, this
+# stops the spin at twelve cycles an hour instead of letting an agent hammer the
+# gateway and the forge unattended.
+# Sized from OBSERVED normal operation, not from a guess. Rung 0 ran about
+# eleven ticks in thirty minutes while landing four PRs -- every one a real
+# event -- and a goal legitimately uses three retries before changing tactic.
+# At burst 12/hour this tripped within two minutes and systemd refused to start
+# the unit at all: the loop went silent while every unit still reported healthy,
+# which is the worst way for a backstop to fire.
+#
+# 60/hour still stops a runaway (a tick averages 40-90s, so sustained 60/hour is
+# already near saturation) without firing on work that is going well.
+StartLimitIntervalSec=1h
+StartLimitBurst=60
+Documentation=file:///home/svc-autodev/autodev/scripts/csd-autodev-loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=svc-autodev
+Group=svc-autodev
+ExecStart=/usr/local/bin/autodev-tick
+TimeoutStartSec=1800
+# The tick ARMS a CI watcher and returns rather than blocking on CI, because
+# this forge emits no CI webhook and a tick that waits half an hour cannot be
+# stopped or told about a merge meanwhile. The watcher must therefore outlive
+# the tick that armed it -- the default KillMode=control-group would reap it the
+# moment the oneshot finished, and the loop would never learn how CI came out.
+# The watcher carries its own deadline and an exclusive lock per commit, so this
+# cannot leak processes.
+KillMode=process
+# The agent gets no more of the host than it needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/svc-autodev /fleet-data/gpu-requests

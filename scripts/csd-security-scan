@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+"""Run the self-hosted scanners, normalise what they say, and report what blocks.
+
+WHY. config/security-policy.json states the policy in full -- critical and high
+are must-fix with no acceptance path, medium and low may be accepted WITH an
+annotation, and "a scanner that is not installed is REPORTED AS ABSENT, never
+silently treated as clean". Nothing read that file. The scanners were run by
+hand, one at a time, each with its own output shape and its own idea of what a
+severity is, and the answer to "does this repo block a merge" lived in whoever
+had last run them.
+
+The failure this exists to prevent is the one the policy names: a scan that
+reports clean because it never ran. It has already happened here in two
+different shapes -- an allow-list in pytest.ini made a whole test file invisible
+while the suite reported green, and gitleaks' own declared command (below)
+writes its report to a FILE and prints nothing, so reading its stdout yields
+"no secrets" for a repo nobody scanned. Both look exactly like a pass.
+
+So every scanner ends up in the output with a status, including the ones that
+did not run, and a run where NOTHING ran exits 3 rather than 0. Absent is not
+clean; it is an admission that nothing was asserted.
+
+ONE FINDING AT A TIME, like csd-repo-onboard, for the same reason: eighty-six
+findings handed to an implementer produce a diff nobody can review. --all when
+you want the whole list.
+
+ACCEPTANCE. An acceptance marker naming a scanner id, with the SEVERITY,
+REACHABLE and REVISIT fields on the lines under it, accepts a medium or a low.
+All three or it does not count -- a marker with no reason is a way to silence the
+scanner, and the policy says as much. On a critical or a high the marker is
+itself a failure: an agent may not annotate its way past a must-fix.
+
+Usage:
+    csd-security-scan <repo> [--release] [--json] [--all]
+Exit: 0 nothing blocks · 1 blocking findings · 2 bad usage · 3 no scanner ran
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+POLICY_PATH = ROOT / "config" / "security-policy.json"
+
+SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+}
+
+SEVERITY_ORDER = ("critical", "high", "medium", "low")
+
+# Field names live here rather than in a literal block anywhere in this file on
+# purpose: this script is itself scanned for annotations, and a worked example
+# written out properly in a docstring would be indistinguishable from a real
+# acceptance of whatever id the example used.
+MARKER = "SEC-ACCEPTED"
+
+# How far below the marker its fields may be. A blank line ends the block first;
+# the window is only a backstop for a file with no blank lines in it.
+ANNOTATION_WINDOW = 12
+
+# Anything larger is not source someone annotated by hand. The walk is over an
+# arbitrary repo, and a vendored bundle or a checked-in model file would
+# otherwise be read into memory line by line looking for a comment.
+MAX_ANNOTATION_BYTES = 1 << 20
+
+STATUS_WHY = {
+    "absent": "NOT clean -- nothing was scanned for this, so nothing is asserted",
+    "error": "NOT clean -- the scanner ran and failed; its findings are unknown",
+    "unsupported": "NOT clean -- declared in the policy, no normaliser here yet",
+    "n/a": "does not apply to this repo",
+}
+
+
+# --------------------------------------------------------------------------- #
+# The two seams the tests replace. Everything below them is pure.
+# --------------------------------------------------------------------------- #
+def which(tool: str) -> str | None:
+    """PATH lookup, wrapped so a test can say a scanner is missing.
+
+    Named for the TOOL, not for command[0]. `cargo audit` is a separate binary
+    called cargo-audit, and cargo is on every dev box in this fleet -- checking
+    command[0] would report the dependency scanner present, run it, get "no such
+    subcommand", and hand back a scan that asserted nothing.
+    """
+    return shutil.which(tool)
+
+
+def run_command(cmd: list[str], cwd: Path, timeout: int = 900) -> tuple[int, str, str]:
+    p = subprocess.run(
+        cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, check=False
+    )
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+# --------------------------------------------------------------------------- #
+# Severity
+# --------------------------------------------------------------------------- #
+CVSS3_WEIGHTS = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+CVSS3_PR = {
+    "U": {"N": 0.85, "L": 0.62, "H": 0.27},
+    "C": {"N": 0.85, "L": 0.68, "H": 0.50},
+}
+
+
+def cvss3_base_score(vector: str) -> float | None:
+    """Base score from a CVSS:3.x vector string, or None if it is not one.
+
+    Computed rather than looked up because osv-scanner reports severity as the
+    VECTOR -- `CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:C/C:L/I:L/A:L` -- and a band
+    guessed from the vector's shape would put a 6.8 in whichever bucket the
+    guess favoured. Verified against that exact vector, which osv independently
+    scores 6.8.
+
+    CVSS:4.0 is deliberately not attempted: a wrong score is worse than no
+    score, and the callers already have a documented fallback for None.
+    """
+    parts = vector.strip().split("/")
+    if not parts or not parts[0].startswith("CVSS:3"):
+        return None
+    m = {}
+    for part in parts[1:]:
+        if ":" in part:
+            k, v = part.split(":", 1)
+            m[k] = v
+    try:
+        scope = m["S"]
+        exploitability = (
+            8.22
+            * CVSS3_WEIGHTS["AV"][m["AV"]]
+            * CVSS3_WEIGHTS["AC"][m["AC"]]
+            * CVSS3_PR[scope][m["PR"]]
+            * CVSS3_WEIGHTS["UI"][m["UI"]]
+        )
+        iss = 1 - (
+            (1 - CVSS3_WEIGHTS["C"][m["C"]])
+            * (1 - CVSS3_WEIGHTS["I"][m["I"]])
+            * (1 - CVSS3_WEIGHTS["A"][m["A"]])
+        )
+    except KeyError:
+        return None
+    if scope == "U":
+        impact = 6.42 * iss
+        raw = impact + exploitability
+    else:
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+        raw = 1.08 * (impact + exploitability)
+    if impact <= 0:
+        return 0.0
+    return roundup(min(raw, 10.0))
+
+
+def roundup(x: float) -> float:
+    """CVSS 3.1's round-up, which is not round-half-up and not ceil-to-int."""
+    i = round(x * 100000)
+    if i % 10000 == 0:
+        return i / 100000.0
+    return (math.floor(i / 10000) + 1) / 10.0
+
+
+def band(score: float) -> str:
+    if score >= 9.0:
+        return "critical"
+    if score >= 7.0:
+        return "high"
+    if score >= 4.0:
+        return "medium"
+    return "low"
+
+
+def severity_from_label(label: str) -> str | None:
+    """GitHub and friends say MODERATE where the policy says medium."""
+    table = {
+        "critical": "critical",
+        "high": "high",
+        "moderate": "medium",
+        "medium": "medium",
+        "low": "low",
+        "warning": "medium",
+        "error": "high",
+        "info": "low",
+        "informational": "low",
+        "note": "low",
+    }
+    return table.get((label or "").strip().lower())
+
+
+# --------------------------------------------------------------------------- #
+# Normalisation. Every scanner ends up as the same seven fields.
+# --------------------------------------------------------------------------- #
+def fingerprint(tool: str, ident: str, file: str, title: str) -> str:
+    """Stable id for a finding, deliberately WITHOUT the line number.
+
+    An annotation is written next to a finding and then survives every unrelated
+    edit above it. Hashing the line would expire the acceptance the moment
+    somebody adds an import, which trains people to re-accept findings without
+    re-reading them -- the annotation would become the ritual the policy is
+    written to prevent.
+
+    The cost, measured on the first real run: the two S112 findings at
+    csd-autodev-loop:808 and :840 share a fingerprint, because they are the same
+    rule on the same file with the same message. That is the intended reading --
+    one defect, one fix, one decision -- and it matches acceptance, which is by
+    scanner id and coarser still. A consumer that needs to count occurrences has
+    to count findings, not fingerprints.
+    """
+    raw = "\x00".join((tool, ident or "", file or "", title or ""))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def finding(scanner, tool, ident, severity, file, line, title) -> dict:
+    return {
+        "scanner": scanner,
+        "tool": tool,
+        "id": ident,
+        "severity": severity,
+        "file": file,
+        "line": line,
+        "title": " ".join((title or "").split())[:200],
+        "fingerprint": fingerprint(tool, ident, file, title),
+    }
+
+
+def relative(path: str, repo: Path) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    try:
+        return str(p.resolve().relative_to(repo.resolve()))
+    except (ValueError, OSError):
+        return path
+
+
+def parse_gitleaks(payload, spec, repo) -> list[dict]:
+    """Every secret is critical, per the policy: it is already published."""
+    sev = spec.get("severity_of_any_finding", "critical")
+    out = []
+    for hit in payload or []:
+        out.append(
+            finding(
+                "secrets",
+                spec["tool"],
+                hit.get("RuleID") or "secret",
+                sev,
+                relative(hit.get("File", ""), repo),
+                hit.get("StartLine"),
+                hit.get("Description") or hit.get("RuleID") or "secret detected",
+            )
+        )
+    return out
+
+
+def parse_ruff(payload, spec, repo) -> list[dict]:
+    sev = spec.get("default_severity", "medium")
+    out = []
+    for hit in payload or []:
+        loc = hit.get("location") or {}
+        out.append(
+            finding(
+                "python_sast",
+                spec["tool"],
+                hit.get("code") or "S",
+                sev,
+                relative(hit.get("filename", ""), repo),
+                loc.get("row"),
+                hit.get("message", ""),
+            )
+        )
+    return out
+
+
+def parse_semgrep(payload, spec, repo) -> list[dict]:
+    smap = spec.get("severity_map", {})
+    out = []
+    for hit in (payload or {}).get("results", []) or []:
+        extra = hit.get("extra") or {}
+        raw = extra.get("severity", "")
+        sev = smap.get(raw) or severity_from_label(raw) or "medium"
+        out.append(
+            finding(
+                "sast",
+                spec["tool"],
+                hit.get("check_id") or "semgrep",
+                sev,
+                relative(hit.get("path", ""), repo),
+                (hit.get("start") or {}).get("line"),
+                extra.get("message", ""),
+            )
+        )
+    return out
+
+
+def osv_severity(vuln: dict, group_max: str | None) -> str:
+    """CVSS where there is one, then the database's own label, then medium.
+
+    The order matters: `database_specific.severity` is absent from PYSEC rows
+    and present on GHSA ones for the SAME advisory, so preferring the label
+    would score one alias of a vulnerability and not the other.
+    """
+    for entry in vuln.get("severity") or []:
+        score = str(entry.get("score", ""))
+        computed = cvss3_base_score(score)
+        if computed is not None:
+            return band(computed)
+        try:
+            return band(float(score))
+        except ValueError:
+            continue
+    label = severity_from_label((vuln.get("database_specific") or {}).get("severity", ""))
+    if label:
+        return label
+    if group_max:
+        try:
+            score = float(group_max)
+        except (TypeError, ValueError):
+            score = 0.0
+        # osv writes 0.0 for a group it has no score for, and band(0.0) is
+        # "low" -- the one level that blocks nothing. Reading the absence of a
+        # score as an assertion that the vulnerability is harmless is how an
+        # unscored advisory ships. It falls through to the policy default.
+        if score > 0:
+            return band(score)
+    return "medium"
+
+
+def parse_osv(payload, spec, repo) -> list[dict]:
+    out = []
+    for result in (payload or {}).get("results", []) or []:
+        src = relative((result.get("source") or {}).get("path", ""), repo)
+        for pkg in result.get("packages", []) or []:
+            group_max = None
+            for grp in pkg.get("groups") or []:
+                group_max = grp.get("max_severity") or group_max
+            name = (pkg.get("package") or {}).get("name", "?")
+            version = (pkg.get("package") or {}).get("version", "?")
+            for vuln in pkg.get("vulnerabilities", []) or []:
+                summary = vuln.get("summary") or vuln.get("details") or "vulnerability"
+                out.append(
+                    finding(
+                        "deps",
+                        spec["tool"],
+                        vuln.get("id") or "OSV",
+                        osv_severity(vuln, group_max),
+                        src,
+                        None,
+                        f"{name} {version}: {summary}",
+                    )
+                )
+    return out
+
+
+def parse_cargo_audit(payload, spec, repo) -> list[dict]:
+    out = []
+    vulns = ((payload or {}).get("vulnerabilities") or {}).get("list") or []
+    for entry in vulns:
+        adv = entry.get("advisory") or {}
+        pkg = entry.get("package") or {}
+        cvss = adv.get("cvss")
+        sev = "medium"
+        score = cvss3_base_score(cvss) if isinstance(cvss, str) else None
+        if score is not None:
+            sev = band(score)
+        out.append(
+            finding(
+                "rust_deps",
+                spec["tool"],
+                adv.get("id") or "RUSTSEC",
+                sev,
+                relative("Cargo.lock", repo),
+                None,
+                f"{pkg.get('name', '?')} {pkg.get('version', '?')}: "
+                f"{adv.get('title', 'advisory')}",
+            )
+        )
+    return out
+
+
+PARSERS = {
+    "gitleaks": parse_gitleaks,
+    "ruff": parse_ruff,
+    "semgrep": parse_semgrep,
+    "osv-scanner": parse_osv,
+    "cargo-audit": parse_cargo_audit,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Running them
+# --------------------------------------------------------------------------- #
+def applies(spec: dict, repo: Path) -> bool:
+    if spec.get("applies_to") == "rust":
+        return (repo / "Cargo.toml").is_file()
+    return True
+
+
+def scanner_command(spec: dict, tmpdir: Path) -> tuple[list[str], Path | None]:
+    """The declared command, with gitleaks' `--report-path -` made to work.
+
+    MEASURED, not assumed: `gitleaks detect --report-path -` writes a file
+    literally named `-` into the working directory and prints only its banner to
+    stdout. Running the config's command verbatim and parsing stdout therefore
+    reports zero secrets for every repo, forever, while littering each one with
+    a file called `-`. That is the policy's own stated failure -- a scan that
+    reads as clean because it never produced a report -- shipped in the config.
+    """
+    cmd = list(spec.get("command") or [])
+    report = None
+    for i, arg in enumerate(cmd):
+        # `{tmpfile}` is the explicit form the config now uses, so the
+        # declared command is one that WORKS rather than one annotated as
+        # broken. `-` is still honoured: it is what gitleaks documents, and
+        # a config written from its docs should not silently scan nothing.
+        if (
+            arg == "--report-path"
+            and i + 1 < len(cmd)
+            and cmd[i + 1] in ("-", "{tmpfile}")
+        ):
+            report = tmpdir / "report.json"
+            cmd[i + 1] = str(report)
+    return cmd, report
+
+
+def run_scanner(name: str, spec: dict, repo: Path) -> dict:
+    """One scanner, always reported, whatever happened to it."""
+    tool = spec.get("tool", name)
+    row = {"scanner": name, "tool": tool, "status": "ok", "findings": [], "detail": ""}
+
+    if not applies(spec, repo):
+        row["status"] = "n/a"
+        row["detail"] = f"{spec.get('applies_to')} project layout not present"
+        return row
+    if which(tool) is None:
+        row["status"] = "absent"
+        row["detail"] = f"{tool} is not on PATH"
+        return row
+    if tool not in PARSERS:
+        row["status"] = "unsupported"
+        row["detail"] = f"no normaliser for {tool}'s output"
+        return row
+
+    with tempfile.TemporaryDirectory(prefix="csd-security-scan.") as td:
+        cmd, report = scanner_command(spec, Path(td))
+        try:
+            rc, out, err = run_command(cmd, repo)
+        except (OSError, subprocess.SubprocessError) as e:
+            row["status"] = "error"
+            row["detail"] = f"{type(e).__name__}: {e}"
+            return row
+        raw = out
+        if report is not None:
+            try:
+                raw = report.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                raw = ""
+        try:
+            payload = json.loads(raw) if raw.strip() else None
+        except json.JSONDecodeError as e:
+            # rc alone cannot decide this: gitleaks exits 1 when it FINDS
+            # something, which is a successful scan, and ruff exits 1 for
+            # findings and 2 for a broken config. Whether the output parsed is
+            # the only signal that separates a result from a failure.
+            row["status"] = "error"
+            row["detail"] = f"unparseable output (exit {rc}): {e}"
+            if err.strip():
+                row["detail"] += " | " + err.strip().splitlines()[-1][:200]
+            return row
+
+    if payload is None and rc not in (0, 1):
+        row["status"] = "error"
+        row["detail"] = f"exit {rc}, no output" + (
+            " | " + err.strip().splitlines()[-1][:200] if err.strip() else ""
+        )
+        return row
+
+    row["findings"] = PARSERS[tool](payload, spec, repo)
+    return row
+
+
+# --------------------------------------------------------------------------- #
+# Acceptance annotations
+# --------------------------------------------------------------------------- #
+def annotation_files(repo: Path):
+    for p in sorted(repo.rglob("*")):
+        if not p.is_file() or p.is_symlink():
+            continue
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        # config/security-policy.json is the SPEC, not an acceptance. Its
+        # `example` field is one JSON string holding a whole worked annotation,
+        # so a naive read of it accepts, repo-wide, whatever id the example
+        # happens to use -- the policy document silencing the policy.
+        if p.resolve() == POLICY_PATH.resolve():
+            continue
+        try:
+            if p.stat().st_size > MAX_ANNOTATION_BYTES:
+                continue
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if MARKER in text:
+            yield p, text
+
+
+def parse_annotations(repo: Path, required: list[str]) -> list[dict]:
+    """Every marker in the tree, complete or not.
+
+    Incomplete ones are kept rather than dropped: "you wrote an acceptance and
+    it does not count" is the single most useful thing this can tell someone,
+    and dropping them would make a two-field annotation indistinguishable from
+    never having tried.
+    """
+    out: list[dict] = []
+    for path, text in annotation_files(repo):
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if MARKER + ":" not in line:
+                continue
+            before, head = line.split(MARKER + ":", 1)
+            # The marker has to OPEN its line, behind nothing but comment
+            # punctuation. Source that mentions the contract -- this script's
+            # own prose, a test fixture building one, the policy's example
+            # quoted in a doc -- is not source that accepts a finding, and
+            # without this rule every one of those shows up in the report as an
+            # acceptance that does not count. Measured: the first real run of
+            # this script produced three such rows and no real ones.
+            if before.strip(" \t#/*-;!<>"):
+                continue
+            fields: dict[str, str] = {}
+            for follow in lines[i + 1 : i + 1 + ANNOTATION_WINDOW]:
+                stripped = follow.strip()
+                if not stripped or MARKER in stripped:
+                    break
+                body = stripped.lstrip("#/*-").strip()
+                hit = re.match(r"([A-Z]+)\s*:\s*(.*)$", body)
+                if hit and hit.group(1) in required:
+                    fields[hit.group(1)] = hit.group(2).strip()
+            out.append(
+                {
+                    "file": relative(str(path), repo),
+                    "line": i + 1,
+                    "head": head.strip(),
+                    "fields": fields,
+                    # The fields must be on their OWN lines below the marker.
+                    # An annotation written on a single line is what the config
+                    # example is, and what a one-line "SEC-ACCEPTED: X SEVERITY:
+                    # low ..." would be -- a shape nobody reads as a decision.
+                    "missing": [f for f in required if not fields.get(f)],
+                }
+            )
+    return out
+
+
+def match_annotation(f: dict, annotations: list[dict]) -> tuple[dict | None, list[dict]]:
+    """Annotations whose marker line names this finding's scanner id.
+
+    Matching on the id alone is what the policy asks for, and it has to be: an
+    osv-scanner finding names a CVE in a lockfile, and there is no line of
+    source next to it to annotate. The sharp edge is real and deliberate --
+    one `S603` acceptance speaks for every S603 in the repo -- so an acceptance
+    is a repo-wide claim about the architecture, which is exactly what the
+    REACHABLE field is specified to argue about.
+    """
+    ident = f.get("id") or ""
+    if not ident:
+        return None, []
+    pattern = re.compile(rf"(?<![\w-]){re.escape(ident)}(?![\w-])")
+    hits = [a for a in annotations if pattern.search(a["head"])]
+    complete = [a for a in hits if not a["missing"]]
+    # Prefer one sitting in the same file, so the report points at the
+    # annotation a reader is most likely to have meant.
+    same_file = [a for a in complete if a["file"] == f.get("file")]
+    chosen = (same_file or complete or [None])[0]
+    return chosen, hits
+
+
+def apply_policy(findings: list[dict], annotations: list[dict], policy: dict, gate: str):
+    """Attach acceptance to each finding and collect the policy violations."""
+    sev_policy = policy["severity"]
+    gate_spec = policy["gates"][gate]
+    blocks_on = gate_spec["blocks_on"]
+    allows_annotated = gate_spec.get("allows_annotated", [])
+    violations: list[dict] = []
+
+    for f in findings:
+        chosen, hits = match_annotation(f, annotations)
+        allowed = sev_policy.get(f["severity"], {}).get("annotation_allowed", False)
+        f["annotations"] = hits
+        f["accepted_by"] = None
+        f["accepted"] = False
+
+        if hits and not allowed:
+            # The policy names this exactly: "an agent may not annotate its way
+            # past a critical". The marker is not ignored here, it is a finding
+            # of its own -- someone tried, and that attempt is the thing a
+            # reviewer most needs to see.
+            for a in hits:
+                violations.append(
+                    {
+                        "file": a["file"],
+                        "line": a["line"],
+                        "id": f["id"],
+                        "severity": f["severity"],
+                        "why": (
+                            f"{f['severity']} may never be accepted: "
+                            + sev_policy.get(f["severity"], {}).get("why", "")
+                        ),
+                    }
+                )
+        elif chosen is not None and allowed:
+            f["accepted"] = True
+            f["accepted_by"] = chosen
+
+        blocks = f["severity"] in blocks_on
+        if blocks and f["accepted"] and f["severity"] in allows_annotated:
+            blocks = False
+        f["blocks"] = blocks
+
+    return violations
+
+
+# --------------------------------------------------------------------------- #
+# The scan
+# --------------------------------------------------------------------------- #
+def order_key(f: dict) -> tuple:
+    sev = f["severity"]
+    rank = SEVERITY_ORDER.index(sev) if sev in SEVERITY_ORDER else len(SEVERITY_ORDER)
+    return (rank, f["tool"], f.get("file") or "", f.get("line") or 0, f["id"])
+
+
+def scan(repo: Path, policy: dict, gate: str = "merge") -> dict:
+    rows: list[dict] = []
+    findings: list[dict] = []
+    for name, spec in policy["scanners"].items():
+        if name.startswith("_"):
+            continue
+        row = run_scanner(name, spec, repo)
+        findings.extend(row.pop("findings"))
+        rows.append(row)
+
+    required = policy["acceptance_annotation"]["required_fields"]
+    annotations = parse_annotations(repo, required)
+    violations = apply_policy(findings, annotations, policy, gate)
+    findings.sort(key=order_key)
+
+    counts = {s: 0 for s in SEVERITY_ORDER}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+
+    blocking = [f for f in findings if f["blocks"]]
+    return {
+        "repo": repo.name,
+        "gate": gate,
+        "scanners": rows,
+        "scanners_ok": sum(1 for r in rows if r["status"] == "ok"),
+        "findings": findings,
+        "counts": counts,
+        "accepted": sum(1 for f in findings if f["accepted"]),
+        "annotations": annotations,
+        "violations": violations,
+        "blocking": blocking,
+        "blocks": bool(blocking or violations),
+    }
+
+
+def exit_code(result: dict) -> int:
+    if result["scanners_ok"] == 0:
+        # Not 0. Nothing ran, so nothing was asserted, and a green exit here is
+        # the lie the whole script exists to avoid.
+        return 3
+    return 1 if result["blocks"] else 0
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+def describe(f: dict) -> str:
+    where = f.get("file") or "-"
+    if f.get("line"):
+        where += f":{f['line']}"
+    return f"[{f['severity']}] {f['tool']} {f['id']}  {where}"
+
+
+def report(result: dict, policy: dict, show_all: bool) -> None:
+    rows = result["scanners"]
+    print(
+        f"  {result['repo']}: {result['gate']} gate, "
+        f"{len(rows)} scanner(s) declared, {result['scanners_ok']} ran, "
+        f"{len(result['findings'])} finding(s), "
+        f"{len(result['blocking'])} blocking"
+    )
+    for r in rows:
+        note = STATUS_WHY.get(r["status"], "")
+        detail = f" -- {r['detail']}" if r["detail"] else ""
+        print(f"    {r['status']:<12}{r['tool']:<14}{r['scanner']:<14}{note}{detail}")
+
+    if result["scanners_ok"] == 0:
+        print(
+            "\n  NOTHING RAN. This is not a clean repo, it is an unscanned one:\n"
+            "  install a scanner, or run this where the scanners live."
+        )
+        return
+
+    c = result["counts"]
+    print(
+        f"\n  {c['critical']} critical, {c['high']} high, {c['medium']} medium, "
+        f"{c['low']} low  ({result['accepted']} accepted by annotation)"
+    )
+
+    if result["violations"]:
+        print(
+            f"\n  --- FAIL: acceptances the policy does not allow "
+            f"({len(result['violations'])}) ---"
+        )
+        for v in result["violations"]:
+            print(f"    {v['file']}:{v['line']}  {MARKER} on {v['id']} ({v['severity']})")
+            print(f"      why: {v['why']}")
+            print("      fix: delete the annotation and fix the finding")
+
+    incomplete = [a for a in result["annotations"] if a["missing"]]
+    if incomplete:
+        print(f"\n  --- annotations that do NOT count ({len(incomplete)}) ---")
+        for a in incomplete:
+            print(f"    {a['file']}:{a['line']}  missing {', '.join(a['missing'])}")
+            print(
+                "      -> the finding stands; an unannotated acceptance is "
+                "indistinguishable from nobody looking"
+            )
+
+    if not result["blocking"]:
+        gate_why = policy["gates"][result["gate"]].get("why", "")
+        print(f"\n  NOTHING BLOCKS the {result['gate']} gate. {gate_why}")
+    else:
+        shown = result["blocking"] if show_all else result["blocking"][:1]
+        if not show_all:
+            print("\n  FIX THIS FIRST (one at a time, on purpose):")
+        for f in shown:
+            print(f"\n    {describe(f)}")
+            print(f"      {f['title']}")
+            print(f"      why: {policy['severity'][f['severity']]['why']}")
+            print(f"      fingerprint: {f['fingerprint']}")
+        if not show_all and len(result["blocking"]) > 1:
+            print(
+                f"\n  ({len(result['blocking']) - 1} more behind it. Fix this one, "
+                "re-run, get the next.)"
+            )
+
+    others = [f for f in result["findings"] if not f["blocks"] and not f["accepted"]]
+    if others and show_all:
+        print(f"\n  --- does not block this gate ({len(others)}) ---")
+        for f in others:
+            print(f"    {describe(f)}  {f['title'][:70]}")
+    elif others:
+        print(f"\n  ({len(others)} finding(s) below this gate. --release raises it.)")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("repo")
+    ap.add_argument(
+        "--release",
+        action="store_true",
+        help="apply the release gate, where medium blocks too",
+    )
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--all", action="store_true", help="list every finding, not just the first to fix"
+    )
+    ap.add_argument("--policy", default=str(POLICY_PATH))
+    a = ap.parse_args(argv)
+
+    repo = Path(a.repo).resolve()
+    if not repo.is_dir():
+        print(f"no repo at {repo}", file=sys.stderr)
+        return 2
+    policy_path = Path(a.policy).resolve()
+    if not policy_path.is_file():
+        # Exit 2 rather than falling back to a built-in default. A hardcoded
+        # copy of the policy would drift from the file the operator edits, and
+        # the scan would enforce a rule nobody wrote down.
+        print(f"no policy at {policy_path}", file=sys.stderr)
+        return 2
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"policy is not valid JSON: {e}", file=sys.stderr)
+        return 2
+
+    result = scan(repo, policy, "release" if a.release else "merge")
+    if a.json:
+        print(json.dumps(result, indent=2))
+    else:
+        report(result, policy, a.all)
+    return exit_code(result)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

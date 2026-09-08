@@ -1,0 +1,182 @@
+{
+  "_comment": [
+    "THE ROLE REGISTRY. A role is a contract, not a model.",
+    "",
+    "Every role used to be an env var pointing at one gateway alias, which made",
+    "'which model is the reviewer' a thing you learned by reading a shell script.",
+    "It also made the one property the review gate depends on -- that reviewer and",
+    "implementer are different models -- invisible and unenforceable.",
+    "",
+    "`model` here is a GATEWAY ALIAS, not a checkpoint. The gateway owns which",
+    "weights an alias resolves to and on which card, so a role can be re-pointed at",
+    "a different model, quantisation or GPU without touching the loop. That is what",
+    "'agent identity is separate from model identity' means in practice.",
+    "",
+    "`may_change` is enforced, not advisory: a role that writes outside its paths",
+    "is a role doing someone else's job, which is how a defect gets patched at the",
+    "wrong layer.",
+    "",
+    "`escalates_to` is the ladder. A role that fails repeatedly does not try",
+    "harder; it hands a structured stuck-report to the role named here.",
+    "",
+    "See docs/AGENT-ORGANISATION.md. Roles marked implemented:false are declared",
+    "so the pipeline can name them and so the gap is visible -- they are NOT",
+    "silently missing."
+  ],
+  "version": 1,
+  "roles": {
+    "analyst": {
+      "implemented": true,
+      "tool": "scripts/csd-repo-survey",
+      "model": null,
+      "owns": "repository state, intent, gaps, and the context every other role needs",
+      "may_change": [],
+      "gate": null,
+      "escalates_to": "planner",
+      "note": "Deterministic today: reads the source and proposes nothing. That is why it is trusted."
+    },
+    "ideator": {
+      "implemented": false,
+      "model": "planner",
+      "owns": "candidate improvements, features, research directions",
+      "may_change": [],
+      "gate": null,
+      "escalates_to": "product"
+    },
+    "planner": {
+      "implemented": true,
+      "tool": "scripts/csd-autodev-intake",
+      "model": "planner",
+      "owns": "goals, milestones, priorities, sequencing",
+      "may_change": ["GOALS*.md", "docs/goals/**"],
+      "gate": null,
+      "escalates_to": "product"
+    },
+    "decomposer": {
+      "implemented": false,
+      "model": "planner",
+      "owns": "goals split into independently achievable tasks, one file each",
+      "may_change": ["GOALS*.md", "docs/goals/**"],
+      "gate": null,
+      "escalates_to": "architect",
+      "note": "One file per task is a hard constraint: apply_proposal writes exactly one, so a two-file task lands half and closes anyway."
+    },
+    "product": {
+      "implemented": false,
+      "model": "planner",
+      "owns": "user stories, requirements, scope, definition of done, success AND kill criteria, acceptance criteria",
+      "may_change": ["docs/requirements/**"],
+      "gate": "acceptance criteria exist and are satisfied",
+      "escalates_to": "operator"
+    },
+    "architect": {
+      "implemented": false,
+      "model": "planner",
+      "owns": "system boundaries, interfaces, APIs, data models, dependencies, constraints",
+      "may_change": ["docs/design/**", "**/*.pyi"],
+      "gate": "the design is coherent and its interfaces are stated",
+      "escalates_to": "product"
+    },
+    "implementer": {
+      "implemented": true,
+      "tool": "scripts/csd-autodev-loop",
+      "model": "coder-deep",
+      "owns": "code that satisfies an approved design",
+      "may_change": ["**"],
+      "forbidden": [".git/**"],
+      "gate": "implementation complete",
+      "escalates_to": "architect"
+    },
+    "reviewer": {
+      "implemented": true,
+      "tool": "scripts/csd-autodev-review",
+      "model": "reviewer",
+      "owns": "correctness, quality, maintainability, architectural consistency, regressions",
+      "may_change": [],
+      "gate": "code review passed",
+      "escalates_to": "architect",
+      "must_differ_from": "implementer",
+      "note": "must_differ_from is ENFORCED at call time by asking the gateway what each alias resolves to. A reviewer that degrades to the implementer's model returns a correlated opinion labelled independent."
+    },
+    "test-engineer": {
+      "implemented": false,
+      "model": "coder-deep",
+      "owns": "unit, integration, regression and system tests",
+      "may_change": ["tests/**", "**/test_*.py", "**/*_test.py"],
+      "gate": "required tests exist and pass",
+      "escalates_to": "architect",
+      "note": "The gate exists today as run_repo_gates, but nothing AUTHORS the tests -- the implementer does, which is why a goal asking for behaviour plus tests landed only the behaviour."
+    },
+    "doc-engineer": {
+      "implemented": false,
+      "model": "coder-fast",
+      "owns": "inline, API, architecture, user and developer documentation, examples",
+      "may_change": ["docs/**", "README*", "**/*.md"],
+      "gate": "documentation complete",
+      "escalates_to": "architect"
+    },
+    "ux": {
+      "implemented": false,
+      "applies_when": "the project has a user interface",
+      "model": "planner",
+      "owns": "usability, accessibility, interaction design, consistency",
+      "may_change": ["ui/**", "web/**", "frontend/**"],
+      "gate": "UI/UX review passed",
+      "escalates_to": "product"
+    },
+    "dx": {
+      "implemented": false,
+      "applies_when": "the project has a developer-facing surface",
+      "model": "planner",
+      "owns": "APIs, SDKs, CLIs, configuration, error messages, install, debugging, extension points",
+      "may_change": ["**"],
+      "gate": "DI/DX review passed",
+      "escalates_to": "architect"
+    },
+    "style": {
+      "implemented": false,
+      "model": null,
+      "owns": "formatting and lint, across every repository",
+      "may_change": ["**"],
+      "gate": "style is clean",
+      "escalates_to": "operator",
+      "note": "REPAIRS, never refuses. A style finding is fixed by the repo's own formatter and only an unresolvable disagreement becomes a finding. A pipeline that halts on formatting is a pipeline that does not run."
+    }
+  },
+  "escalation_ladder": [
+    "attempt",
+    "retry",
+    "change_approach",
+    "peer_review",
+    "escalate_to_owner_role",
+    "alternate_model_or_gpu",
+    "resume"
+  ],
+  "gates": [
+    {"id": "implementation", "owner": "implementer", "applies": "always"},
+    {"id": "acceptance", "owner": "product", "applies": "when requirements exist"},
+    {"id": "review", "owner": "reviewer", "applies": "always"},
+    {"id": "tests", "owner": "test-engineer", "applies": "always"},
+    {"id": "docs", "owner": "doc-engineer", "applies": "always"},
+    {"id": "ux", "owner": "ux", "applies": "when the project has a UI"},
+    {"id": "dx", "owner": "dx", "applies": "when the project has a developer surface"},
+    {"id": "style", "owner": "style", "applies": "always"},
+    {"id": "stubs", "owner": "architect", "applies": "always"},
+    {"id": "local", "owner": "implementer", "applies": "always"},
+    {"id": "ci", "owner": "implementer", "applies": "always"},
+    {"id": "no_blocking_findings", "owner": "reviewer", "applies": "always"}
+  ],
+  "defect_routing": {
+    "_comment": "Which role a finding goes BACK to. A defect patched at the wrong layer is the failure this prevents: an implementer working around an architectural fault produces code that passes every gate and encodes the fault permanently.",
+    "code_is_wrong": "implementer",
+    "interface_is_ambiguous": "architect",
+    "requirement_unclear": "product",
+    "test_proves_wrong_thing": "test-engineer",
+    "test_reveals_design_fault": "architect",
+    "docs_cannot_describe_it": "architect",
+    "error_message_unusable": "dx",
+    "style": "style",
+    "stub_unannotated": "implementer",
+    "stub_blocker_landed": "decomposer"
+  }
+}

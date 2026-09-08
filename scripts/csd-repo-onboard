@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Audit a repository against the house standard, and report the FIRST thing to fix.
+
+WHY. Every convention this fleet has was living in someone's shell history. ruff
+was the gate all session -- run by hand, defaults only -- so the style role
+correctly reported "not configured by this repo" and skipped it. nl-router's CI
+runs `uv run pytest` while our gate ran a bare pytest, so a correct change was
+refused three times with ModuleNotFoundError. An undeclared convention exists
+only while somebody remembers it.
+
+ADOPTION IS EXPECTED TO GO RED, and that is not a regression. Configuring a
+linter properly surfaces real findings. Those are a different thing from a gate
+that fires on what is NOT a defect -- CI scrutiny demanding a run from a
+workflow_dispatch-only workflow was a false positive; eighty-six ruff findings
+are eighty-six real ones.
+
+So this reports ONE finding at a time, in a fixed order, and says what to do
+about it. A batch of eighty-six handed to an implementer produces a diff nobody
+can review; one finding produces a PR a reviewer can actually judge. Fix it,
+re-run, get the next. The repo goes green by induction rather than by a heroic
+sweep, and stays green because the config is now declared.
+
+WHAT IT DOES NOT DO. It does not write anything. `--goals` turns the first
+finding into a queued goal via the planner's own checks; the implementer does the
+work through the normal pipeline, with a review and a gate, like everything else.
+
+Usage:
+    csd-repo-onboard <repo> [--json] [--all] [--goals GOALS.md]
+Exit: 0 fully adopted · 1 findings remain · 2 bad usage
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RULES = ROOT / "config" / "house-rules.json"
+INTAKE = ROOT / "scripts" / "csd-autodev-intake"
+SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+}
+
+
+def tracked(repo: Path) -> list[str]:
+    """Only tracked files. An untracked .venv full of vendored Python would make
+    every repo look like it speaks every language."""
+    try:
+        r = subprocess.run(
+            ["git", "ls-files"], cwd=str(repo), capture_output=True, text=True, timeout=60
+        )
+        return [f for f in r.stdout.split() if f]
+    except Exception:
+        return []
+
+
+def languages(repo: Path, rules: dict, files: list[str]) -> list[str]:
+    found = []
+    for lang, spec in rules["languages"].items():
+        for pat in spec["detect"]:
+            hit = (
+                any(fnmatch.fnmatch(Path(f).name, pat) for f in files)
+                if "*" in pat
+                else pat in files
+            )
+            if hit:
+                found.append(lang)
+                break
+    return found
+
+
+def has_section(repo: Path, section: str) -> bool:
+    """A config section, found wherever that ecosystem keeps it.
+
+    Checked as a literal section header rather than a substring: `ruff` appears
+    in a dependency list of half the repos here, and treating that as "ruff is
+    configured" is how a tool gets run against a project that never opted in.
+    """
+    if not section:
+        return True
+    if section.startswith("["):
+        for name in ("pyproject.toml", "Cargo.toml", "ruff.toml", ".ruff.toml"):
+            p = repo / name
+            if p.is_file():
+                try:
+                    if section in p.read_text(encoding="utf-8", errors="replace"):
+                        return True
+                except OSError:
+                    continue
+        return False
+    return (repo / section).exists()
+
+
+def check_language(repo: Path, lang: str, spec: dict) -> list[dict]:
+    out: list[dict] = []
+    pm = spec.get("package_manager") or {}
+    for f in pm.get("required_files", []):
+        if not (repo / f).is_file():
+            out.append(
+                {
+                    "stage": "toolchain-config",
+                    "lang": lang,
+                    "what": f"missing {f}",
+                    "why": pm.get("why", ""),
+                    "fix": f"add {f} ({pm.get('tool')} is the house manager)",
+                }
+            )
+    for kind in ("lint", "format", "types", "test"):
+        s = spec.get(kind)
+        if not s or s.get("required") is False:
+            continue
+        sec = s.get("config_section")
+        if sec and not has_section(repo, sec):
+            out.append(
+                {
+                    "stage": "toolchain-config",
+                    "lang": lang,
+                    "what": f"{kind}: {s['tool']} is not configured ({sec} absent)",
+                    "why": s.get(
+                        "why",
+                        "an undeclared tool cannot be run by the style or gate roles",
+                    ),
+                    "fix": f"declare {sec}",
+                }
+            )
+    for f in spec.get("toolchain_pin", {}).get("required_files", []):
+        if not (repo / f).is_file():
+            out.append(
+                {
+                    "stage": "toolchain-config",
+                    "lang": lang,
+                    "what": f"missing {f}",
+                    "why": spec["toolchain_pin"].get("why", ""),
+                    "fix": f"add {f}",
+                }
+            )
+    return out
+
+
+def check_ci(repo: Path, rules: dict) -> list[dict]:
+    out: list[dict] = []
+    ci = rules["ci"]
+    wd = repo / ci["workflow_dir"]
+    if not wd.is_dir():
+        return [
+            {
+                "stage": "ci-workflow",
+                "lang": "-",
+                "what": f"no {ci['workflow_dir']}",
+                "why": "a repo with no CI has no second opinion on a merge",
+                "fix": f"add {ci['required_workflows'][0]}",
+            }
+        ]
+    bodies = {}
+    for p in sorted(wd.glob("*.y*ml")):
+        try:
+            bodies[p.name] = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    for req in ci["required_workflows"]:
+        if req not in bodies:
+            out.append(
+                {
+                    "stage": "ci-workflow",
+                    "lang": "-",
+                    "what": f"no {req}",
+                    "why": "",
+                    "fix": f"add {req}",
+                }
+            )
+    r = ci["rules"]
+    for name, body in bodies.items():
+        if r["never_guard_on"] in body:
+            out.append(
+                {
+                    "stage": "ci-workflow",
+                    "lang": "-",
+                    "what": f"{name} guards on {r['never_guard_on']}",
+                    "why": r["why_never"],
+                    "fix": f"guard on {r['guard_on']} instead",
+                }
+            )
+        if "https://git.example.com" in body:
+            out.append(
+                {
+                    "stage": "ci-workflow",
+                    "lang": "-",
+                    "what": f"{name} hardcodes the forge URL",
+                    "why": r["why_never_hardcode"],
+                    "fix": f"use ${{{{ {r['api_url_from']} }}}}",
+                }
+            )
+        if "CABAL_FORGEJO_AGENT_TOKEN" in body:
+            out.append(
+                {
+                    "stage": "ci-workflow",
+                    "lang": "-",
+                    "what": f"{name} uses a managed secret",
+                    "why": r["why_token"],
+                    "fix": f"use ${{{{ {r['token']} }}}}",
+                }
+            )
+        if r.get("no_runtime_installs") and any(
+            k in body
+            for k in ("pip install", "apt-get install", "npm install -g", "cargo install")
+        ):
+            out.append(
+                {
+                    "stage": "ci-workflow",
+                    "lang": "-",
+                    "what": f"{name} installs dependencies at runtime",
+                    "why": r["why_no_installs"],
+                    "fix": f"bake it into {ci['base_image']}",
+                }
+            )
+    return out
+
+
+def check_gates(repo: Path, lang: str, spec: dict) -> list[dict]:
+    """Do the declared gates actually pass? This is where adoption goes red."""
+    out: list[dict] = []
+    for kind, stage in (
+        ("lint", "lint-clean"),
+        ("format", "format-clean"),
+        ("test", "test-present"),
+    ):
+        s = spec.get(kind)
+        if not s or s.get("required") is False:
+            continue
+        cmd = s.get("command") or []
+        if not cmd or not shutil.which(cmd[0]):
+            continue  # not installed: not a repo finding
+        if s.get("config_section") and not has_section(repo, s["config_section"]):
+            continue  # already reported as unconfigured
+        p = subprocess.run(
+            cmd, cwd=str(repo), capture_output=True, text=True, timeout=900
+        )
+        if p.returncode != 0:
+            tail = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
+            out.append(
+                {
+                    "stage": stage,
+                    "lang": lang,
+                    "what": f"{s['tool']} fails: {' '.join(cmd)}",
+                    "why": "expected during adoption -- these are real "
+                    "findings, and the repo goes green by fixing "
+                    "them one at a time",
+                    "fix": (
+                        s.get("fix_command")
+                        and f"try `{' '.join(s['fix_command'])}` first"
+                    )
+                    or "fix the first failure, re-run, repeat",
+                    "detail": "\n".join(tail[-12:]),
+                }
+            )
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("repo")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--all", action="store_true", help="list every finding, not just the first to fix"
+    )
+    ap.add_argument(
+        "--goals", default="", help="queue the first finding as a goal in this file"
+    )
+    a = ap.parse_args()
+
+    repo = Path(a.repo).resolve()
+    if not repo.is_dir():
+        print(json.dumps({"ok": False, "error": f"no repo at {repo}"}))
+        return 2
+    rules = json.loads(RULES.read_text())
+    files = tracked(repo)
+    langs = languages(repo, rules, files)
+
+    findings: list[dict] = []
+    for lang in langs:
+        findings += check_language(repo, lang, rules["languages"][lang])
+    findings += check_ci(repo, rules)
+    for lang in langs:
+        findings += check_gates(repo, lang, rules["languages"][lang])
+
+    order = rules["adoption"]["order"]
+    findings.sort(
+        key=lambda f: order.index(f["stage"]) if f["stage"] in order else len(order)
+    )
+
+    out = {
+        "repo": repo.name,
+        "languages": langs,
+        "files": len(files),
+        "adopted": not findings,
+        "findings": len(findings),
+        "next": findings[0] if findings else None,
+        "all": findings if a.all else None,
+    }
+
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(
+            f"  {repo.name}: {', '.join(langs) or 'no known language'}, "
+            f"{len(files)} tracked file(s), {len(findings)} finding(s)"
+        )
+        if not findings:
+            print("  ADOPTED — every house rule this repo can satisfy, it does.")
+        else:
+            shown = findings if a.all else findings[:1]
+            if not a.all:
+                print("\n  FIX THIS FIRST (one at a time, on purpose):")
+            for f in shown:
+                print(f"\n    [{f['stage']}] {f['lang']}: {f['what']}")
+                if f.get("why"):
+                    print(f"      why: {f['why']}")
+                print(f"      fix: {f['fix']}")
+                for ln in str(f.get("detail", "")).splitlines()[:8]:
+                    print(f"        {ln}")
+            if not a.all and len(findings) > 1:
+                print(
+                    f"\n  ({len(findings) - 1} more behind it. Fix this one, "
+                    "re-run, get the next.)"
+                )
+
+    if a.goals and findings and INTAKE.is_file():
+        f = findings[0]
+        finding = (
+            f"In {repo.name}: {f['what']}. {f.get('why', '')} Suggested fix: {f['fix']}."
+        )
+        r = subprocess.run(
+            [
+                sys.executable,
+                str(INTAKE),
+                "--repo",
+                str(repo),
+                "--goals",
+                a.goals,
+                "--finding",
+                finding,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=420,
+        )
+        print("\n  queued as a goal:" if r.returncode == 0 else "\n  could not queue:")
+        print("   ", (r.stdout or r.stderr).strip()[:400])
+
+    return 0 if not findings else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

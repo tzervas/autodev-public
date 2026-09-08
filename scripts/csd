@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Thin HTTP client entry for the csd-autodev harness API (R1).
+
+Does not import the loop library or lab-console server modules.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    src = Path(__file__).resolve().parents[1] / "src"
+    if src.is_dir() and str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from csd_client.cli import main as client_main
+
+    return int(client_main())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

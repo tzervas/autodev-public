@@ -1,0 +1,4449 @@
+#!/usr/bin/env python3
+"""Self-hosted autodev tick: 3090 local/code, no hosted Grok.
+
+Pick next_goal from CSD_STEER / PHASE-1, implement via LocalAI queue,
+land with csd-autodev-git + csd-autodev-forgejo, merge-gate only when
+required checks ran. Never poll hosted Grok. Ping mailbox on stall.
+
+  ./scripts/csd-autodev-loop --once
+  ./scripts/csd-autodev-loop --worker
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+_SRC = ROOT / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+STEER = Path(os.environ.get("CSD_STEER", "/fleet-data/cabal/csd-steer.json"))
+OUT = Path(os.environ.get("CSD_AUTODEV_OUT", "/fleet-data/cabal/autodev-out"))
+HEART = Path(
+    os.environ.get("CSD_AUTODEV_HEARTBEAT", "/fleet-data/cabal/autodev-heartbeat.json")
+)
+GROK_NEED = Path(os.environ.get("CSD_GROK_NEED", "/fleet-data/cabal/csd-need-grok.json"))
+STALL = Path(os.environ.get("CSD_AUTODEV_STALL", "/fleet-data/cabal/autodev-stall.json"))
+GPU_PLAN = Path(os.environ.get("CSD_GPU_PLAN", "/fleet-data/cabal/gpu-plan.json"))
+# LocalAI is retired. The gateway (LiteLLM) fronts vLLM on both cards and does
+# the routing, fallbacks and cooldowns csd-model-router used to approximate.
+QUEUE = ROOT / "scripts/csd-gateway-complete"
+PLAN = ROOT / "scripts/csd-gpu-plan"
+ROUTER = ROOT / "scripts/csd-model-router"
+# A whole file as JSON runs well past 8000 chars. This is the cap on what the
+# transport may return; anything smaller silently truncates real patches.
+MODEL_REPLY_LIMIT = int(os.environ.get("AUTODEV_REPLY_LIMIT", "400000"))
+GIT_CLI = ROOT / "scripts/csd-autodev-git"
+FORGEJO_CLI = ROOT / "scripts/csd-autodev-forgejo"
+REVIEW_CLI = ROOT / "scripts/csd-autodev-review"
+ADOPT_CLI = ROOT / "scripts/csd-adopt"
+CALIBRATE_CLI = ROOT / "scripts/csd-budget-calibrate"
+LADDER_CLI = ROOT / "scripts/csd-ladder"
+# The vault CLI, by absolute path. The watcher is spawned detached and must not
+# depend on inheriting a PATH that the systemd unit does not set.
+SECRET_CLI = os.environ.get("SECRET_CLI", "/usr/local/bin/secret")
+GOALS = Path(os.environ.get("CSD_GOALS", str(ROOT / "docs/program/GOALS.md")))
+PHASE1 = Path(
+    os.environ.get("CSD_PHASE1_BOARD", str(ROOT / "docs/program/PHASE-1-TASK-BOARD.md"))
+)
+HAND = ROOT / "docs/program/IMPLEMENTER-HANDOFF.md"
+QD_PACK = ROOT / "docs/program/CONTEXT-PACK-G-QD.md"
+P108_PACK = ROOT / "docs/program/CONTEXT-PACK-P1-08.md"
+REGION_PACK = ROOT / "docs/program/CONTEXT-PACK-REGION-PRETRAIN.md"
+MG_DEFAULT = Path("/home/operator/code/personal/tzervas/python-ai/memory-gate-wt-p1-09")
+MG_WT = Path(os.environ.get("CSD_AUTODEV_WT", str(MG_DEFAULT)))
+AUTODEV_HOME = Path(
+    os.environ.get("CSD_AUTODEV_HOME", "/home/operator/code/personal/tzervas/csd-autodev")
+)
+PROTECTED = Path("/home/operator/code/personal/tzervas/python-ai/memory-gate")
+ALLOW_PREFIXES = ("src/", "tests/", "docs/")
+HARNESS_ALLOW = ("scripts/", "tests/", "docs/", ".grok/")
+HARNESS_RELS = (
+    "scripts/csd-autodev-",
+    "scripts/csd-lab-console",
+    "scripts/csd",
+    "src/csd_client/",
+    "src/csd_autodev/",
+    "tests/test_autodev_",
+    "tests/test_client_boundary.py",
+    "tests/test_lab_console.py",
+    "tests/test_need_grok.py",
+    ".grok/skills/csd-autodev",
+)
+PROTECTED_REFS = frozenset({"main", "staging", "develop", "dev"})
+HORIZON = ("G-TRAIN", "G-SPLIT", "G-CHROMA", "G-SHARE", "G-1080", "G-LIFE")
+OPS_SKIP = ("G-POOL", "G-GPUCI", "G-WHEEL")
+BLOCKED_P1 = frozenset({"P1-05"})
+LOCAL_WF = "csd-python-first-drive.yml"
+PING_MAX = 2048
+STALL_N = 2
+IDENTITY = "autodev"
+
+
+def _flag(name: str, default: str = "0") -> bool:
+    raw = os.environ.get(name, default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def need_grok_enabled() -> bool:
+    """Feature flag. Default off: autodev must not wake hosted Grok."""
+    return _flag("CSD_NEED_GROK") or _flag("CSD_NEED_GROK_ENABLED")
+
+
+def stop_retry_enabled() -> bool:
+    """Old stall-stop (need_grok / halt). Default off."""
+    return _flag("CSD_STOP_RETRY")
+
+
+def approach_retries() -> int:
+    """After this many fails of one approach, change tactic (default 3)."""
+    try:
+        n = int(os.environ.get("CSD_APPROACH_RETRIES", "3"))
+    except ValueError:
+        n = 3
+    return max(1, n)
+
+
+def readable_file(path: Path) -> bool:
+    """Is this a file we can actually read? Unreachable counts as absent.
+
+    `Path.is_file()` RAISES rather than returning False when a parent directory
+    denies traversal, and several defaults here point outside the service
+    account's reach -- the CSD product root under the operator's home, the
+    shared state under /fleet-data. Under the operator's uid those stat fine
+    and the code looks correct; under the agent's it raises PermissionError
+    from inside whatever happened to be calling.
+
+    That is not hypothetical: dest_worktree("region-pretrain") crashed the tick
+    outright on `product.is_dir()`, because the agent cannot traverse
+    /home/operator. For every one of these call sites "cannot see it" and "it is
+    not there" lead to the same branch, so say so once here.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def readable_dir(path: Path) -> bool:
+    """Directory counterpart of readable_file. See it for why."""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _read_json(path: Path) -> dict:
+    if not readable_file(path):
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# Schemes that make an argument a place to CONNECT TO rather than text.
+REMOTE_SCHEMES = ("http://", "https://", "git://", "ssh://", "git@", "//")
+
+
+def targets_github(argv: list) -> bool:
+    """Does this command point a network operation at GitHub?
+
+    The check used to be `"github.com" in any argument`, which is not the same
+    question. The implementer's prompt is ONE argument carrying the goal, the
+    goals-file preamble and the source of the file being changed, so the moment
+    a document mentioned github.com the loop refused to call the model at all --
+    rc=2, "never GitHub", against a goal that never touched a remote.
+
+    G-SANITISE-ONBOARD failed that way on every attempt: the file it was asked
+    to sanitise, docs/ONBOARDING-A-REPO.md, documents a GitHub mirror.
+
+    So look at arguments that are actually locations. The rule this enforces --
+    the agent never pushes, fetches or authenticates to GitHub -- is unchanged,
+    because every way of doing that names a remote.
+    """
+    for a in argv:
+        text = str(a)
+        low = text.lower()
+        if "github.com" not in low:
+            continue
+        if low.startswith(REMOTE_SCHEMES):
+            return True
+        # A bare "github.com/owner/repo" is a remote too, but a prose line that
+        # merely contains it is not: require the URL to start the argument.
+        if low.startswith("github.com"):
+            return True
+    return False
+
+
+def _run(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 90,
+    input_text: str | None = None,
+    limit: int = 8000,
+    env: dict | None = None,
+) -> tuple[int, str]:
+    """Run a local CLI. Never spawn hosted grok or GitHub remotes.
+
+    `limit` caps captured output. 8000 suits git and test output; a model reply
+    carrying a whole file needs far more, and truncating it produced JSON that
+    failed to parse with the work already done.
+    """
+    if any(a == "grok" or str(a).endswith("/grok") for a in argv):
+        return 2, "refusing hosted grok"
+    if targets_github(argv):
+        return 2, "never GitHub"
+    try:
+        p = subprocess.run(
+            argv,
+            cwd=str(cwd or ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            input=input_text,
+            env=env,
+        )
+    except FileNotFoundError:
+        # A missing helper used to raise out of tick() and kill the worker. Several
+        # scripts this loop referenced (csd-gpu-plan, csd-model-router,
+        # csd-localai-queue) never came across when autodev was split out of the CSD
+        # repo, so the loop could not complete a single cycle. 127 is what a shell
+        # reports for "command not found"; callers that care can check it.
+        return 127, f"not found: {argv[0]}"
+    return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()[:limit]
+
+
+def fetch_steer() -> dict:
+    """Read steer via harness HTTP API — loop has no private file door (R1/S13)."""
+    from csd_client.api import Client
+
+    return Client.from_env().get_steer()
+
+
+def push_steer(fields: dict) -> dict:
+    """Write steer via harness HTTP API."""
+    from csd_client.api import Client
+
+    return Client.from_env().post_steer(fields)
+
+
+def record_run(fields: dict) -> dict:
+    """POST a run record through the shared /api/runs surface."""
+    from csd_client.api import Client
+
+    return Client.from_env().create_run(fields)
+
+
+def publish_event(
+    run_id: str,
+    kind: str,
+    payload: dict | None = None,
+    *,
+    checkpoint_sha256: str | None = None,
+) -> dict:
+    """Publish thought/input/output/phase through the shared event API."""
+    from csd_client.api import Client
+
+    return Client.from_env().publish_event(
+        run_id, kind, payload, checkpoint_sha256=checkpoint_sha256
+    )
+
+
+def consume_override(run_id: str) -> str | None:
+    """Pull pending operator text for the next phase input (R3-A3)."""
+    from csd_client.api import Client
+
+    rec = Client.from_env().consume_override(run_id)
+    text = rec.get("text") if isinstance(rec, dict) else None
+    return str(text) if text else None
+
+
+def register_call(run_id: str, pid: int, *, argv: list[str] | None = None) -> dict:
+    from csd_client.api import Client
+
+    return Client.from_env().register_call(run_id, pid, argv=argv)
+
+
+def clear_call(run_id: str) -> dict:
+    from csd_client.api import Client
+
+    return Client.from_env().clear_call(run_id)
+
+
+def _run_cancellable(
+    run_id: str,
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 90,
+    input_text: str | None = None,
+) -> tuple[int, str]:
+    """Run a child in its own session; halt via API kills it in <2s (R3-A1)."""
+    if any(a == "grok" or str(a).endswith("/grok") for a in argv):
+        return 2, "refusing hosted grok"
+    if targets_github(argv):
+        return 2, "never GitHub"
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(cwd or ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+        stdin=subprocess.PIPE if input_text is not None else None,
+    )
+    try:
+        register_call(run_id, int(proc.pid), argv=[str(a) for a in argv[:8]])
+    except Exception as exc:
+        # Without registration, halt cannot preempt; surface the error in output.
+        reg_err = f"register_call failed: {exc}"
+    else:
+        reg_err = ""
+    try:
+        out, _ = proc.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 15)
+        except OSError:
+            proc.kill()
+        out, _ = proc.communicate(timeout=5)
+        text = ((out or "") + ("\n" + reg_err if reg_err else "")).strip()[
+            :MODEL_REPLY_LIMIT
+        ]
+        with contextlib.suppress(Exception):
+            clear_call(run_id)
+        return 124, text or "timeout"
+    except Exception:
+        try:
+            os.killpg(proc.pid, 15)
+        except OSError:
+            proc.kill()
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            clear_call(run_id)
+    text = ((out or "") + ("\n" + reg_err if reg_err else "")).strip()[:MODEL_REPLY_LIMIT]
+    return int(proc.returncode or 0), text
+
+
+def steered_pause() -> bool:
+    try:
+        return bool(fetch_steer().get("pause"))
+    except Exception:
+        return False
+
+
+def goal_id(raw: str) -> str:
+    """Short board id (P1-09 / G-VAL-1) from a steer or table line.
+
+    The trailing segment is part of the id, not decoration. Goals decompose into
+    numbered tasks -- G-PROVE-1, G-PROVE-2 -- and each task is its own PR on its
+    own branch. The earlier pattern stopped at the second hyphen, so every task
+    of a goal collapsed onto ONE branch name: the second task would push onto the
+    first task's branch, and closing either would close whichever row came first.
+    It went unnoticed only because no goal had reached a second task yet.
+    """
+    hit = re.search(r"P1-\d+", raw)
+    if hit:
+        return hit.group(0)
+    hit = re.search(r"G-[A-Z0-9]+(?:-[A-Z0-9]+)*", raw)
+    return hit.group(0) if hit else raw.strip()[:80]
+
+
+def _merged_p1_ids(text: str) -> set[str]:
+    found: set[str] = set()
+    for line in text.splitlines():
+        idx = line.lower().find("merged")
+        if idx < 0:
+            if "| met |" not in line:
+                continue
+            hit = re.search(r"P1-\d+", line)
+            if hit:
+                found.add(hit.group(0))
+            continue
+        prefix = line[:idx]
+        for match in re.finditer(r"P1-(\d+)\.\.P1-(\d+)", prefix):
+            start, end = int(match.group(1)), int(match.group(2))
+            for i in range(start, end + 1):
+                found.add(f"P1-{i:02d}")
+        for match in re.finditer(r"P1-\d+", prefix):
+            found.add(match.group(0))
+    return found
+
+
+def phase1_open_ids() -> list[str]:
+    """Ordered PHASE-1 ids that are not merged or blocked."""
+    board = PHASE1.read_text(encoding="utf-8") if readable_file(PHASE1) else ""
+    goals = GOALS.read_text(encoding="utf-8") if readable_file(GOALS) else ""
+    merged = _merged_p1_ids(board) | _merged_p1_ids(goals)
+    ids: list[str] = []
+    for line in board.splitlines():
+        match = re.match(r"^\|\s*`(P1-\d+)`\s*\|", line)
+        if not match:
+            continue
+        pid = match.group(1)
+        if pid in BLOCKED_P1 or pid in merged:
+            continue
+        ids.append(pid)
+    return ids
+
+
+def is_region_pretrain(goal: str) -> bool:
+    """True when steer asks for one-region public-split pretrain."""
+    g = (goal or "").lower()
+    if "region-pretrain" in g:
+        return True
+    return "region" in g and "pretrain" in g
+
+
+def is_harness_goal(goal: str) -> bool:
+    """True when the slice is the autodev/lab harness, not CSD PoC."""
+    g = (goal or "").lower()
+    keys = (
+        "autodev-harness",
+        "csd-autodev",
+        "lab-console",
+        "harness-split",
+        "autodev-repo",
+    )
+    return any(k in g for k in keys)
+
+
+def is_harness_rel(rel: str) -> bool:
+    """Harness paths must not land in CogSynDelta (ADR-0017)."""
+    path = str(rel or "").lstrip("/")
+    return any(
+        path == prefix.rstrip("-") or path.startswith(prefix) for prefix in HARNESS_RELS
+    )
+
+
+# A single target repo, set by the unit, overrides the CSD-era decision table.
+# The table below routes between csd-autodev, CogSynDelta and memory-gate, which
+# is right when the loop is working the CSD programme and wrong when it is working
+# a trust-ladder repo. Setting both of these makes the target explicit instead of
+# inferred from goal text.
+TARGET_REPO = os.environ.get("AUTODEV_TARGET_REPO", "").strip()
+TARGET_WT = os.environ.get("AUTODEV_TARGET_WORKTREE", "").strip()
+# Sync only where the loop owns the worktree. In the CSD setup an external
+# process prepares ephemeral worktrees, and resetting one of those would
+# throw away work this loop did not create.
+TARGET_WORKTREE_SYNC = bool(TARGET_WT)
+
+
+def dest_worktree(goal: str) -> Path:
+    """Harness → csd-autodev; region-pretrain → CogSynDelta; else memory-gate.
+
+    Why: autodev loop/lab/forgejo CLI is out of scope for CSD PoC PRs.
+    """
+    if TARGET_WT:
+        return Path(TARGET_WT)
+    if is_harness_goal(goal):
+        return AUTODEV_HOME
+    if is_region_pretrain(goal):
+        product = Path(
+            os.environ.get(
+                "CSD_PRODUCT_ROOT",
+                "/home/operator/code/personal/tzervas/CogSynDelta",
+            )
+        )
+        return product if readable_dir(product) else ROOT
+    if MG_WT.resolve() == ROOT.resolve():
+        return MG_DEFAULT
+    return MG_WT
+
+
+def repo_for(goal: str, dest: Path | None = None) -> str:
+    """Forgejo repo. Harness is csd-autodev; region-pretrain is CogSynDelta."""
+    if TARGET_REPO:
+        return TARGET_REPO
+    if is_harness_goal(goal):
+        return "csd-autodev"
+    if is_region_pretrain(goal):
+        return "CogSynDelta"
+    path = (dest or dest_worktree(goal)).resolve()
+    if path == AUTODEV_HOME.resolve():
+        return "csd-autodev"
+    root = ROOT.resolve()
+    if path == root or root in path.parents or "CogSynDelta" in path.parts:
+        return "CogSynDelta"
+    return "memory-gate"
+
+
+def apply_worktree_name(goal: str) -> str:
+    if is_harness_goal(goal):
+        return "csd-autodev"
+    if is_region_pretrain(goal):
+        return "region-pretrain"
+    return os.environ.get("CSD_APPLY_WORKTREE", "p1-09")
+
+
+# Where the operator drops work. The CLI writes here; the loop reads it.
+BRIEFS = Path(os.environ.get("AUTODEV_BRIEFS", str(GOALS.parent / "briefs")))
+GOAL_ROW_RE = re.compile(r"^\|\s*(G-[A-Z0-9-]+)\s*\|(.+?)\|\s*(\w+)\s*\|\s*$")
+
+
+def decompose_brief(brief: str, existing: list) -> list:
+    """Turn a page of intent into goal rows.
+
+    The operator has no gateway credential and should not have one -- the agent
+    holds its own, in its own vault, which is the whole point of the identity
+    split. So the operator writes a brief and the LOOP decomposes it. That also
+    means submitting work needs nothing but write access to one directory, from
+    any machine.
+    """
+    used = ", ".join(existing[:40]) or "none yet"
+    prompt = (
+        "Turn the brief below into goal rows for an autonomous implementer.\n\n"
+        "Reply with ONLY markdown table rows, one per line, in exactly this "
+        "form and nothing else:\n\n"
+        "| G-<SHORTNAME>-<n> | <what to do> | open |\n\n"
+        "EXACTLY three cells. The last is the state and is always `open`. Put "
+        "acceptance criteria inside the middle cell, as part of the sentence.\n\n"
+        "Rules that come from what actually fails here:\n"
+        "  - ONE file per row. A row spanning two files lands half of itself, "
+        "passes CI, and closes.\n"
+        "  - Name that file explicitly, in backticks.\n"
+        "  - NAME WHAT TO READ. If the row describes existing behaviour, name "
+        "the file or the functions that define it, in backticks -- the "
+        "implementer is given exactly what the row names and nothing else, so "
+        "a row saying 'document all the commands' without naming where they "
+        "are defined cannot be done, and the model will invent instead.\n"
+        "  - NO ROW MAY DEPEND ON ANOTHER. Rows are attempted in any order and "
+        "in separate branches: a row that edits a file an earlier row creates "
+        "will run first, find nothing, and fail. Fold such pairs into ONE row.\n"
+        "  - Say what must be PROVEN, not just what to add.\n"
+        "  - A row a reviewer cannot judge in one read is two rows.\n"
+        "  - Three to eight rows. More than that is a plan, not a goal.\n"
+        f"  - Ids must not collide with those already queued: {used}\n\n"
+        f"Repository: {TARGET_REPO}\n\n"
+        f"BRIEF:\n{brief}\n"
+    )
+    rc, out = _run(
+        [
+            str(QUEUE),
+            "complete",
+            "--kind",
+            "plan",
+            "--prompt",
+            prompt,
+            "--timeout",
+            "300",
+        ],
+        timeout=360,
+        limit=8000,
+    )
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        m = GOAL_ROW_RE.match(line.rstrip())
+        if m and m.group(1) not in existing:
+            rows.append(f"| {m.group(1)} | {m.group(2).strip()} | open |")
+    return rows
+
+
+def intake_briefs() -> dict:
+    """Append goals for every brief the operator has dropped, then file it away.
+
+    Runs before goal selection, so work submitted seconds ago is picked up on
+    this tick rather than the next one.
+    """
+    if not TARGET_REPO or not readable_dir(BRIEFS):
+        return {"ok": True, "skipped": "no briefs directory"}
+    pending = sorted(
+        f for f in BRIEFS.glob("*.md") if f.is_file() and not f.name.startswith(".")
+    )
+    if not pending:
+        return {"ok": True, "briefs": 0}
+
+    done_dir = BRIEFS / "done"
+    handled, added = [], 0
+    for f in pending:
+        try:
+            brief = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        existing = [
+            m.group(1)
+            for line in (
+                GOALS.read_text(encoding="utf-8").splitlines()
+                if readable_file(GOALS)
+                else []
+            )
+            if (m := GOAL_ROW_RE.match(line))
+        ]
+        rows = decompose_brief(brief, existing)
+        if not rows:
+            # Leave it. A brief that cannot be decomposed is the operator's to
+            # look at, and deleting it would lose the only copy of their intent.
+            continue
+        with GOALS.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(rows) + "\n")
+        added += len(rows)
+        try:
+            done_dir.mkdir(parents=True, exist_ok=True)
+            f.replace(done_dir / f.name)
+        except OSError:
+            pass
+        handled.append(f.name)
+
+    if added:
+        emit_continue(f"{added} goal(s) from {len(handled)} brief(s)")
+    return {"ok": True, "briefs": len(handled), "goals_added": added, "files": handled}
+
+
+def next_open_goal() -> str:
+    """Pick STEER next_goal, else first open PHASE-1 id, else GOALS.md.
+
+    With a target repo set, the shared steer is NOT consulted for the goal: that
+    steer belongs to the CSD programme and currently names a CSD goal, which a
+    loop working a ladder repo would otherwise pick up and try to act on. Pause
+    and operator notes are still read from it, so steering still works.
+    """
+    nxt = ""
+    if not TARGET_REPO:
+        try:
+            nxt = str(fetch_steer().get("next_goal") or "").strip()
+        except Exception:
+            nxt = ""
+    if nxt:
+        return nxt
+    open_ids = phase1_open_ids()
+    if open_ids:
+        return open_ids[0]
+    if not readable_file(GOALS):
+        return ""
+    rows, blocked = [], []
+    for line in GOALS.read_text(encoding="utf-8").splitlines():
+        if any(tag in line for tag in (*HORIZON, *OPS_SKIP)):
+            continue
+        if "| G-" in line and "| open |" in line:
+            # A goal set aside after repeated escalation carries `blocked:` and
+            # goes to the BACK of the queue -- skipped while there is other work,
+            # returned to when there is not. It stays `open` on purpose: the rule
+            # is that a skipped goal must eventually be come back to, and a state
+            # change would take it out of the queue for good.
+            #
+            # Without this, set-aside meant nothing: G-LOOP-1 was correctly set
+            # aside after three escalations and picked again on the very next
+            # tick, which is the spin the escalation cap exists to end.
+            (blocked if "blocked:" in line else rows).append(line)
+    if rows:
+        return rows[0]
+    return blocked[0] if blocked else ""
+
+
+def write_steer_next(nxt: str) -> dict:
+    return push_steer({"next_goal": nxt})
+
+
+def advance_next_goal(current: str) -> str:
+    """Move STEER to the next open PHASE-1 id after a green merge."""
+    cur = goal_id(current)
+    rest = [pid for pid in phase1_open_ids() if pid != cur]
+    nxt = rest[0] if rest else ""
+    if nxt:
+        write_steer_next(nxt)
+    return nxt
+
+
+def ti_ok() -> bool:
+    """1080 Ti only when catalog live=true and guest smi is live."""
+    cat = _read_json(ROOT / "config" / "model-router.json")
+    spec = (cat.get("hosts") or {}).get("host-gpu-b-1080ti") or {}
+    if spec.get("live") is not True:
+        return False
+    node = _read_json(GPU_PLAN).get("host-gpu-b-1080ti") or {}
+    if not isinstance(node, dict) or node.get("live") is not True:
+        return False
+    name = str(node.get("name") or "")
+    return (not name) or ("1080" in name)
+
+
+def cluster_view() -> dict:
+    """Three live backends: 3090 + 5080 + 1080 Ti guest.
+
+    Why: heartbeat/steer must record retrieve-index-light (guest
+    203.0.113.12) beside 3090 local/code and 5080 exclusive-seq.
+    256 specialists (G-SHARE) is horizon, not a live target.
+    """
+    cat = _read_json(ROOT / "config" / "model-router.json")
+    hosts = cat.get("hosts") if isinstance(cat.get("hosts"), dict) else {}
+    spec = hosts.get("host-gpu-b-1080ti")
+    if not isinstance(spec, dict):
+        spec = {}
+    role = str(spec.get("role") or "retrieve-index-light")
+    return {
+        "backends": ["host-a", "host-gpu-b", "host-gpu-b-1080ti"],
+        "count": 3,
+        "not_256_specialists": True,
+        "host-gpu-b-1080ti": {
+            "live": ti_ok(),
+            "role": role,
+            "host_ip": str(spec.get("host_ip") or "203.0.113.11"),
+            "guest_ip": str(spec.get("guest_ip") or "203.0.113.12"),
+        },
+    }
+
+
+def ensure_steer_cluster() -> dict:
+    """Attach cluster facts to steer without changing next_goal.
+
+    Why: do not steer away from region-pretrain. P1-09 stays parked on
+    the board unless the file already names it. Cluster is 3090+5080+guest.
+    """
+    try:
+        cur = dict(fetch_steer())
+    except Exception:
+        cur = {}
+    nxt = str(cur.get("next_goal") or "").strip()
+    fields: dict = {}
+    # Only default to the CSD goal when this loop is actually working the CSD
+    # programme. With a target repo set, writing it here would put a CSD goal
+    # back into the steer on every tick.
+    if nxt not in {"P1-09", "region-pretrain"} and not TARGET_REPO:
+        fields["next_goal"] = "region-pretrain"
+    view = cluster_view()
+    wanted = {
+        "cluster": view["backends"],
+        "host-gpu-b-1080ti": view["host-gpu-b-1080ti"],
+        "need_grok": str(GROK_NEED),
+    }
+    for key, val in wanted.items():
+        if cur.get(key) != val:
+            fields[key] = val
+    if fields:
+        cur = push_steer(fields)
+    return cur
+
+
+def _router(*args: str) -> None:
+    _run([str(ROUTER), *args], timeout=60)
+
+
+def apply_http(payload: dict, worktree: str | None = None) -> dict:
+    """POST allowlisted file to prime agent. No SSH."""
+    import urllib.error
+    import urllib.request
+
+    token = os.environ.get("CSD_APPLY_TOKEN", "")
+    if not token:
+        tf = Path(
+            os.environ.get("CSD_APPLY_TOKEN_FILE", "/fleet-data/cabal/csd-apply.token")
+        )
+        if readable_file(tf):
+            token = tf.read_text(encoding="utf-8").strip()
+    wt = worktree or os.environ.get("CSD_APPLY_WORKTREE", "p1-09")
+    body = json.dumps(
+        {
+            "worktree": wt,
+            "path": payload.get("path"),
+            "content": payload.get("content"),
+        }
+    ).encode()
+    url = os.environ["CSD_APPLY_URL"].rstrip("/") + "/api/apply"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "error": exc.read().decode()[:300]}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+
+
+def fenced_block(text: str) -> str | None:
+    """The content of the OUTERMOST fenced block, or None if it never closes.
+
+    A regex with a non-greedy `(.*?)```` stops at the FIRST closing fence, which
+    is wrong for any file that contains a fence of its own. Writing a markdown
+    document is the common case, and every markdown document here has a ```bash
+    block near the top, so the proposal was cut at that block and the rest of
+    the file was thrown away. Because the loop writes whole files, the throwing
+    away is a DELETION: G-SANITISE-RUNBOOK dropped 239 of RUNBOOK.md's 250
+    lines, passed the gate (docs are not tested) and opened a PR.
+
+    Fences are matched by depth, using the one asymmetry markdown gives us: an
+    OPENING fence may carry an info string (```bash), a CLOSING fence is bare.
+    Depth starts at 1 after the opener; an info-string fence pushes, a bare
+    fence pops, and the pop that reaches 0 is the real end.
+
+    Two deliberate refusals, because a wrong guess here silently destroys a
+    file:
+      - a reply whose fence never closes returns None. That is a truncated
+        reply, and half a file is worse than no file.
+      - a depth that never returns to 0 falls back to the LAST bare fence, which
+        is right when the content holds an unlabelled ``` block, and returns
+        None if there is no bare fence at all.
+    """
+    lines = text.splitlines(keepends=True)
+    open_at = None
+    open_ticks = 0
+    for i, line in enumerate(lines):
+        m = re.match(r"^(`{3,})\s*([\w+.-]*)\s*$", line.strip("\n"))
+        if m:
+            open_at = i
+            open_ticks = len(m.group(1))
+            break
+    if open_at is None:
+        return None
+
+    depth = 1
+    bare_closers: list[int] = []
+    for i in range(open_at + 1, len(lines)):
+        m = re.match(r"^(`{3,})\s*([\w+.-]*)\s*$", lines[i].strip("\n"))
+        if not m:
+            continue
+        ticks, info = len(m.group(1)), m.group(2)
+        if ticks < open_ticks:
+            continue
+        if info:
+            depth += 1
+            continue
+        bare_closers.append(i)
+        depth -= 1
+        if depth == 0:
+            return "".join(lines[open_at + 1 : i])
+
+    # Unbalanced. An unlabelled inner fence is the benign explanation; take the
+    # last bare fence as the outer close.
+    if bare_closers:
+        return "".join(lines[open_at + 1 : bare_closers[-1]])
+    return None
+
+
+# A substitution is a different KIND of change from a rewrite, and asking for it
+# as a rewrite is what broke. "Replace 8 identifiers in a 272-line document"
+# returned a 28-line summary of the document -- not a truncation, a rewrite that
+# lost 90% of the content, three attempts running. The shrink guard caught it
+# every time, which is the guard working and the protocol being wrong: a model
+# asked to re-emit a long file it must not otherwise change will drift, and no
+# amount of instruction reliably stops that.
+#
+# So let it say what to change instead of restating the file. The loop does the
+# editing, which makes losing content structurally impossible rather than
+# merely refused.
+SUBST_HEADER = re.compile(
+    r"^\s*(?:SUBSTITUTIONS|SUBSTITUTE)\s*(?:IN)?\s*:\s*[`\"']?([\w./-]+)[`\"']?\s*$",
+    re.M | re.I,
+)
+
+
+def parse_substitutions(text: str) -> dict:
+    """A path plus literal from/to pairs, one per line.
+
+        SUBSTITUTIONS: docs/EVENT-DRIVEN.md
+        ```
+        203.0.113.10 => 203.0.113.10
+        git.example.com => git.example.com
+        ```
+
+    Returns {"path", "subs": [(from, to), ...]} or {} when the reply is not in
+    this form. `=>` is the separator because it does not occur in the paths,
+    hosts and addresses these goals substitute, where `->` and `:` both do.
+    """
+    header = SUBST_HEADER.search(text)
+    if not header:
+        return {}
+    body = fenced_block(text[header.end() :])
+    if body is None:
+        body = text[header.end() :]
+    subs: list[tuple[str, str]] = []
+
+    # BLOCK FORM, for replacing a passage rather than a token:
+    #
+    #     <<<FROM
+    #     the paragraph as it stands
+    #     ===TO
+    #     the paragraph as it should be
+    #     >>>
+    #
+    # Editing one SECTION of a document is neither a whole-file rewrite nor a
+    # one-line swap, and having only those two is why G-ARCH-GUARDS kept failing:
+    # asked to correct five paragraphs in an 83-line file, the model re-emitted
+    # the file unchanged, three times. The one-line form cannot express a
+    # multi-line passage, so it had no way to say what it meant.
+    rest = []
+    i = 0
+    lines = body.splitlines(keepends=True)
+    while i < len(lines):
+        if lines[i].strip() == "<<<FROM":
+            frm, to, mode = [], [], "from"
+            i += 1
+            while i < len(lines):
+                marker = lines[i].strip()
+                if marker == "===TO":
+                    mode = "to"
+                elif marker == ">>>":
+                    break
+                elif mode == "from":
+                    frm.append(lines[i])
+                else:
+                    to.append(lines[i])
+                i += 1
+            if frm:
+                subs.append(("".join(frm), "".join(to)))
+        else:
+            rest.append(lines[i])
+        i += 1
+
+    # THE FORM MODELS ACTUALLY PRODUCE, as well as the ones we asked for. Given
+    # a multi-line passage and a one-line `from => to` grammar, the model put
+    # the arrow on its OWN LINE between two multi-line blocks:
+    #
+    #     the passage as it stands,
+    #     over several lines
+    #     => the passage as it should read,
+    #     also over several lines
+    #
+    # which is a perfectly sensible reading of the instruction. It parsed as
+    # nothing, the reply was rejected as unparseable, and the identical prompt
+    # was retried nine times before the goal was invalidated. Being strict about
+    # a format the model has no way to verify only moves the failure somewhere
+    # it is harder to see.
+    #
+    # So: split the remaining text on lines whose FIRST token is the arrow, and
+    # treat what is above and below as the two sides.
+    block = "".join(rest)
+    if "\n=>" in block or block.startswith("=>"):
+        chunks = re.split(r"(?m)^\s*=>\s?", block)
+        for i in range(len(chunks) - 1):
+            frm = chunks[i].strip("\n")
+            to = chunks[i + 1]
+            # The TO side runs to the next blank line followed by more content,
+            # or to the end. A blank line is how the model separated pairs.
+            to = re.split(r"\n\s*\n", to, maxsplit=1)[0].strip("\n")
+            frm = re.split(r"\n\s*\n", frm)[-1].strip("\n")
+            if frm.strip():
+                subs.append((frm, to))
+    else:
+        for line in block.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=>" not in line:
+                continue
+            left, _, right = line.partition("=>")
+            left, right = left.strip().strip("`"), right.strip().strip("`")
+            # An empty LEFT would match everywhere; an empty right is a
+            # legitimate deletion of that token.
+            if left:
+                subs.append((left, right))
+    if not subs:
+        return {}
+    return {"path": header.group(1), "subs": subs}
+
+
+def apply_substitutions(target: Path, subs: list) -> dict:
+    """Apply literal replacements to a file that already exists.
+
+    Every pair must MATCH SOMETHING. A pair that matches nothing means the model
+    invented a string the file does not contain, and silently ignoring it is how
+    a goal reports success having changed less than it claimed.
+    """
+    if not readable_file(target):
+        return {"ok": False, "error": f"no such file to substitute in: {target.name}"}
+    try:
+        before = target.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": str(e)[:200]}
+    text = before
+    applied, missed = [], []
+    for frm, to in subs:
+        n = text.count(frm)
+        if n == 0:
+            missed.append(frm)
+            continue
+        text = text.replace(frm, to)
+        applied.append({"from": frm, "to": to, "n": n})
+    if not applied:
+        # NOTHING matched. The model quoted text this file does not contain, so
+        # there is no change to make and reporting success would be a lie.
+        return {
+            "ok": False,
+            "error": (
+                f"no substitution matched anything in {target.name}: "
+                + ", ".join(repr(m) for m in missed[:5])
+                + ". Quote the text exactly as it appears in the file."
+            ),
+            "missed": missed,
+        }
+    if text == before:
+        return {"ok": False, "error": "substitutions changed nothing"}
+    # SOME matched. Applying those and REPORTING the rest is right: these goals
+    # work from a shared mapping table, and a table row that does not occur in
+    # this particular file is not a false claim -- refusing the whole change for
+    # it blocked a correct 7-of-8 substitution. What must not happen is a miss
+    # passing unnoticed, so it travels in the record to the review and the diff.
+    return {"ok": True, "content": text, "applied": applied, "unmatched": missed}
+
+
+def extract_json(text: str) -> dict:
+    """Parse a file proposal from a model reply.
+
+    Accepts a bare object, a fenced ```json block, or an ARRAY of objects -- the
+    model returns an array whenever the goal touches more than one file, and the
+    previous implementation (first "{" to last "}") produced invalid JSON for
+    exactly that case, silently.
+
+    A failure returns {"_parse_error": ...} rather than {} so the caller can tell
+    "the model proposed no file" apart from "we could not read what it said".
+    Those were indistinguishable before, and both were reported as success.
+    """
+    import re as _re
+
+    candidates: list[str] = []
+    fenced = _re.search(r"```(?:json)?\s*\n(.*?)```", text, _re.S)
+    if fenced:
+        candidates.append(fenced.group(1).strip())
+    for opener, closer in (("[", "]"), ("{", "}")):
+        s, e = text.find(opener), text.rfind(closer)
+        if 0 <= s < e:
+            candidates.append(text[s : e + 1])
+
+    # PATH: <path> followed by a fenced block. No escaping, so a long file cannot
+    # be invalidated by one bad backslash the way JSON can.
+    subst = parse_substitutions(text)
+    if subst:
+        return {"path": subst["path"], "substitutions": subst["subs"]}
+
+    header = _re.search(
+        r"^\s*(?:PATH|FILE)\s*:\s*[`\"']?([\w./-]+)[`\"']?\s*$", text, _re.M | _re.I
+    )
+    if header:
+        after = text[header.end() :]
+        body = fenced_block(after)
+        if body is not None:
+            return {"path": header.group(1), "content": body}
+        if "```" in after:
+            # An opener with no close is a TRUNCATED reply. Writing what arrived
+            # would delete the rest of the file, so say what happened instead.
+            return {
+                "_parse_error": (
+                    "the fenced block for "
+                    f"{header.group(1)} is never closed -- the reply was cut off"
+                )
+            }
+
+    for blob in candidates:
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            # One file per turn: the loop applies, tests and lands a single
+            # change. Take the first and say so rather than dropping the rest on
+            # the floor without a word.
+            objs = [d for d in data if isinstance(d, dict) and d.get("path")]
+            if objs:
+                first = dict(objs[0])
+                if len(objs) > 1:
+                    first["_extra_files_ignored"] = [d.get("path") for d in objs[1:]]
+                return first
+        elif isinstance(data, dict):
+            return data
+    note = _re.search(r"^\s*NOTE\s*:\s*(.+)$", text, _re.M | _re.I)
+    if note:
+        return {"note": note.group(1).strip()[:400]}
+    # SAY WHAT LOOKED WRONG. "could not parse" told the next attempt nothing, so
+    # the next attempt made the same mistake -- nine times, before the goal was
+    # invalidated for failing nine times. The parser already knows enough to
+    # guess, and a wrong guess costs nothing next to no guess at all.
+    hint = ""
+    upper = text.upper()
+    if "SUBSTITUTIONS" in upper or "SUBSTITUTE" in upper:
+        hint = (
+            "The reply looks like a SUBSTITUTIONS block whose pairs could not be "
+            "read. Each pair is `from => to` on ONE line, or a <<<FROM / ===TO / "
+            ">>> block for a multi-line passage. "
+        )
+    elif "```" in text:
+        hint = "The reply has a fenced block but no `PATH: <file>` line above it. "
+    elif not text.strip():
+        hint = "The reply was empty. "
+    return {"_parse_error": f"{hint}Reply began: {text[:200]!r}"}
+
+
+def _shape_of(rel: str, body: str, cap: int) -> str:
+    """A structural summary of an oversized fixture.
+
+    Cutting JSON at a byte offset produces something that LOOKS like a complete
+    object with fewer keys, and a test built from it omits exactly the keys that
+    were cut. That is how `trust` went missing and every run died on KeyError.
+
+    Every top-level key survives here, with the first element of each list, so
+    the shape is complete even though the data is abridged.
+    """
+    if not rel.endswith(".json"):
+        return body[:cap] + "\n... (truncated; ask for the rest rather than guessing)"
+    try:
+        d = json.loads(body)
+    except Exception:
+        return body[:cap] + "\n... (truncated)"
+
+    def abridge(v, depth=0):
+        if isinstance(v, dict):
+            return {k: abridge(x, depth + 1) for k, x in v.items()}
+        if isinstance(v, list):
+            if not v:
+                return []
+            # One representative element, and say how many were dropped.
+            return [abridge(v[0], depth + 1)] + (
+                [f"... {len(v) - 1} more of the same shape"] if len(v) > 1 else []
+            )
+        if isinstance(v, str) and len(v) > 120:
+            return v[:120] + "..."
+        return v
+
+    out = json.dumps(abridge(d), indent=2)
+    if len(out) > cap * 2:
+        out = out[: cap * 2] + "\n... (summary truncated)"
+    return "ABRIDGED: every top-level key is present; lists show one element.\n" + out
+
+
+def discover_docs(dest: Path, listing: list[str], budget: int = 6000) -> str:
+    """Find the repository's own conventions and quote them.
+
+    The loop knew the fleet's rules and nothing about the repo it was editing.
+    That is backwards for a process meant to work unattended across several
+    repositories: a repo that says "tests live in tests/, run with pytest -q,
+    conventional commits" is telling the implementer exactly what it needs, and
+    the implementer was never shown it.
+
+    Discovered, not configured. Adding a repo should not mean editing this file
+    -- the names below are the conventional ones, and anything a repo actually
+    keeps is found because it is there.
+    """
+    WANT = (
+        "AGENTS.md",
+        "CONTRIBUTING.md",
+        "CONVENTIONS.md",
+        "CLAUDE.md",
+        "docs/CONTRIBUTING.md",
+        "README.md",
+        "README.rst",
+    )
+    found = [w for w in WANT if w in listing]
+    if not found:
+        return ""
+
+    parts = [
+        "\n--- the repository's own conventions (follow these over any "
+        "general habit) ---\n"
+    ]
+    spent = 0
+    for rel in found:
+        if spent >= budget:
+            break
+        try:
+            body = (dest / rel).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        # A README is usually a project pitch with the useful part at the top,
+        # so it is truncated rather than skipped; a CONTRIBUTING file is all
+        # rules and gets more room.
+        cap = 1500 if rel.startswith("README") else (budget - spent)
+        clipped = body[:cap]
+        if len(body) > len(clipped):
+            clipped += f"\n... [{len(body) - len(clipped)} more bytes]\n"
+        parts.append(f"\n=== {rel} ===\n{clipped}\n")
+        spent += len(clipped)
+
+    # The docs tree itself, named but not quoted: enough for the model to ask
+    # for a file by name in a later goal without spending the budget now.
+    docs = [f for f in listing if f.startswith("docs/") and f.endswith(".md")]
+    if docs:
+        parts.append(
+            "\nOther docs in this repo (not quoted; name one in a goal "
+            "to have it included):\n" + "\n".join(sorted(docs)[:40]) + "\n"
+        )
+    return "".join(parts)
+
+
+def named_symbols(goal: str) -> list:
+    """Identifiers the goal names, in the order it names them.
+
+    Backticked, and shaped like a Python name -- so `docs/A.md` and `v1.2.3`
+    are not symbols, while `shrink_check` and `apply_substitutions()` are.
+    """
+    out, seen = [], set()
+    for raw in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)(?:\(\))?`", goal):
+        if raw in seen:
+            continue
+        # snake_case or a plain lowercase word. Excludes CONSTANTS and prose
+        # that happens to be backticked, without needing a stop-list.
+        if "_" in raw or raw.islower():
+            seen.add(raw)
+            out.append(raw)
+    return out
+
+
+def symbol_source(dest: Path, files: list, symbols: list, budget: int) -> str:
+    """The SOURCE of the functions a goal names, not the files that contain them.
+
+    A goal saying "read scripts/csd-autodev-loop -- the functions X, Y and Z --
+    and state accurately what each guard prevents" named a 114 KB file against a
+    24 KB context budget. The file was truncated to its first quarter, none of
+    the five functions were in it, and the model described all five from their
+    NAMES. Four descriptions were wrong and one was backwards: shrink_check,
+    which refuses a write that DELETES most of a file, was documented as
+    preventing bloat.
+
+    Truncation is honest and the loop already labels it. The problem is that a
+    whole file is the wrong unit when the goal is about five functions inside
+    it, so send the functions.
+    """
+    if not symbols:
+        return ""
+    import ast as _ast
+
+    found, spent = [], 0
+    for rel in files:
+        if spent >= budget:
+            break
+        f = dest / rel
+        if not readable_file(f) or f.suffix not in {".py", ""}:
+            continue
+        try:
+            src = f.read_text(encoding="utf-8", errors="replace")
+            tree = _ast.parse(src)
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in _ast.walk(tree):
+            if not isinstance(
+                node, _ast.FunctionDef | _ast.AsyncFunctionDef | _ast.ClassDef
+            ):
+                continue
+            if node.name not in symbols:
+                continue
+            seg = _ast.get_source_segment(src, node) or ""
+            if not seg or spent + len(seg) > budget:
+                continue
+            found.append(f"--- {rel}: {node.name} ---\n{seg}\n")
+            spent += len(seg)
+
+    if not found:
+        return ""
+    return (
+        "The functions the goal names, in full. Describe these from the code "
+        "below, not from their names:\n\n" + "\n".join(found) + "\n"
+    )
+
+
+def repo_context(dest: Path, goal: str, budget: int = 24000) -> str:
+    """The repository, as the model needs to see it: a file listing, and the FULL
+    text of every file the goal names.
+
+    This is the fix for the defect that mattered most. The model was asked to
+    raise test coverage of a file it had never seen and produced a plausible
+    module bearing no relation to the real one -- which would have overwritten it.
+
+    Files are quoted whole rather than summarised: a partial file invites the
+    model to reconstruct the rest, which is the same failure in slower motion.
+    """
+    import re as _re
+
+    parts: list[str] = []
+    try:
+        rc = subprocess.run(
+            ["git", "ls-files"], cwd=str(dest), capture_output=True, text=True, timeout=60
+        )
+        listing = [f for f in rc.stdout.split() if f]
+    except Exception:
+        listing = []
+    if listing:
+        parts.append("Repository files:\n" + "\n".join(sorted(listing)[:200]) + "\n")
+
+    # What this repo says about itself, before anything about the goal. A rule
+    # the repo states beats a habit the model brought with it.
+    conventions = discover_docs(dest, listing)
+    if conventions:
+        parts.append(conventions)
+
+    # Any path the goal mentions, backticked or bare.
+    #
+    # NOT "anything ending in a known extension". Every script in this
+    # repository is extensionless, so that pattern could never match one, and a
+    # goal saying "read `scripts/autodev`" got a context with no
+    # scripts/autodev in it. The model said so plainly -- "the file is not
+    # included in the provided repository files list" -- and the goal was
+    # invalidated for asking the impossible, six times.
+    #
+    # It is the same blind spot as ruff walking only *.py, one layer up: a rule
+    # written around extensions in a tree that does not use them.
+    #
+    # So: take any backticked token, and any bare token with a slash, and keep
+    # whatever the LISTING confirms is a real file. The listing is the
+    # authority, so a loose pattern costs nothing.
+    candidates = set(_re.findall(r"`([^`\s]+)`", goal))
+    candidates |= set(_re.findall(r"(?:^|[\s(])([\w.-]+(?:/[\w.-]+)+)", goal))
+    named = (candidates & set(listing)) if listing else set()
+
+    # ...plus the files those imply. A goal about testing X needs X AND the tests
+    # that already exercise X: without them the model either duplicates existing
+    # cases or rewrites the test file and silently drops some. It declined a real
+    # goal for exactly this reason, which is how the gap was found.
+    related: set[str] = set()
+    for rel in list(named):
+        stem = Path(rel).stem
+        for other in listing:
+            if other in named:
+                continue
+            op = Path(other)
+            is_test = op.name.startswith("test_") or "tests/" in other
+            if not is_test:
+                continue
+            # Named for it, or importing it.
+            if stem in op.name:
+                related.add(other)
+                continue
+            try:
+                if stem in (dest / other).read_text(encoding="utf-8", errors="replace"):
+                    related.add(other)
+            except Exception:
+                pass
+    # Keep the directly-named set: the prompt tells the model which files the
+    # goal asked for and which the loop added, and it cannot do that after the
+    # union.
+    goal_named = set(named)
+    named |= related
+
+    spent = 0
+    # Named symbols come first and out of the same budget. When a goal is about
+    # five functions in a large file, those five functions are the context --
+    # the rest of the file is what pushes them out of it.
+    syms = symbol_source(dest, sorted(named), named_symbols(goal), budget // 2)
+    if syms:
+        parts.append(syms)
+        spent += len(syms)
+
+    for rel in sorted(named):
+        f = dest / rel
+        if not f.is_file():
+            continue
+        try:
+            body = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        room = budget - spent
+        if room <= 0:
+            parts.append(f"\n(omitted {rel}: context budget spent)\n")
+            break
+        if len(body) > room:
+            parts.append(
+                f"\n--- {rel} (TRUNCATED at {room} of {len(body)} chars; "
+                "ask for the rest rather than inventing it) ---\n" + body[:room] + "\n"
+            )
+            spent = budget
+        else:
+            tag = "complete" if rel in goal_named else "related, complete"
+            parts.append(f"\n--- {rel} ({tag}, {len(body)} chars) ---\n{body}\n")
+            spent += len(body)
+
+    # The data the code expects. validate_candidate reaches into
+    # catalog["trust"]; a test catalog built by guesswork raises KeyError, which
+    # is what happened. A human would open the real fixture first.
+    FIXTURE_MAX = 6000
+    fixtures = [
+        f
+        for f in listing
+        if f.startswith(("config/", "fixtures/", "tests/data/"))
+        and f.endswith((".json", ".yaml", ".yml", ".toml"))
+    ]
+    shown = 0
+    for rel in sorted(fixtures)[:6]:
+        f = dest / rel
+        try:
+            body = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if len(body) > FIXTURE_MAX:
+            body = _shape_of(rel, body, FIXTURE_MAX)
+        parts.append(
+            f"\n--- {rel} (data the code reads; use this SHAPE in tests) ---\n{body}\n"
+        )
+        shown += 1
+    if shown:
+        parts.insert(
+            1,
+            f"\n({shown} config/data file(s) included below -- build "
+            "test fixtures from these rather than inventing a shape.)\n",
+        )
+
+    if not named:
+        parts.append(
+            "\n(The goal names no file. Pick one from the listing above "
+            "and say which in your reply.)\n"
+        )
+    return "".join(parts)
+
+
+# Conventional-commit type per kind of path. Order matters: the first match
+# wins, so the more specific prefixes come first.
+COMMIT_TYPES = (
+    (("docs/", "README", "CHANGELOG", "AGENTS.md", "CLAUDE.md"), "docs"),
+    (("tests/", "test/"), "test"),
+    ((".github/", ".forgejo/", "scripts/gate", ".pre-commit"), "ci"),
+    (("pyproject.toml", "uv.lock", "Cargo.toml", "Cargo.lock", "package.json"), "build"),
+)
+
+
+def commit_message(goal: str, rel: str) -> str:
+    """A conventional commit describing what changed, and why.
+
+    Every autodev commit used to read `feat(memory): G-X-1 autodev slice`. The
+    scope was hardcoded to the CSD programme -- "agents" for CogSynDelta and
+    "memory" for everything else -- so nine documentation changes in this
+    repository were all committed as features of a memory subsystem that does
+    not exist here. The type was wrong, the scope was wrong, and the subject
+    said "slice", which describes the pipeline rather than the change.
+
+    Derived from the path instead, with the goal text as the body: the log
+    should tell a reader what happened without them opening the diff, and
+    "autodev slice" told them nothing.
+    """
+    low = rel.lower()
+    ctype = "feat"
+    for prefixes, name in COMMIT_TYPES:
+        if any(low.startswith(x.lower()) or rel.startswith(x) for x in prefixes):
+            ctype = name
+            break
+
+    parts = Path(rel).parts
+    # The interesting part of a path is the directory UNDER the top level:
+    # docs/goals/nl-router.md is about goals, src/csd_autodev/x.py about
+    # csd_autodev. A two-part path has only the top level to offer.
+    scope = parts[1] if len(parts) > 2 else (parts[0] if len(parts) > 1 else rel)
+    scope = Path(scope).stem.replace("_", "-")[:20]
+    # `docs(docs):` says the same thing twice, and `ci(.github):` names a
+    # directory rather than a component. Conventional commits allow no scope,
+    # and no scope reads better than a redundant one.
+    if (
+        # `docs(docs):` and `test(tests):` say the same thing twice.
+        scope.rstrip("s") == ctype.rstrip("s")
+        # `ci(.github):` names a directory rather than a component.
+        or scope.startswith(".")
+        # A file at the root has no component to name.
+        or len(parts) == 1
+        or not scope
+    ):
+        scope = ""
+
+    gid = goal_id(goal)
+    # The goal row is `| id | text | state |`; the middle cell is the intent.
+    cells = goal.split("|")
+    intent = cells[2].strip() if len(cells) >= 4 else goal.strip()
+    subject = f"{ctype}({scope}): {gid}" if scope else f"{ctype}: {gid}"
+    body = "\n".join(_wrap(intent, 72))
+    return f"{subject}\n\n{body}\n" if body else subject
+
+
+def _wrap(text: str, width: int) -> list:
+    """Wrap without pulling in textwrap for one call."""
+    out, line = [], ""
+    for word in text.split():
+        if line and len(line) + 1 + len(word) > width:
+            out.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+# Phrases that turn a goal's own words into a check. Every goals file here is
+# written with "Prove ..." clauses, and until now nothing read them.
+_VERBS = r"(?:contains?|mentions?|matches?|includes?|refers? to)"
+_ABSENT = re.compile(rf"\b(?:no longer|not|never)\s+{_VERBS}\b", re.I)
+_PRESENT = re.compile(rf"\b{_VERBS}\b", re.I)
+_TICKED = re.compile(r"`([^`\n]{2,120})`")
+
+
+def goal_claims(goal: str) -> list:
+    """Checkable claims the goal makes about the file after the change.
+
+    Returns (kind, needle) pairs where kind is "absent" or "present".
+
+    WHY. G-README-CLI-1 said "Prove the section no longer mentions
+    `docs/GOALS.md`". The change was applied, the goal closed as done, and the
+    README still said docs/GOALS.md -- in fact the substitution had replaced a
+    line INSIDE a code fence and left the wrong prose exactly where it was, so
+    the file came out worse than before. The goal stated its own success
+    condition in words, and nothing read them.
+
+    Deliberately narrow: only sentences beginning "prove", only backticked
+    needles. A claim this cannot parse is simply not checked, which is where it
+    already was.
+    """
+    claims = []
+    for sentence in re.split(r"(?<=[.;])\s+", goal):
+        if not re.search(r"\bprove\b", sentence, re.I):
+            continue
+        needles = _TICKED.findall(sentence)
+        if not needles:
+            continue
+        kind = (
+            "absent"
+            if _ABSENT.search(sentence)
+            else ("present" if _PRESENT.search(sentence) else "")
+        )
+        if not kind:
+            continue
+        for n in needles:
+            claims.append((kind, n))
+    return claims
+
+
+def check_claims(target: Path, goal: str) -> dict | None:
+    """Hold the change to what the goal said it would achieve.
+
+    Returns None to allow, or the refusal record. A goal that makes no
+    checkable claim is unaffected.
+    """
+    claims = goal_claims(goal)
+    if not claims or not readable_file(target):
+        return None
+    try:
+        body = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    broken = []
+    for kind, needle in claims:
+        there = needle in body
+        if kind == "absent" and there:
+            broken.append(f"{needle!r} is still present")
+        elif kind == "present" and not there:
+            broken.append(f"{needle!r} is not there")
+    if not broken:
+        return None
+    return {
+        "ok": False,
+        "error": (
+            "the change does not do what the goal says it proves: "
+            + "; ".join(broken[:4])
+            + f". Read {target.name} and make the stated claim true."
+        ),
+        "claims": [{"kind": k, "needle": n} for k, n in claims],
+        "broken": broken,
+    }
+
+
+def apply_proposal(
+    payload: dict, dest: Path, worktree: str | None = None, goal: str = ""
+) -> dict:
+    """Write one relative path into the memory-gate worktree.
+
+    Why: autodev must land slices without touching operator-main-wip.
+    Homelab dispatch uses CSD_APPLY_URL (HTTP bearer), not SSH.
+    """
+    rel = str(payload.get("path") or "").lstrip("/")
+    if dest.resolve() == PROTECTED.resolve():
+        return {"ok": False, "error": "refusing operator-main-wip"}
+    if payload.get("_parse_error"):
+        # Loud AND specific. "could not parse a file proposal from the reply"
+        # told the next attempt nothing, so the next attempt made the same
+        # mistake. The detail the parser already knows goes in the message,
+        # because that message is what the retry is given.
+        return {
+            "ok": False,
+            "error": (
+                "could not parse a file proposal from the reply: "
+                f"{payload['_parse_error']}. Reply in EXACTLY one of the two "
+                "forms in the brief and nothing else -- no explanation before "
+                "or after."
+            ),
+            "sample": payload["_parse_error"],
+        }
+    if not rel or (payload.get("content") is None and not payload.get("substitutions")):
+        return {"ok": True, "skipped": payload.get("note") or "no-file"}
+    if dest.resolve() == ROOT.resolve() and is_harness_rel(rel):
+        dest = AUTODEV_HOME
+        worktree = "csd-autodev"
+    # Path traversal and absolute paths are refused everywhere: those escape the
+    # worktree, which no legitimate change needs.
+    if ".." in Path(rel).parts or rel.startswith("/"):
+        return {"ok": False, "error": f"path escapes the worktree: {rel}"}
+
+    if TARGET_REPO:
+        # The agent's OWN repo in the collective org. It develops here freely --
+        # including CI, config and tooling, which the src/tests/docs allow-list
+        # refused. Only .git is off limits: rewriting history or hooks would be
+        # changing the tooling out from under itself.
+        if rel.startswith(".git/") or rel == ".git":
+            return {"ok": False, "error": f"refusing to write inside .git: {rel}"}
+    else:
+        allow = (
+            HARNESS_ALLOW if dest.resolve() == AUTODEV_HOME.resolve() else ALLOW_PREFIXES
+        )
+        if not rel.startswith(allow):
+            return {"ok": False, "error": f"path not allowed: {rel}"}
+    deny = {
+        "src/memory_policy.py",
+        "src/tiered_memory_policy.py",
+        "tests/test_tiered_memory_policy.py",
+    }
+    if rel in deny:
+        return {"ok": False, "error": f"stale path: {rel}"}
+    content = str(payload.get("content") or "")
+    if "\x00" in content:
+        return {"ok": False, "error": "nul in content"}
+    if (
+        "def test_" in content
+        and "assert" not in content
+        and "pytest.raises" not in content
+    ):
+        return {"ok": False, "error": "test has no assert; refusing pass stubs"}
+    if dest.resolve() == ROOT.resolve() and rel.startswith("src/memory_gate"):
+        return {"ok": False, "error": "memory-gate path in CSD worktree"}
+    url = os.environ.get("CSD_APPLY_URL", "").rstrip("/")
+    if url:
+        return apply_http(payload, worktree=worktree)
+    target = (dest / rel).resolve()
+    if dest.resolve() not in target.parents and target != dest.resolve():
+        return {"ok": False, "error": "escaped worktree"}
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if payload.get("substitutions"):
+        # The loop does the editing, so the content that is not being changed
+        # cannot be lost -- no shrink check is needed, because there is no way
+        # for this path to remove anything the pairs do not name.
+        sub = apply_substitutions(target, list(payload["substitutions"]))
+        if not sub.get("ok"):
+            return {"ok": False, "error": sub.get("error"), "substitutions": sub}
+        before = target.read_text(encoding="utf-8", errors="replace")
+        target.write_text(str(sub["content"]), encoding="utf-8")
+        claim = check_claims(target, goal)
+        if claim is not None:
+            # Put it back. A file left in a state the goal denies is worse than
+            # no change at all, and the next attempt should start from the same
+            # place this one did.
+            target.write_text(before, encoding="utf-8")
+            return {**claim, "substituted": sub.get("applied")}
+        return {
+            "ok": True,
+            "wrote": str(target),
+            "path": rel,
+            "substituted": sub.get("applied"),
+            # Carried, not swallowed: a mapping row that did not occur here
+            # must be visible in the tick record and the review.
+            "unmatched": sub.get("unmatched") or [],
+        }
+
+    # A whole-file write that drops most of an existing file is a DELETION, and
+    # the loop cannot tell an intended rewrite from a truncated reply by looking
+    # at the content. It has to compare against what is already there.
+    #
+    # This is a second line of defence behind fenced_block(), on purpose: that
+    # one is a heuristic over model output and will be wrong again, and when it
+    # is, the failure mode is losing a file the tests do not cover. RUNBOOK.md
+    # went from 250 lines to 11, passed the gate because documentation is not
+    # tested, and opened a PR.
+    shrink = shrink_check(target, str(payload.get("content")), goal)
+    if shrink is not None:
+        return shrink
+
+    before = (
+        target.read_text(encoding="utf-8", errors="replace")
+        if readable_file(target)
+        else None
+    )
+    target.write_text(str(payload.get("content")), encoding="utf-8")
+    claim = check_claims(target, goal)
+    if claim is not None:
+        if before is None:
+            target.unlink(missing_ok=True)
+        else:
+            target.write_text(before, encoding="utf-8")
+        return claim
+    return {"ok": True, "wrote": str(target), "path": rel}
+
+
+# How much of a file a single write may remove before it needs saying so in the
+# goal. Rewrites do legitimately shrink files -- extracting a block, deleting
+# dead code -- so this is deliberately generous. It is here to catch losing MOST
+# of a file, not to police size.
+SHRINK_KEEP_FRACTION = 0.5
+SHRINK_FLOOR_LINES = 20
+# Words that make a deletion the stated intent rather than an accident.
+SHRINK_INTENT = (
+    "delete",
+    "remove",
+    "truncate",
+    "empty",
+    "shorten",
+    "trim",
+    "strip",
+    "rewrite",
+    "replace the file",
+    "condense",
+)
+
+
+def shrink_check(target: Path, content: str, goal: str = "") -> dict | None:
+    """Refuse a write that removes most of an existing file, unless asked to.
+
+    Returns None to allow the write, or the refusal record to return.
+    """
+    if not readable_file(target):
+        return None
+    try:
+        before = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    old_lines = before.count("\n") + 1
+    new_lines = content.count("\n") + 1
+    if old_lines <= SHRINK_FLOOR_LINES:
+        return None
+    if new_lines >= old_lines * SHRINK_KEEP_FRACTION:
+        return None
+    if any(w in goal.lower() for w in SHRINK_INTENT):
+        return None
+    return {
+        "ok": False,
+        "error": (
+            f"refusing to shrink {target.name} from {old_lines} lines to "
+            f"{new_lines}: a whole-file write that drops "
+            f"{100 - int(100 * new_lines / old_lines)}% of the file is a "
+            "deletion, and the goal does not ask for one. If the reply was cut "
+            "off, ask for the file in pieces; if the deletion is intended, say "
+            "so in the goal."
+        ),
+        "shrink": {"path": target.name, "before": old_lines, "after": new_lines},
+    }
+
+
+def beat(extra: dict | None = None) -> None:
+    """Persist loop liveness plus cluster / next_goal / need_grok mailbox."""
+    HEART.parent.mkdir(parents=True, exist_ok=True)
+    prev = _read_json(HEART)
+    goal = next_open_goal() or "region-pretrain"
+    mailbox = _read_json(GROK_NEED)
+    rec = {
+        "t": time.time(),
+        "pid": os.getpid(),
+        "wt": str(dest_worktree(goal)),
+        "identity": IDENTITY,
+        "next_goal": goal,
+        "cluster": cluster_view(),
+        "ti": ti_ok(),
+        "need_grok": {
+            "need": False if not need_grok_enabled() else mailbox.get("need") is True,
+            "enabled": need_grok_enabled(),
+            "path": str(GROK_NEED),
+        },
+    }
+    last = prev.get("last")
+    if isinstance(last, dict):
+        rec["last"] = last
+    if extra:
+        rec.update(extra)
+    HEART.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+
+def ensure_idle_ping() -> None:
+    """Create or force-clear the mailbox. Flag off always writes need=false."""
+    GROK_NEED.parent.mkdir(parents=True, exist_ok=True)
+    if not need_grok_enabled():
+        GROK_NEED.write_text(
+            json.dumps({"need": False, "enabled": False}) + "\n",
+            encoding="utf-8",
+        )
+        return
+    if readable_file(GROK_NEED):
+        return
+    GROK_NEED.write_text(
+        json.dumps({"need": False, "enabled": True}) + "\n", encoding="utf-8"
+    )
+
+
+def cap_ping(rec: dict) -> dict:
+    """Keep ping JSON at or under 2 KiB. Drop dumps, never transcripts."""
+    drop = {
+        "text",
+        "transcript",
+        "stdout",
+        "stderr",
+        "journal",
+        "log",
+        "autodev-out",
+        "reply",
+    }
+    out = {k: v for k, v in rec.items() if k not in drop}
+    out["identity"] = IDENTITY
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    if len(raw) <= PING_MAX:
+        return out
+    out.pop("tried", None)
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    if len(raw) <= PING_MAX:
+        return out
+    out.pop("paths", None)
+    evidence = str(out.get("evidence") or "")
+    while len(json.dumps(out, separators=(",", ":")).encode()) > PING_MAX:
+        if len(evidence) > 40:
+            evidence = evidence[: max(40, len(evidence) // 2)]
+            out["evidence"] = evidence
+            continue
+        q = str(out.get("question") or "")
+        if len(q) > 40:
+            out["question"] = q[:40]
+            continue
+        break
+    return out
+
+
+def ping_fingerprint(goal: str, blocker: str, question: str) -> str:
+    return f"{goal_id(goal)}|{blocker}|{question[:120]}"
+
+
+def write_need_grok(
+    *,
+    question: str,
+    evidence: str,
+    goal: str,
+    blocker: str = "",
+    paths: list[str] | None = None,
+    tried: list[str] | None = None,
+) -> dict:
+    """Write the operator-wakes mailbox. No-op when CSD_NEED_GROK is off."""
+    if not need_grok_enabled():
+        return {"need": False, "enabled": False, "identity": IDENTITY}
+    ensure_idle_ping()
+    fp = ping_fingerprint(goal, blocker, question)
+    cur = _read_json(GROK_NEED)
+    if cur.get("need") is True and cur.get("fp") == fp:
+        return cur
+    rec = cap_ping(
+        {
+            "need": True,
+            "identity": IDENTITY,
+            "goal": goal_id(goal),
+            "question": question[:400],
+            "evidence": evidence[:800],
+            "blocker": blocker[:200],
+            "paths": (paths or [])[:8],
+            "tried": (tried or [])[:8],
+            "t": int(time.time()),
+            "fp": fp,
+        }
+    )
+    GROK_NEED.parent.mkdir(parents=True, exist_ok=True)
+    GROK_NEED.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    return rec
+
+
+def note_stall(fingerprint: str) -> int:
+    rec = _read_json(STALL)
+    counts = rec.get("counts") if isinstance(rec.get("counts"), dict) else {}
+    n = int(counts.get(fingerprint) or 0) + 1
+    counts[fingerprint] = n
+    rec["counts"] = counts
+    rec["t"] = time.time()
+    STALL.parent.mkdir(parents=True, exist_ok=True)
+    STALL.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    return n
+
+
+def maybe_ping_stall(
+    goal: str,
+    blocker: str,
+    question: str,
+    evidence: str,
+    *,
+    paths: list[str] | None = None,
+    tried: list[str] | None = None,
+) -> dict:
+    if not need_grok_enabled() or not stop_retry_enabled():
+        return {"need": False, "enabled": False, "stop_retry": False, "n": 0}
+    n = note_stall(ping_fingerprint(goal, blocker, question))
+    if n < STALL_N:
+        return {"need": False, "n": n}
+    return write_need_grok(
+        question=question,
+        evidence=evidence,
+        goal=goal,
+        blocker=blocker,
+        paths=paths,
+        tried=tried,
+    )
+
+
+def launch_local_workflow(goal: str, reason: str) -> dict:
+    """Dispatch Forgejo workflow csd-python-first-drive. Never hosted Grok."""
+    if os.environ.get("CSD_IN_WORKFLOW") == "1":
+        return {"ok": False, "skipped": "nested-workflow", "workflow": LOCAL_WF}
+    ref = os.environ.get("CSD_AUTODEV_REF", "feat/agent-harness")
+    rc, text = _run(
+        [
+            str(FORGEJO_CLI),
+            "workflow-dispatch",
+            "CogSynDelta",
+            LOCAL_WF,
+            "--ref",
+            ref,
+            "--input",
+            f"goal={goal_id(goal)}",
+            "--input",
+            f"reason={reason[:80]}",
+        ],
+        timeout=45,
+    )
+    rec: dict = {}
+    try:
+        rec = json.loads(text) if text.startswith("{") else {}
+    except json.JSONDecodeError:
+        rec = {}
+    rec.setdefault("ok", rc == 0)
+    rec["rc"] = rc
+    rec["workflow"] = LOCAL_WF
+    rec["hosted_grok"] = False
+    if not rec.get("ok"):
+        ping = write_need_grok(
+            question="Local workflow-dispatch failed; is homelab-cpu registered?",
+            evidence=(
+                f"blocker: missing runner or workflow; "
+                f"paths: .github/workflows/{LOCAL_WF}; tried: {reason}"
+            ),
+            goal=goal,
+            blocker="runner missing",
+            paths=[f".github/workflows/{LOCAL_WF}"],
+            tried=["workflow-dispatch", reason],
+        )
+        rec["ping"] = ping
+    return rec
+
+
+def _ref_is_protected(arg: str) -> bool:
+    """True when an argv token names a protected trunk (main/staging/develop/dev)."""
+    for branch in PROTECTED_REFS:
+        if arg == branch or arg.endswith(f":{branch}") or arg.endswith(f"/{branch}"):
+            return True
+    return False
+
+
+def git_cmd(args: list[str], cwd: Path) -> dict:
+    """Git as identity autodev. Never GitHub. Never author on protected trunks.
+
+    Merging ``origin/main`` *into* a feature branch is allowed (operator merge
+    or autodev catch-up). Checkout/switch/push of those trunks is not.
+    """
+    if any("github.com" in a.lower() for a in args):
+        return {"ok": False, "error": "never GitHub", "stdout": "never GitHub"}
+    cmd = args[0] if args else ""
+    # PUSH to a trunk is refused. CHECKOUT of one is not: the loop has to stand on
+    # the default branch to fetch and fast-forward it, and blocking that left it
+    # stranded on a branch that had been deleted on the forge. Standing on a trunk
+    # is not authoring on it -- land_git separately refuses to push from one.
+    if cmd == "push":
+        for a in args[1:]:
+            if _ref_is_protected(a):
+                return {"ok": False, "error": f"refusing {cmd} {a}", "stdout": ""}
+    if cmd in {"merge", "rebase"}:
+        br = current_branch(cwd)
+        # A FAST-FORWARD of a trunk to its own remote is not authoring on it: it
+        # creates no commit and invents nothing, it moves the local ref to what
+        # origin already has. Refusing it is what kept the worktree pinned to a
+        # stale main -- autodev branched from a main four commits behind, so its
+        # PR carried the OLD workflows and CI skipped every check on it.
+        #
+        # The refusal that actually protects the trunk is on `push`, which is
+        # unconditional. This narrow exemption requires all three: --ff-only, on
+        # the trunk itself, merging that same trunk's remote-tracking ref.
+        ff_of_own_remote = (
+            cmd == "merge"
+            and "--ff-only" in args
+            and br in PROTECTED_REFS
+            and any(a == f"origin/{br}" for a in args[1:])
+        )
+        if br in PROTECTED_REFS and not ff_of_own_remote:
+            return {"ok": False, "error": f"refusing {cmd} on {br}", "stdout": ""}
+    argv = [str(GIT_CLI), "-C", str(cwd), *args]
+    rc, text = _run(argv, cwd=cwd, timeout=120)
+    return {"ok": rc == 0, "rc": rc, "stdout": text}
+
+
+def forgejo_cmd(args: list[str], timeout: int = 90) -> dict:
+    rc, text = _run([str(FORGEJO_CLI), *args], timeout=timeout)
+    rec: dict = {}
+    start = text.find("{")
+    if start >= 0:
+        try:
+            rec = json.loads(text[start:])
+        except json.JSONDecodeError:
+            rec = {}
+    if not isinstance(rec, dict):
+        rec = {}
+    rec.setdefault("ok", rc == 0)
+    rec["rc"] = rc
+    return rec
+
+
+def current_branch(cwd: Path) -> str:
+    rec = git_cmd(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    return str(rec.get("stdout") or "").strip()
+
+
+def current_sha(cwd: Path) -> str:
+    rec = git_cmd(["rev-parse", "HEAD"], cwd)
+    return str(rec.get("stdout") or "").strip()
+
+
+def goal_branch(goal: str) -> str:
+    """A stable branch name from the goal id.
+
+    Derived from the id rather than a timestamp or a hash so that re-running a
+    goal reuses its branch instead of leaving a trail of near-identical ones for
+    the operator to prune.
+    """
+    import re as _re
+
+    gid = goal_id(goal) or ""
+    slug = _re.sub(r"[^a-z0-9]+", "-", gid.lower()).strip("-")
+    if not slug:
+        slug = _re.sub(r"[^a-z0-9]+", "-", goal.lower()).strip("-")[:40] or "work"
+    return f"autodev/{slug}"
+
+
+def close_goal(branch: str) -> dict:
+    """Mark the goal that produced `branch` as done, so it is not picked again.
+
+    Without this a merged goal stays `open` and the loop rebuilds the same change
+    every tick -- an unattended machine producing a PR for work already landed.
+
+    Matched by the same slug that named the branch, so it cannot drift from how
+    the branch was chosen.
+    """
+    import re as _re
+
+    slug = branch.split("/", 1)[-1].strip().lower()
+    if not slug or not readable_file(GOALS):
+        return {"ok": False, "reason": "no branch slug or no goals file"}
+
+    lines = GOALS.read_text(encoding="utf-8").splitlines()
+    changed = None
+    legacy: tuple[int, str] | None = None
+    for i, line in enumerate(lines):
+        if "| G-" not in line or "| open |" not in line:
+            continue
+        m = _re.search(r"\|\s*(G-[A-Za-z0-9-]+)\s*\|", line)
+        if not m:
+            continue
+        row = _re.sub(r"[^a-z0-9]+", "-", m.group(1).lower()).strip("-")
+        if row == slug:
+            lines[i] = line.replace("| open |", "| done |")
+            changed = m.group(1)
+            break
+        # Fallback for branches named before goal_id kept the task number:
+        # `autodev/g-val` was pushed for G-VAL-1 and its PR may still be open.
+        # Exact matching is tried across ALL rows first, so this can never
+        # shadow a correctly-named branch.
+        if row.startswith(slug + "-"):
+            legacy = legacy or (i, m.group(1))
+
+    if changed is None and legacy:
+        i, changed = legacy
+        lines[i] = lines[i].replace("| open |", "| done |")
+
+    if not changed:
+        return {"ok": False, "reason": f"no open goal matches branch {branch!r}"}
+    GOALS.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"ok": True, "closed": changed, "branch": branch}
+
+
+def sync_worktree(cwd: Path, repo: str = "", inflight: dict | None = None) -> dict:
+    """Bring the worktree to the right branch, syncing only when a PR has merged.
+
+    A merge is the event that makes the worktree stale: delete-on-merge removes
+    the remote branch, so the local ref dangles and the next merge trips over it.
+    While a PR is still open there is nothing to sync to -- the work belongs on
+    that branch, and moving to the default one is what made every tick fail with
+    "refusing sync on main".
+
+    Returns `merged_since_last` so the caller can tell the implementer that its
+    previous change landed and this is a fresh start, not a continuation.
+    """
+    if not cwd.is_dir():
+        return {"ok": False, "error": "worktree missing"}
+
+    steps: list[dict] = []
+
+    def step(name, args):
+        rc = git_cmd(args, cwd)
+        ok = bool(rc.get("ok"))
+        rec = {"step": name, "ok": ok}
+        if not ok:
+            rec["out"] = str(rc.get("stdout") or "")[:160]
+        steps.append(rec)
+        return ok
+
+    # Always safe, and always useful: drop refs for branches deleted on the forge.
+    step("fetch-prune", ["fetch", "--prune", "origin"])
+
+    head = git_cmd(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
+    base = str(head.get("stdout") or "").strip().rsplit("/", 1)[-1] or "main"
+    current = current_branch(cwd)
+
+    inflight = inflight or {}
+    number = inflight.get("number")
+    pr = {}
+    if number and repo:
+        # FLAT dict: head is the ref string, merged is a bool. The nested
+        # head.ref form is GitHub's shape, not this CLI's.
+        pr = forgejo_cmd(["pr", repo, str(int(number))], timeout=60) or {}
+
+    pr_branch = str(pr.get("head") or inflight.get("head") or "").strip()
+    pr_merged = bool(pr.get("merged") or inflight.get("merged"))
+    # A branch the forge no longer has is a merged-and-deleted branch.
+    branch_gone = bool(pr_branch) and pr_branch not in str(
+        git_cmd(["ls-remote", "--heads", "origin", pr_branch], cwd).get("stdout") or ""
+    )
+
+    if number and pr_branch and not pr_merged and not branch_gone:
+        # Work in progress. Stay where it belongs; do not touch the tree.
+        if current != pr_branch:
+            step("checkout-inflight", ["checkout", pr_branch])
+        return {
+            "ok": all(s["ok"] for s in steps),
+            "on": current_branch(cwd),
+            "base": base,
+            "synced": False,
+            "merged_since_last": False,
+            "reason": f"PR #{number} still open on {pr_branch}",
+            "steps": steps,
+        }
+
+    # Either the PR merged, its branch is gone, or there was never one. This is
+    # the moment to sync: get clean, return to the default branch, fast-forward,
+    # and drop local branches whose work is already in it.
+    # A GONE BRANCH IS NOT A MERGE. Both leave nothing to sync to, so both mean
+    # "return to the default branch" -- but only a merge means the WORK LANDED,
+    # and only that may close the goal. Treating them alike marked G-VAL-1 done
+    # when its PR #7 was closed unmerged: the goal left the queue and the work
+    # would never have been redone.
+    #
+    # delete-on-merge still works, because the API reports merged=true for the
+    # PR long after its branch is gone. And when the lookup fails outright,
+    # pr_merged is false and the goal simply stays open, which is the safe
+    # direction: a goal redone is cheap, a goal silently dropped is not.
+    merged_since_last = bool(number) and pr_merged
+    abandoned = bool(number) and branch_gone and not pr_merged
+
+    step("reset", ["reset", "--hard"])
+    step("clean", ["clean", "-fd"])
+    if current != base:
+        step("checkout-base", ["checkout", base])
+    step("ff-base", ["merge", "--ff-only", f"origin/{base}"])
+
+    gone: list[str] = []
+    merged_out = git_cmd(["branch", "--merged", base], cwd)
+    for line in str(merged_out.get("stdout") or "").splitlines():
+        name = line.strip().lstrip("* ").strip()
+        if not name or name == base or name in PROTECTED_REFS:
+            continue
+        # An UNMERGED branch is left alone: that is work in flight, or evidence.
+        if git_cmd(["branch", "-d", name], cwd).get("ok"):
+            gone.append(name)
+
+    # ff-base is no longer excused. It was, and that is how a REFUSED
+    # fast-forward looked like a healthy sync for four commits: every branch cut
+    # afterwards carried a stale base. A sync that did not sync must say so.
+    return {
+        "ok": all(s["ok"] for s in steps),
+        "on": current_branch(cwd),
+        "base": base,
+        "synced": True,
+        "merged_since_last": merged_since_last,
+        "pruned_local": gone,
+        "abandoned": abandoned,
+        "reason": (
+            "previous PR merged; starting fresh"
+            if merged_since_last
+            else "previous PR closed WITHOUT merging; its goal stays open"
+            if abandoned
+            else "no PR in flight"
+        ),
+        "steps": steps,
+    }
+
+
+def gate_command(cwd: Path) -> list[str]:
+    """The command THIS repository uses to test itself.
+
+    Bare `python3 -m pytest` is our assumption, not the repo's contract, and on a
+    src-layout package it cannot import the package at all: nl-router failed
+    every gate with `ModuleNotFoundError: No module named 'nl_router'` while its
+    own CI passed, because CI runs `uv run pytest`, which installs it first.
+    A gate that fails for a reason the repo does not share is not a gate, it is a
+    blocker on work that was fine.
+
+    Read from the repository, in the order that a person would try:
+      1. a lockfile plus uv on PATH -- the repo declares a managed environment
+      2. a src/ layout -- the package is importable only with src on the path
+      3. plain pytest
+    """
+    # RUST. cargo test is the gate; there is no ambiguity and no alternative.
+    if (cwd / "Cargo.toml").is_file() and shutil.which("cargo"):
+        return ["cargo", "test", "--all-features"]
+
+    # SHELL. A repo of shell scripts has no test runner, and its gate is
+    # shellcheck. This is what blocked rung 4 -- and "the gate does not exist"
+    # was recorded as a reason to SKIP the repo, which is a stall with better
+    # vocabulary. `-S warning` matches the house standard.
+    if shutil.which("shellcheck"):
+        sh = sorted(
+            str(f.relative_to(cwd)) for f in cwd.rglob("*.sh") if ".git" not in f.parts
+        )
+        if not sh and not (cwd / "tests").is_dir():
+            # Extensionless scripts with a shell shebang count too: this fleet
+            # writes them that way, which is the same blind spot that let twenty
+            # Python scripts go unlinted.
+            for f in sorted(cwd.rglob("*")):
+                if not f.is_file() or ".git" in f.parts:
+                    continue
+                try:
+                    if f.open("rb").readline().startswith(b"#!") and b"sh" in (
+                        f.open("rb").readline() or b""
+                    ):
+                        sh.append(str(f.relative_to(cwd)))
+                except OSError:
+                    continue
+        if sh:
+            return ["shellcheck", "-S", "warning", *sh[:200]]
+
+    if (cwd / "uv.lock").is_file() and shutil.which("uv"):
+        return ["uv", "run", "pytest", "-q", "--no-header", "tests/"]
+    return ["python3", "-m", "pytest", "-q", "--no-header", "tests/"]
+
+
+def run_repo_gates(cwd: Path, *, baseline: bool = False) -> dict:
+    """Run the repository's own test suite. Its gates, not ours.
+
+    A repo with no tests is not a failure -- plenty of goals touch docs or config
+    -- but a repo WITH tests that now fail must not reach a PR. The distinction
+    matters: treating "no tests" as failure would block every docs change.
+
+    `baseline=True` runs it BEFORE the change, so a suite that was already broken
+    is not blamed on the implementer. Without that the loop retried a correct
+    change three times against a repo whose tests could not even be collected,
+    and then went quiet.
+    """
+    # `tests/` is a PYTHON convention. A Rust crate keeps them beside the source
+    # and a shell repo has none at all, so requiring the directory made every
+    # non-Python repo report "no tests" -- a pass, on a repo nothing had checked.
+    if (
+        not (cwd / "tests").is_dir()
+        and not (cwd / "Cargo.toml").is_file()
+        and not any(cwd.rglob("*.sh"))
+    ):
+        return {"ok": True, "skipped": "no tests/ directory"}
+
+    env = dict(os.environ)
+    if (cwd / "src").is_dir():
+        # A src layout is importable only with src on the path. Set it for the
+        # fallback command; `uv run` does not need it and ignores it harmlessly.
+        env["PYTHONPATH"] = str(cwd / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    argv = gate_command(cwd)
+    rc, out = _run(argv, cwd=cwd, timeout=900, env=env)
+    if rc == 127:
+        return {"ok": True, "skipped": "pytest not available"}
+    # pytest exits 5 when it collected nothing at all.
+    if rc == 5:
+        return {"ok": True, "skipped": "no tests collected"}
+    tail = "\n".join(out.strip().splitlines()[-12:])
+    rec = {"ok": rc == 0, "rc": rc, "output": tail, "argv": " ".join(argv)}
+    if baseline:
+        rec["baseline"] = True
+    return rec
+
+
+def land_git(goal: str, applied: dict) -> dict:
+    """Commit and push the applied slice as autodev. Never GitHub."""
+    if applied.get("skipped") or not applied.get("ok"):
+        return {"ok": True, "skipped": applied.get("skipped") or "apply-not-ok"}
+    rel = str(applied.get("path") or "")
+    cwd = dest_worktree(goal)
+    repo = repo_for(goal, cwd)
+    if not cwd.is_dir():
+        return {"ok": False, "error": "worktree missing", "repo": repo}
+
+    # THE GATE. Before this existed the loop pushed whatever was written and
+    # opened a PR on it; its first PR carried three failing tests.
+    gates = run_repo_gates(cwd)
+    if not gates.get("ok"):
+        # WAS IT ALREADY BROKEN? Ask the tree without the change. nl-router's
+        # suite could not even be COLLECTED -- its package is a src layout that
+        # only imports under `uv run` -- so a correct change was refused three
+        # times and blamed on the implementer. A gate that cannot tell "you broke
+        # it" from "it was broken" turns a repo defect into an infinite retry.
+        stashed = git_cmd(
+            [
+                "stash",
+                "push",
+                "--keep-index",
+                "--include-untracked",
+                "-m",
+                "autodev-baseline",
+            ],
+            cwd,
+        )
+        base = run_repo_gates(cwd, baseline=True) if stashed.get("ok") else {}
+        if stashed.get("ok"):
+            git_cmd(["stash", "pop"], cwd)
+        if base and not base.get("ok"):
+            return {
+                "ok": False,
+                "error": "the repo's own tests were ALREADY failing before "
+                "this change; not an implementation defect",
+                "repo": repo,
+                "gates": gates,
+                "baseline": base,
+                "needs_onboarding": True,
+            }
+        return {
+            "ok": False,
+            "error": "repo tests fail; refusing to push",
+            "repo": repo,
+            "gates": gates,
+        }
+    branch = current_branch(cwd)
+    if branch in PROTECTED_REFS:
+        # Never push a protected ref -- but do not just stop. A clone is on main
+        # by default, so refusing without creating a branch means the loop can
+        # never land anything. Make the branch the change belongs on.
+        want = goal_branch(goal)
+        made = git_cmd(["checkout", "-B", want], cwd)
+        if not made.get("ok"):
+            return {
+                "ok": False,
+                "error": f"could not create {want}: {str(made.get('stdout'))[:160]}",
+                "repo": repo,
+                "was_on": branch,
+            }
+        branch = current_branch(cwd)
+        if branch in PROTECTED_REFS:
+            return {"ok": False, "error": f"refusing push {branch}", "repo": repo}
+    # Skip when the loop owns the worktree: sync_worktree already fetched and
+    # fast-forwarded at the top of the tick, BEFORE anything was written. Doing it
+    # again here runs AFTER the file is applied, so it tries to fast-forward over
+    # uncommitted work and aborts -- "local changes would be overwritten by merge".
+    # Integrate first, then edit; never the reverse.
+    integrated = (
+        {"ok": True, "skipped": "synced at tick start"}
+        if TARGET_WORKTREE_SYNC
+        else integrate_remote(cwd)
+    )
+    if not integrated.get("ok"):
+        return {
+            "ok": False,
+            "error": integrated.get("error") or "integrate remote failed",
+            "repo": repo,
+            "branch": branch,
+            "integrate": integrated,
+        }
+    if rel:
+        add = git_cmd(["add", "--", rel], cwd)
+        if not add.get("ok"):
+            return {
+                "ok": False,
+                "error": add.get("stdout") or "git add failed",
+                "repo": repo,
+            }
+    staged = git_cmd(["diff", "--cached", "--name-only"], cwd)
+    if not str(staged.get("stdout") or "").strip():
+        # NOTHING TO COMMIT MEANS THE WORK IS ALREADY THERE. The implementer
+        # wrote a file identical to the one in the tree, which is what happens
+        # when the change landed by another route: an operator bootstrap merge,
+        # a duplicate PR, or a hand fix. The goal is satisfied.
+        #
+        # Left open, the loop re-picks it every wake and re-runs the model
+        # forever on work that is done -- G-CI-1 did exactly that after its PR
+        # was merged outside the loop. Closing it here is the only place that
+        # can tell the difference, because sync_worktree only closes goals whose
+        # PR IT tracked.
+        # ...OR THE MODEL DID NOTHING. A clean tree cannot tell those apart on
+        # its own, and guessing "satisfied" closes goals whose work was never
+        # done. G-ARCH-GUARDS was asked to correct five wrong paragraphs, wrote
+        # the file back byte-identical, and was marked done with every wrong
+        # paragraph still in it -- on a green gate, because prose has no tests.
+        #
+        # So ask the forge for the evidence: a branch whose PR merged really did
+        # land its work. One that never had a merged PR did not.
+        if branch_ever_merged(repo, branch):
+            closed = close_goal(branch)
+            cont = emit_continue("goal already satisfied") if closed.get("ok") else {}
+            return {
+                "ok": True,
+                "skipped": "clean",
+                "branch": branch,
+                "repo": repo,
+                "closed_goal": closed,
+                "continue": cont,
+                "why": "a PR from this branch merged; the tree already has it",
+            }
+        return {
+            "ok": False,
+            "skipped": None,
+            "branch": branch,
+            "repo": repo,
+            "error": (
+                "the implementer wrote the file back unchanged and no PR from "
+                f"{branch} has ever merged, so the goal is NOT satisfied"
+            ),
+            "no_op": True,
+        }
+    if TARGET_REPO:
+        msg = commit_message(goal, str(applied.get("path") or ""))
+    else:
+        # The CSD programme's own convention, left as it is.
+        scope = "agents" if repo == "CogSynDelta" else "memory"
+        msg = f"feat({scope}): {goal_id(goal)} autodev slice"
+    commit = git_cmd(["commit", "-m", msg], cwd)
+    if not commit.get("ok"):
+        return {
+            "ok": False,
+            "error": commit.get("stdout") or "commit failed",
+            "repo": repo,
+        }
+    sha = current_sha(cwd)
+    remote = str(integrated.get("remote") or push_remote(cwd))
+    push = git_cmd(["push", remote, f"HEAD:{branch}"], cwd)
+    if not push.get("ok"):
+        retry = integrate_remote(cwd)
+        push = git_cmd(["push", remote, f"HEAD:{branch}"], cwd)
+        if not push.get("ok"):
+            return {
+                "ok": False,
+                "error": push.get("error") or push.get("stdout") or "push failed",
+                "branch": branch,
+                "sha": sha,
+                "repo": repo,
+                "remote": remote,
+                "integrate": retry,
+            }
+    return {
+        "ok": True,
+        "branch": branch,
+        "sha": current_sha(cwd),
+        "repo": repo,
+        "remote": remote,
+        # Carried so the PR title can be derived the same way the commit
+        # subject was, instead of a second hardcoded scope disagreeing with it.
+        "path": rel,
+    }
+
+
+def branch_ever_merged(repo: str, head: str) -> bool:
+    """Did a PR from this branch ever merge?
+
+    The evidence that distinguishes "the work landed by another route" from
+    "the model produced a no-op", which a clean tree cannot tell apart on its
+    own.
+    """
+    rec = forgejo_cmd(["prs", repo, "--state", "all", "--limit", "50"])
+    for row in rec.get("pulls") or []:
+        if (
+            isinstance(row, dict)
+            and str(row.get("head") or "") == head
+            and row.get("merged")
+        ):
+            return True
+    return False
+
+
+def existing_pr(repo: str, head: str) -> int | None:
+    rec = forgejo_cmd(["prs", repo, "--state", "open", "--limit", "20"])
+    for row in rec.get("pulls") or []:
+        if isinstance(row, dict) and str(row.get("head") or "") == head:
+            try:
+                return int(row.get("number"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def scrutinise_ci(repo: str, sha: str) -> dict:
+    """CLEAN / SUSPECT / FAIL for a commit's checks.
+
+    Delegates to csd-ci-scrutiny, which compares the checks that RAN against the
+    workflows the repository DECLARES. A workflow that produced no run leaves no
+    context to inspect, so counting contexts can never notice it -- that is the
+    shape of a fake green tick.
+    """
+    tool = ROOT / "scripts/csd-ci-scrutiny"
+    if not tool.is_file():
+        return {"verdict": "SUSPECT", "findings": ["csd-ci-scrutiny is not installed"]}
+    rc, out = _run([str(tool), repo, sha, "--json"], timeout=120, limit=40000)
+    try:
+        d = json.loads(out[out.find("{") : out.rfind("}") + 1])
+    except Exception:
+        return {
+            "verdict": "SUSPECT",
+            "findings": [f"could not read the scrutiny result (rc={rc})"],
+            "raw": out[:200],
+        }
+    return d
+
+
+def arm_ci_watcher(repo: str, sha: str, number: int | None) -> dict:
+    """Start a bounded watcher that will emit a `ci` event when CI settles.
+
+    THIS FORGE EMITS NO CI WEBHOOK. Probed one event name at a time against
+    Forgejo 16.0.2: `status`, `commit_status`, `workflow_run`, `workflow_job`,
+    `check_run` and `check_suite` are all silently DROPPED at registration --
+    they look accepted and never fire. So the CI half of the loop has no
+    upstream emitter, and this arms the adapter that makes one.
+
+    Armed rather than awaited. The tick used to block on `wait` for 90s and then
+    return with nothing scheduled to look again: if CI had not decided in that
+    window, the PR sat until the hourly reconcile. Blocking longer is worse --
+    a tick that waits half an hour cannot be stopped, cannot be told about a
+    merge that happened meanwhile, and holds its worktree throughout.
+
+    The watcher detaches deliberately (`start_new_session`), and
+    autodev-tick.service sets `KillMode=process` so it outlives the tick that
+    armed it. It carries its own deadline and an O_EXCL lock on the sha, so it
+    cannot accumulate: with no PR in flight, no watcher exists.
+    """
+    if not (EVENTS_CLI.is_file() and repo and sha):
+        return {"ok": False, "why": "no events CLI or no sha"}
+    lock = Path(os.environ.get("AUTODEV_EVENT_DIR", "/home/svc-autodev/events"))
+    if (lock / f".watch-{sha[:12]}.lock").exists():
+        return {"ok": True, "already": sha[:12]}
+    argv = [
+        str(SECRET_CLI),
+        "exec",
+        "TOKEN=forgejo/token",
+        "--",
+        sys.executable,
+        str(EVENTS_CLI),
+        "watch-ci",
+        "--repo",
+        repo,
+        "--sha",
+        sha,
+        "--pr",
+        str(int(number or 0)),
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
+    return {"ok": True, "pid": proc.pid, "sha": sha[:12]}
+
+
+def review_pr(repo: str, number: int, goal: str, ci: dict) -> dict:
+    """A DIFFERENT agent reads the diff before the merge gate runs.
+
+    CI proves the suite is green. It cannot tell you the change does what the
+    goal asked, does only that, or is not wrong on a path no test covers.
+    G-SCHEMA-1 landed a behaviour change with none of the tests its goal demanded
+    and merged on green CI; the reviewer, run against that same PR afterwards,
+    called it in one sentence.
+
+    Runs AFTER CI has settled, so the reviewer sees the verdict it is reviewing
+    under, and BEFORE merge-gate, so its refusal actually stops the merge.
+
+    FAILS CLOSED. Anything other than a clean APPROVE -- a refusal, an
+    unreadable reply, a crash, a missing script -- leaves the PR unmerged. The
+    whole point is to stop merging on one signal; treating a broken reviewer as
+    assent would restore exactly that.
+    """
+    if not REVIEW_CLI.is_file():
+        return {
+            "ok": False,
+            "verdict": "REQUEST_CHANGES",
+            "why": "no reviewer installed; refusing to merge on CI alone",
+        }
+    summary = f"{ci.get('verdict', '?')}, {ci.get('passed', '?')} check(s) passed"
+    rc, text = _run(
+        [
+            sys.executable,
+            str(REVIEW_CLI),
+            repo,
+            str(int(number)),
+            "--goal",
+            goal[:4000],
+            "--ci",
+            summary,
+        ],
+        timeout=420,
+        limit=20000,
+    )
+    rec: dict = {}
+    start = text.find("{")
+    if start >= 0:
+        try:
+            rec = json.loads(text[start:])
+        except json.JSONDecodeError:
+            rec = {}
+    if not isinstance(rec, dict) or not rec.get("verdict"):
+        return {
+            "ok": False,
+            "verdict": "REQUEST_CHANGES",
+            "rc": rc,
+            "why": "reviewer produced no verdict",
+            "out": text[:400],
+        }
+    rec["rc"] = rc
+    rec["ok"] = rec.get("verdict") == "APPROVE"
+    return rec
+
+
+def land_pr(goal: str, git_rec: dict) -> dict:
+    """PR / wait / merge-gate. Merge only when required checks ran."""
+    if git_rec.get("skipped") or not git_rec.get("ok"):
+        return {"ok": bool(git_rec.get("ok")), "skipped": git_rec.get("skipped")}
+    repo = str(git_rec.get("repo") or "") or repo_for(goal)
+    head = str(git_rec.get("branch") or "")
+    sha = str(git_rec.get("sha") or "")
+    if not head or not sha:
+        return {"ok": False, "error": "missing branch/sha"}
+    number = existing_pr(repo, head)
+    if number is None:
+        created = forgejo_cmd(
+            [
+                "pr-create",
+                repo,
+                (
+                    # Same derivation as the commit, so the PR title and the
+                    # log agree instead of naming two different scopes.
+                    commit_message(goal, str(git_rec.get("path") or "")).splitlines()[0]
+                    if TARGET_REPO
+                    else (
+                        f"feat(harness): {goal_id(goal)}"
+                        if repo == "csd-autodev" or is_harness_goal(goal)
+                        else (
+                            f"feat(agents): {goal_id(goal)}"
+                            if is_region_pretrain(goal)
+                            else f"feat(memory): {goal_id(goal)}"
+                        )
+                    )
+                ),
+                head,
+                "--base",
+                "main",
+                "--body",
+                f"Autodev {goal_id(goal)}. Merge-gate only when checks ran.",
+            ]
+        )
+        try:
+            number = int(created.get("number") or 0) or None
+        except (TypeError, ValueError):
+            number = None
+        if number is None:
+            return {"ok": False, "error": created.get("error") or "pr-create failed"}
+    # Arm BEFORE waiting. If this tick dies in the next ninety seconds, the
+    # watcher is already the thing that will wake the next one.
+    armed = arm_ci_watcher(repo, sha, number)
+    wait_s = int(os.environ.get("CSD_AUTODEV_WAIT", "90"))
+    wait_rec = forgejo_cmd(
+        ["wait", repo, sha, "--timeout", str(wait_s), "--poll", "5"],
+        timeout=wait_s + 20,
+    )
+    state = str(wait_rec.get("state") or "")
+    out = {
+        "ok": False,
+        "repo": repo,
+        "head": head,
+        "sha": sha,
+        "number": number,
+        "wait": wait_rec,
+        "ci_watcher": armed,
+        "merged": False,
+        "required_ran": False,
+        "required_succeeded": False,
+    }
+    if state != "success":
+        # Not a dead end any more: the armed watcher will emit a `ci` event when
+        # the checks settle, and that event starts the tick that decides.
+        out["notes"] = (
+            f"wait state={state}; not merge-gate. CI watcher armed: {armed.get('ok')}"
+        )
+        return out
+    # Look at the CI before asking to merge. merge-gate answers "did required
+    # checks succeed", which is blind to a job that was skipped and to a workflow
+    # that never dispatched -- both of which leave "nothing failed" true.
+    ci = scrutinise_ci(repo, sha)
+    out["ci"] = ci
+    if ci.get("verdict") != "CLEAN":
+        out["notes"] = (
+            f"CI {ci.get('verdict')}: " + "; ".join(ci.get("findings") or [])[:300]
+        )
+        out["ok"] = False
+        return out
+
+    # AN INDEPENDENT AGENT, AFTER CI, BEFORE THE MERGE. Two signals, not one.
+    review = review_pr(repo, number, goal, ci)
+    out["review"] = review
+    if not review.get("ok"):
+        out["notes"] = (
+            f"review {review.get('verdict')}: {str(review.get('why') or '')[:200]}"
+        )
+        out["ok"] = False
+        # A reviewer asking for changes is work to do, not a stall: emit so the
+        # next attempt starts now. A REJECT is not retried -- it means the change
+        # should not exist, and another pass at the same goal would rebuild it.
+        if review.get("verdict") == "REQUEST_CHANGES":
+            # THE COMPLAINT IS THE FEEDBACK. Without carrying it forward the
+            # implementer reruns the same goal blind and produces the same diff,
+            # and a reviewer that is WRONG deadlocks the loop permanently rather
+            # than being argued with. The reviewer is a 4B model reading a large
+            # diff; it has already produced a false INCOMPLETE (claiming a test
+            # was missing that was present in the diff), so "the reviewer might
+            # be mistaken" is a measured fact, not a hypothetical.
+            out["review_note"] = str(review.get("why") or "")[:600]
+            out["retry"] = emit_retry(
+                goal, "review requested changes", int(os.environ.get("_AD_FAILS", "0"))
+            )
+        return out
+
+    gate = forgejo_cmd(["merge-gate", repo, sha, str(number)], timeout=120)
+    out["gate"] = gate
+    out["required_ran"] = bool(gate.get("required_ran"))
+    out["required_succeeded"] = bool(gate.get("required_succeeded"))
+    out["merged"] = bool(gate.get("merged"))
+    out["ok"] = bool(gate.get("ok") and gate.get("merged"))
+    out["notes"] = str(gate.get("notes") or "")
+    return out
+
+
+def steer_note() -> str:
+    try:
+        return str(fetch_steer().get("note") or "").strip()
+    except Exception:
+        return ""
+
+
+def note_fingerprint(note: str) -> str:
+    return note.replace("\n", " ")[:240]
+
+
+def should_apply_steer_note(last: dict, note: str) -> bool:
+    """Operator steer with CI/branch hints must not be ignored while follow-stuck."""
+    if not note:
+        return False
+    fp = note_fingerprint(note)
+    if last.get("consumed_note") == fp:
+        return False
+    low = note.lower()
+    markers = (
+        "actions/runs",
+        "jobs/",
+        "import",
+        "pytest",
+        "failure",
+        "updated the branch",
+        "out of date",
+        "reran checks",
+        "merge",
+        "rebase",
+    )
+    return any(m in low for m in markers)
+
+
+def refresh_pr(last: dict) -> dict:
+    """Replace heartbeat SHA with the live Forgejo PR head (merge or rebase)."""
+    repo = str(last.get("repo") or "") or repo_for(str(last.get("goal") or ""))
+    number = last.get("number")
+    out = dict(last)
+    out["repo"] = repo
+    if number is None:
+        return out
+    pr = forgejo_cmd(["pr", repo, str(int(number))])
+    sha = str(pr.get("sha") or last.get("sha") or "")
+    if sha:
+        out["sha"] = sha
+    out["number"] = int(number)
+    out["head"] = pr.get("head") or last.get("head")
+    out["base"] = pr.get("base") or last.get("base") or "main"
+    out["base_sha"] = pr.get("base_sha") or last.get("base_sha")
+    out["mergeable"] = pr.get("mergeable")
+    out["mergeable_state"] = pr.get("mergeable_state")
+    out["merged"] = bool(pr.get("merged") or last.get("merged"))
+    out["state"] = pr.get("state") or last.get("state")
+    out["pr_http"] = pr.get("http")
+    return out
+
+
+def divergence(repo: str, base: str, sha: str) -> dict:
+    """How far the PR head is behind the merge target (usually main)."""
+    if not repo or not base or not sha:
+        return {"behind": 0, "ahead": 0, "ok": False}
+    rec = forgejo_cmd(["compare", repo, str(base), sha])
+    try:
+        behind = int(rec.get("behind") or 0)
+    except (TypeError, ValueError):
+        behind = 0
+    try:
+        ahead = int(rec.get("ahead") or 0)
+    except (TypeError, ValueError):
+        ahead = 0
+    status = str(rec.get("status") or "")
+    if behind == 0 and status in {"behind", "diverged"}:
+        behind = 1
+    return {
+        "behind": behind,
+        "ahead": ahead,
+        "status": status,
+        "ok": bool(rec.get("ok", rec.get("http") == 200)),
+    }
+
+
+def push_remote(cwd: Path) -> str:
+    """Prefer ``forgejo`` (lab) then ``origin``. Never GitHub."""
+    rec = git_cmd(["remote"], cwd)
+    names = set(str(rec.get("stdout") or "").split())
+    for name in ("forgejo", "origin"):
+        if name in names:
+            return name
+    return "origin"
+
+
+def integrate_remote(cwd: Path, *, base: str = "main") -> dict:
+    """Merge remote feature + merge-target into HEAD (merge, not rebase).
+
+    Covers operator ``git merge main`` on the PR: local worker is behind the
+    feature ref itself, not only behind ``main``.
+    """
+    branch = current_branch(cwd)
+    if branch in PROTECTED_REFS:
+        return {"ok": False, "error": f"refusing sync on {branch}"}
+    remote = push_remote(cwd)
+    fetch = git_cmd(["fetch", remote], cwd)
+    if not fetch.get("ok"):
+        return {
+            "ok": False,
+            "error": fetch.get("stdout") or "fetch failed",
+            "fetch": fetch,
+        }
+    steps: list[dict] = []
+    for ref in (f"{remote}/{branch}", f"{remote}/{base}"):
+        merged = git_cmd(["merge", "--no-edit", ref], cwd)
+        out = str(merged.get("stdout") or merged.get("error") or "")
+        steps.append({"ref": ref, "ok": bool(merged.get("ok")), "out": out[:400]})
+        if merged.get("ok"):
+            continue
+        git_cmd(["merge", "--abort"], cwd)
+        miss = (
+            "not something we can merge" in out.lower()
+            or "unknown revision" in out.lower()
+            or "couldn't find" in out.lower()
+            or "does not exist" in out.lower()
+        )
+        if miss:
+            continue
+        return {
+            "ok": False,
+            "error": out or "merge failed",
+            "steps": steps,
+            "remote": remote,
+        }
+    return {
+        "ok": True,
+        "sha": current_sha(cwd),
+        "branch": branch,
+        "remote": remote,
+        "base": base,
+        "how": "merge",
+        "steps": steps,
+    }
+
+
+def sync_feature_with_base(cwd: Path, base: str = "main") -> dict:
+    """Merge remote feature + origin/<base> into HEAD, then push the feature."""
+    sync = integrate_remote(cwd, base=base)
+    if not sync.get("ok"):
+        return sync
+    branch = str(sync.get("branch") or current_branch(cwd))
+    remote = str(sync.get("remote") or push_remote(cwd))
+    push = git_cmd(["push", remote, f"HEAD:{branch}"], cwd)
+    return {
+        **sync,
+        "ok": bool(push.get("ok")),
+        "push": push,
+        "sha": current_sha(cwd),
+    }
+
+
+def follow_pr(last: dict) -> dict:
+    """Resume wait/merge-gate for an in-flight PR. Does not implement."""
+    live = refresh_pr(last)
+    repo = str(live.get("repo") or "") or repo_for(str(live.get("goal") or ""))
+    sha = str(live.get("sha") or "")
+    number = live.get("number")
+    if not sha or number is None:
+        return {"ok": False, "skipped": "no in-flight pr"}
+    st = forgejo_cmd(["status", repo, sha])
+    state = str(st.get("state") or "")
+    if state != "success":
+        return {
+            "ok": False,
+            "waiting": state in {"pending", "timeout", ""},
+            "failed": state in {"failure", "error"},
+            "state": state,
+            "repo": repo,
+            "sha": sha,
+            "number": number,
+            "goal": live.get("goal") or last.get("goal"),
+            "status": st,
+            "head": live.get("head"),
+            "base": live.get("base"),
+        }
+    gate = forgejo_cmd(["merge-gate", repo, sha, str(int(number))], timeout=120)
+    return {
+        "ok": bool(gate.get("ok") and gate.get("merged")),
+        "merged": bool(gate.get("merged")),
+        "required_ran": bool(gate.get("required_ran")),
+        "required_succeeded": bool(gate.get("required_succeeded")),
+        "repo": repo,
+        "sha": sha,
+        "number": number,
+        "goal": live.get("goal") or last.get("goal"),
+        "gate": gate,
+        "notes": str(gate.get("notes") or ""),
+        "head": live.get("head"),
+        "base": live.get("base"),
+    }
+
+
+# How much of a goals file's preamble to carry into a prompt. Generous: it is
+# shared context for every row in the file, so it is written once and read many
+# times, and truncating it mid-table is worse than not sending it.
+GOALS_PREAMBLE_MAX = 6000
+
+
+def goals_preamble() -> str:
+    """The prose above the goals table -- the context every row depends on.
+
+    A goals file is written as a document: a preamble stating the rules and any
+    tables the rows refer to, then one row per task. The loop was sending the
+    ROW only, so any row saying "use the mapping table above" reached the model
+    with no table above it.
+
+    That is not a hypothetical either. Every one of the nine doc-sanitisation
+    goals says exactly that, and the model correctly refused: "no mapping table
+    was provided in the input". A goal the implementer cannot act on is a stall
+    that looks like a decline.
+    """
+    if not readable_file(GOALS):
+        return ""
+    try:
+        text = GOALS.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    head, _, _ = text.partition("| id | goal | state |")
+    head = head.strip()
+    if not head:
+        return ""
+    if len(head) > GOALS_PREAMBLE_MAX:
+        # Cut at a section boundary so what survives is whole; failing that at a
+        # line boundary. Never mid-line: a prompt ending in half a table row
+        # invites the model to complete it.
+        cut = head.rfind("\n#", 0, GOALS_PREAMBLE_MAX)
+        if cut <= 0:
+            cut = head.rfind("\n", 0, GOALS_PREAMBLE_MAX)
+        head = head[: cut if cut > 0 else GOALS_PREAMBLE_MAX].rstrip()
+    return head
+
+
+# Words that make a goal a SUBSTITUTION: change these strings, leave the rest.
+SUBSTITUTION_WORDS = (
+    "replace all",
+    "replace the",
+    "substitute",
+    "using the mapping table",
+    "from the mapping table",
+    "no left-column string remains",
+)
+
+
+# Words that mean a file is being CREATED, where re-emitting it is the only
+# thing that can be meant.
+CREATION_WORDS = ("create ", "add a new", "does not exist yet", "new file")
+
+# Above this many lines, asking a model to restate a file it must otherwise
+# preserve is asking for drift. Measured: an 83-line document came back
+# byte-identical three times, and a 272-line one came back as a 28-line summary.
+EDIT_IN_PLACE_LINES = 60
+
+
+def is_substitution_goal(goal: str, dest: Path | None = None) -> bool:
+    """Should this goal be answered by editing, rather than by restating a file?
+
+    Two ways to be true, and the second matters more.
+
+    By WORDING: "replace all X using the mapping table" is a substitution however
+    large the file. Offering both protocols and letting the model choose did not
+    work -- asked to replace 8 identifiers in a 272-line document it chose the
+    whole-file form and returned a 28-line summary, every time.
+
+    By SIZE: any edit to a file already longer than EDIT_IN_PLACE_LINES. This is
+    the general rule and the wording list is a special case of it. A model asked
+    to re-emit a long file it must not otherwise change will drift -- toward
+    summarising it, or toward reproducing it exactly and changing nothing, both
+    of which happened here. Creating a file is exempt: there is nothing to
+    preserve and nothing to quote.
+    """
+    low = goal.lower()
+    if any(w in low for w in SUBSTITUTION_WORDS):
+        return True
+    if dest is None or any(w in low for w in CREATION_WORDS):
+        return False
+    for rel in re.findall(r"`([\w./-]+\.(?:py|md|json|ya?ml|toml|sh|rs|txt))`", goal):
+        f = dest / rel
+        if not readable_file(f):
+            continue
+        try:
+            if f.read_text(encoding="utf-8", errors="replace").count("\n") >= (
+                EDIT_IN_PLACE_LINES
+            ):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def implement(goal: str, extra: dict | None = None) -> dict:
+    """One local/code slice. No WAN. No hosted Grok."""
+    extra = extra or {}
+    run_id = str(extra.get("run_id") or "") or None
+    dest = dest_worktree(goal)
+    slice_pack = ""
+    if is_region_pretrain(goal) and REGION_PACK.is_file():
+        slice_pack = REGION_PACK.read_text(encoding="utf-8")[:4000]
+    elif "G-QD" in goal and QD_PACK.is_file():
+        slice_pack = QD_PACK.read_text(encoding="utf-8")[:2500]
+    elif "P1-08" in goal and P108_PACK.is_file():
+        slice_pack = P108_PACK.read_text(encoding="utf-8")[:3500]
+    train_rule = (
+        "Never G-TRAIN bedrock/foundation/14B. One-region pretrain of "
+        "LatentVAE or ResidualMLP on a pinned public train split IS the "
+        "current goal when steered region-pretrain.\n"
+        if is_region_pretrain(goal)
+        else "Never G-TRAIN, G-SPLIT, G-SHARE, G-1080. Never dual 14B.\n"
+    )
+    if TARGET_REPO:
+        # A ladder repo. The CSD brief below is about regions, G-TRAIN and
+        # operator-main-wip, none of which exist here -- it spent context and steered
+        # the model wrong. This one carries the thing that was actually missing:
+        # THE CODE. Without it the model can only invent, and it did.
+        if is_substitution_goal(goal, dest):
+            # A substitution is not a rewrite, and asking for it as one is what
+            # broke: re-emitting a long file it must not otherwise change, the
+            # model drifts into summarising it. Here it never restates the file.
+            form = (
+                "This goal is a SUBSTITUTION: specific strings change and "
+                "nothing else does. Do NOT restate the file.\n\n"
+                "Reply in EXACTLY this form and nothing else:\n\n"
+                "SUBSTITUTIONS: <repo-relative path>\n"
+                "```\n"
+                "<exact text to find> => <text to replace it with>\n"
+                "<one pair per line, one for each distinct string>\n"
+                "```\n\n"
+                "Quote the left side EXACTLY as it appears in the file, "
+                "character for character. Every pair must match something: a "
+                "pair that matches nothing is an error and the whole change is "
+                "refused. List a pair for EVERY occurrence-class the goal names "
+                "-- one pair replaces all occurrences of that string.\n\n"
+                "To replace a WHOLE PASSAGE -- a paragraph, a list, a section "
+                "-- use the block form inside the same fence, as many times as "
+                "you need:\n\n"
+                "<<<FROM\n"
+                "the passage exactly as it appears now\n"
+                "===TO\n"
+                "the passage as it should read\n"
+                ">>>\n\n"
+                "Never re-emit the whole file. Quote only what changes.\n\n"
+            )
+        else:
+            form = (
+                "Reply in EXACTLY this form and nothing else:\n\n"
+                "PATH: <repo-relative path>\n"
+                "```python\n"
+                "<the COMPLETE new contents of that file>\n"
+                "```\n\n"
+                "Write the file as a normal file -- do NOT escape it into a "
+                "JSON string. The block replaces the file entirely, so include "
+                "everything that should remain, imports and existing tests "
+                "included.\n\n"
+            )
+        brief = (
+            f"You are an implementer working in the repository {TARGET_REPO}.\n"
+            "Make ONE small, verifiable change. Do not restructure. Do not rewrite "
+            "a file you were shown unless the goal explicitly says to.\n\n"
+            + form
+            + "If you cannot do the goal safely, reply with one line:\n"
+            "NOTE: <why>\n\n"
+            + (
+                f"Context for every goal in this queue:\n{_preamble}\n\n"
+                if (_preamble := goals_preamble())
+                else ""
+            )
+            + f"Goal:\n{goal}\n\n"
+            + repo_context(dest, goal)
+        )
+    else:
+        brief = (
+            "You are local/code on a 3090. One architecture change. No WAN.\n"
+            "Hosted Grok is planner only. Never reset operator-main-wip.\n"
+            + train_rule
+            + "Never dual 14B. Regions are MoE experts of one mind, not agents.\n"
+            f"Worktree: {dest}. JSON only "
+            '{"path": "src|tests|docs/...", "content": "..."}. '
+            "Harness (csd-autodev-loop, csd-lab-console, forgejo CLI, "
+            "test_autodev_*, test_lab_console) belongs in tzervas/csd-autodev. "
+            "Never those paths in CogSynDelta. "
+            "Do not wait-ci unless the slice pack says CI is in flight.\n"
+            f"Open goal:\n{goal}\n\n"
+            + (f"Slice pack:\n{slice_pack}\n" if slice_pack else "")
+            + "Handoff (trim):\n"
+            + (HAND.read_text(encoding="utf-8")[:1800] if HAND.is_file() else "")
+        )
+    if extra.get("approach_note"):
+        # A PEER AGENT ANSWERED. This is the other half of escalation: without
+        # the guidance reaching the brief, asking for help is a log line and the
+        # next attempt repeats the failure that prompted it.
+        brief += (
+            "\nYOU HAVE BEEN STUCK ON THIS GOAL. Another agent looked at the "
+            "failed attempts and advises:\n"
+            f"  {str(extra.get('approach_note'))[:1200]}\n"
+            "Take a DIFFERENT approach on this attempt. Repeating the previous "
+            "one is the failure being reported. If the advice is wrong -- if it "
+            "assumes something about the file that is not true -- say so in one "
+            "line at the top of your reply and do the thing you believe is "
+            "right instead.\n"
+        )
+    if extra.get("review_note"):
+        # THE REVIEWER TALKS BACK TO THE IMPLEMENTER. Two agents in sequence are
+        # only a pipeline if the second one's objection reaches the first; without
+        # this the implementer reruns the goal blind, produces the same diff, and
+        # a reviewer that is WRONG blocks the goal forever instead of being
+        # answered. The reviewer is a 4B model over a large diff and has already
+        # produced one false INCOMPLETE, so it is told it may be mistaken -- and
+        # what to do about that -- rather than treated as an oracle.
+        brief += (
+            "\nA REVIEWER REJECTED YOUR PREVIOUS ATTEMPT AT THIS GOAL:\n"
+            f"  {str(extra.get('review_note'))[:600]}\n"
+            "Address it in this attempt. If the reviewer is MISTAKEN -- if what it "
+            "says is missing is already there -- do not silently repeat yourself: "
+            "say so in a comment at the top of the file, naming the function or "
+            "test that already satisfies the point, so the next reviewer can see "
+            "it without re-deriving it.\n"
+        )
+    if extra.get("change_approach"):
+        brief += (
+            f"\nCHANGE APPROACH (id={int(extra.get('approach_id') or 0)}, "
+            f"after {int(extra.get('approach_fails') or 0)} fails of the last tactic). "
+            "Do not repeat the previous patch. Different file or different fix. "
+            f"Last error: {str(extra.get('last_error') or '')[:400]}\n"
+        )
+    note = steer_note()
+    if note:
+        brief += (
+            "\nOperator steer note (Forgejo is LAN git.example.com):\n"
+            + note[:2500]
+            + "\nUse the live PR head SHA, not a stale heartbeat SHA. "
+            "If the merge target moved, merge origin/<base> into this feature "
+            "branch (do not rebase unless steered; never checkout main).\n"
+            "CI red: patch imports and ensure packages in pyproject are used.\n"
+        )
+    # Operator override reaches this phase input without waiting for the 30s tick.
+    if run_id:
+        try:
+            override = consume_override(run_id)
+        except Exception:
+            override = None
+        if override:
+            brief += f"\nOperator override (live feed):\n{override[:2500]}\n"
+        try:
+            publish_event(run_id, "phase", {"name": "implement", "state": "start"})
+            publish_event(run_id, "input", {"text": brief[:4000]})
+            publish_event(run_id, "thought", {"text": f"implement {goal[:120]}"})
+        except Exception:
+            pass
+    # 240s was sized for a non-reasoning model behind LocalAI. coder-deep spends
+    # its budget thinking before it writes, so the call needs the gateway's full
+    # request_timeout. The subprocess gets a little more than the HTTP call, so a
+    # server-side timeout is reported rather than killed by the wrapper.
+    impl_timeout = int(os.environ.get("AUTODEV_IMPL_TIMEOUT", "600"))
+    argv = [
+        str(QUEUE),
+        "complete",
+        "--kind",
+        "autodev",
+        "--prompt",
+        brief,
+        "--timeout",
+        str(impl_timeout),
+    ]
+    if run_id:
+        rc, text = _run_cancellable(run_id, argv, timeout=impl_timeout + 60)
+        try:
+            publish_event(run_id, "output", {"text": text[:4000], "rc": rc})
+            publish_event(
+                run_id, "phase", {"name": "implement", "state": "end", "rc": rc}
+            )
+        except Exception:
+            pass
+    else:
+        rc, text = _run(argv, timeout=impl_timeout + 60, limit=MODEL_REPLY_LIMIT)
+    return {"rc": rc, "text": text[:MODEL_REPLY_LIMIT], "run_id": run_id}
+
+
+def plan_next_approach(last: dict, rec: dict) -> dict:
+    """After N fails of one tactic, change approach. Do not stop the worker."""
+    sha = str(rec.get("sha") or "")
+    same = bool(sha) and sha == str(last.get("implemented_sha") or "")
+    fails = int(last.get("approach_fails") or 0)
+    aid = int(last.get("approach_id") or 0)
+    if same:
+        fails += 1
+    else:
+        fails = 1
+    change = same and fails >= approach_retries()
+    out = {
+        "approach_fails": 0 if change else fails,
+        "approach_id": aid + 1 if change else aid,
+        "change_approach": change,
+        "last_error": str(rec.get("state") or rec.get("error") or "ci-failure"),
+    }
+    if change or not same:
+        out["retry_implement"] = True
+    return out
+
+
+def handle_inflight(last: dict) -> dict:
+    """Follow the live PR head; merge-from-base if behind; else wait/fail.
+
+    Returns ``retry_implement=True`` when a new operator steer note should
+    drive a CI-fix slice instead of spinning on the old SHA.
+    """
+    live = refresh_pr(last)
+    goal = str(live.get("goal") or next_open_goal())
+    live["goal"] = goal
+    if str(live.get("state") or "").lower() == "closed" and not live.get("merged"):
+        # Somebody closed it -- a reviewer, or the operator rejecting the change.
+        # There is nothing left to merge and nothing to wait for, so DROP it:
+        # re-gating a closed PR asks Forgejo to merge a number that no longer
+        # exists and gets 404, every tick, forever. The goal stays open, so the
+        # next tick implements it again rather than losing the work item.
+        return {
+            "ok": True,
+            "abandoned": True,
+            "reason": "the PR was closed without merging",
+            "goal": goal,
+            "number": live.get("number"),
+            "sha": live.get("sha"),
+            "repo": live.get("repo"),
+            "clear_inflight": True,
+        }
+    if live.get("merged"):
+        rec = {
+            "ok": True,
+            "merged": True,
+            "goal": goal,
+            "number": live.get("number"),
+            "sha": live.get("sha"),
+            "repo": live.get("repo"),
+            "ti": ti_ok(),
+        }
+        if live.get("required_ran"):
+            rec["next_goal"] = advance_next_goal(goal)
+        return rec
+    base = str(live.get("base") or "main")
+    sha = str(live.get("sha") or "")
+    dest = dest_worktree(goal)
+    local = current_sha(dest)
+    div = divergence(str(live.get("repo") or ""), base, sha)
+    behind = int(div.get("behind") or 0)
+    if behind == 0 and str(live.get("mergeable_state") or "") == "behind":
+        behind = 1
+    stale_local = bool(local and sha and local != sha)
+    if behind > 0 or stale_local:
+        sync = sync_feature_with_base(dest, base)
+        if sync.get("ok") and sync.get("sha"):
+            return {
+                "ok": False,
+                "waiting": True,
+                "failed": False,
+                "state": "pending",
+                "goal": goal,
+                "number": live.get("number"),
+                "sha": sync["sha"],
+                "repo": live.get("repo"),
+                "head": live.get("head"),
+                "base": base,
+                "behind": behind,
+                "synced": True,
+                "sync": {"how": "merge", "sha": sync.get("sha"), "base": base},
+                "ti": ti_ok(),
+            }
+        return {
+            "ok": False,
+            "failed": True,
+            "behind": behind,
+            "synced": False,
+            "sync": sync,
+            "goal": goal,
+            "number": live.get("number"),
+            "sha": sha,
+            "repo": live.get("repo"),
+            "ti": ti_ok(),
+            "ping": maybe_ping_stall(
+                goal,
+                "behind merge target",
+                "PR head is behind the merge-target; "
+                "merge origin/<base> into the feature?",
+                f"blocker: behind={behind} base={base}; tried: fetch+merge origin/{base}",
+                paths=["scripts/csd-autodev-loop"],
+                tried=["pr", "compare", f"merge origin/{base}"],
+            ),
+        }
+    rec = follow_pr(live)
+    rec["goal"] = goal
+    rec["ti"] = ti_ok()
+    if rec.get("merged") and rec.get("required_ran"):
+        rec["next_goal"] = advance_next_goal(goal)
+        return rec
+    if rec.get("failed") and should_apply_steer_note(live, steer_note()):
+        rec["retry_implement"] = True
+        rec["consumed_note"] = note_fingerprint(steer_note())
+        return rec
+    if rec.get("failed"):
+        rec.update(plan_next_approach(last, rec))
+        rec["ping"] = maybe_ping_stall(
+            goal,
+            "required pytest red",
+            "Forgejo required checks failed twice; contract or runner?",
+            f"blocker: CI {rec.get('state')}; sha={rec.get('sha')}; "
+            "tried: wait, merge-gate, pr",
+            paths=["scripts/csd-autodev-loop"],
+            tried=["forgejo/pr", "forgejo/status", "forgejo/wait", "merge-gate"],
+        )
+    return rec
+
+
+# --------------------------------------------------------------------------- #
+# Event intake and discovery
+#
+# The loop used to be told everything: a timer told it when to run, and
+# heartbeat.json told it what was in flight. Both are single points of failure
+# for an unattended process -- the timer fires 287 times a day with nothing to
+# do, and a lost or stale heartbeat leaves the loop blind to its own open PR,
+# so it starts a second goal on top of the first.
+#
+# So it now DISCOVERS. Events say when to run; the forge says what is in flight;
+# the repository says what its conventions are. The heartbeat becomes a cache of
+# those answers rather than the source of them.
+# --------------------------------------------------------------------------- #
+EVENTS_CLI = ROOT / "scripts/csd-forge-events"
+
+
+def drain_events() -> dict:
+    """Consume the wake sentinels and report why this tick is running.
+
+    Draining is not bookkeeping. A systemd path unit re-arms only on the
+    empty-to-nonempty edge, so an undrained directory means the NEXT event never
+    starts a tick and the loop silently stops. This runs before anything that
+    can return early, for that reason.
+
+    A tick with no events is legitimate -- the reconcile timer and a manual
+    `systemctl start` both produce one -- so an empty drain is not an error.
+    """
+    if not EVENTS_CLI.is_file():
+        return {"ok": True, "count": 0, "why": "manual", "note": "no events CLI"}
+    rc, text = _run([sys.executable, str(EVENTS_CLI), "drain"], timeout=30)
+    if rc != 0:
+        return {
+            "ok": False,
+            "count": 0,
+            "why": "drain failed",
+            "rc": rc,
+            "out": text[:400],
+        }
+    try:
+        rec = json.loads(text[text.find("{") :])
+    except (ValueError, json.JSONDecodeError):
+        return {"ok": False, "count": 0, "why": "unparseable drain", "out": text[:400]}
+    rec["why"] = "+".join(rec.get("kinds") or []) or "manual"
+    # Keep the summary; drop the per-event bodies, which are large and already
+    # written to received.jsonl by the receiver.
+    rec.pop("events", None)
+    return rec
+
+
+def discover_inflight(repo: str, last: dict) -> dict:
+    """Ask the forge what is open, instead of trusting the heartbeat.
+
+    The heartbeat is a local file that a crash, a manual edit, or a state reset
+    can lose. When it is lost the loop believes nothing is in flight, picks the
+    next goal, and opens a SECOND PR while the first is still open -- which is
+    exactly the unattended failure this whole change is meant to prevent.
+
+    The forge cannot lose it. Returns the heartbeat record when the two agree
+    (it is richer: it carries the goal text, run id and approach history), and
+    a reconstructed one when the heartbeat is empty or stale.
+    """
+    if not repo:
+        return last
+    rec = forgejo_cmd(["prs", repo, "--state", "open", "--limit", "20"], timeout=60)
+    pulls = rec.get("pulls")
+    if not isinstance(pulls, list):
+        # Cannot reach the forge. The heartbeat is now the best answer we have,
+        # and guessing "nothing is open" here is the dangerous direction.
+        return dict(last, discovery={"ok": False, "error": str(rec)[:200]})
+
+    mine = [p for p in pulls if str(p.get("head") or "").startswith("autodev/")]
+    known = last.get("number")
+
+    if known and any(p.get("number") == known for p in mine):
+        return dict(last, discovery={"ok": True, "agrees": True})
+
+    if not mine:
+        if known:
+            # The heartbeat names a PR the forge no longer lists as open. It
+            # merged or was closed while we were not looking; let the sync path
+            # resolve which, since only it can tell those apart.
+            return dict(
+                last,
+                discovery={
+                    "ok": True,
+                    "stale_inflight": known,
+                    "note": "no open autodev PR on the forge",
+                },
+            )
+        return dict(last, discovery={"ok": True, "open": 0})
+
+    # An open PR the heartbeat does not know about. Adopt it rather than
+    # starting new work beside it. The goal text is recovered from the branch,
+    # which is how the branch was named in the first place.
+    adopt = sorted(mine, key=lambda p: p.get("number") or 0)[0]
+    head = str(adopt.get("head") or "")
+    return {
+        "ok": True,
+        "number": adopt.get("number"),
+        "head": head,
+        "merged": False,
+        "goal": goal_for_branch(head) or last.get("goal") or "",
+        "discovery": {
+            "ok": True,
+            "adopted": adopt.get("number"),
+            "was": known,
+            "title": str(adopt.get("title") or "")[:80],
+        },
+    }
+
+
+def goal_for_branch(branch: str) -> str:
+    """The goal row that named this branch, recovered from the goals file.
+
+    The inverse of goal_branch(), and matched by the same slug rule so the two
+    cannot drift. Used when adopting a PR the heartbeat did not record.
+    """
+    import re as _re
+
+    slug = branch.split("/", 1)[-1].strip().lower()
+    if not slug or not readable_file(GOALS):
+        return ""
+    for line in GOALS.read_text(encoding="utf-8").splitlines():
+        m = _re.search(r"\|\s*(G-[A-Za-z0-9-]+)\s*\|", line)
+        if not m:
+            continue
+        if _re.sub(r"[^a-z0-9]+", "-", m.group(1).lower()).strip("-") == slug:
+            return line
+    return ""
+
+
+def discover_branches(cwd: Path, repo: str) -> dict:
+    """Find autodev branches on the forge that no open PR accounts for.
+
+    These are the residue of an interrupted tick: a branch pushed just before
+    the process died, so the work exists and nothing will ever look at it again.
+    Reported, not acted on -- opening a PR for an abandoned branch would be the
+    loop guessing that half-finished work was ready.
+    """
+    if not repo:
+        return {"ok": True, "orphans": []}
+    rc = git_cmd(["ls-remote", "--heads", "origin", "autodev/*"], cwd)
+    remote = [
+        ln.split("refs/heads/", 1)[-1].strip()
+        for ln in str(rc.get("stdout") or "").splitlines()
+        if "refs/heads/" in ln
+    ]
+    if not remote:
+        return {"ok": True, "orphans": []}
+    prs = forgejo_cmd(["prs", repo, "--state", "all", "--limit", "50"], timeout=60)
+    accounted = {str(p.get("head") or "") for p in (prs.get("pulls") or [])}
+    return {"ok": True, "orphans": sorted(set(remote) - accounted)[:10]}
+
+
+def emit_continue(why: str) -> dict:
+    """Wake once more because a goal just CLOSED and others are still open.
+
+    Progress is its own event, and it was the one transition that emitted
+    nothing. A goal closing does not touch the forge, so no webhook fires; the
+    loop went idle holding six open goals and waited for the hourly reconcile.
+
+    It cannot spin: this is called only on a tick that actually closed a goal,
+    and there are finitely many goals. A tick that closes nothing emits nothing.
+    """
+    # The GOALS FILE, not next_open_goal(): that falls back to the CSD-era
+    # 'region-pretrain' when no row is open, so it never reports an empty queue
+    # and this guard would never fire. (That fallback is wrong for a ladder repo
+    # in its own right -- queued as a finding, not papered over here.)
+    if not GOALS.is_file() or "| open |" not in GOALS.read_text(encoding="utf-8"):
+        return {"ok": True, "skipped": "no open goal left"}
+    d = Path(os.environ.get("AUTODEV_EVENT_DIR", "/home/svc-autodev/events"))
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        import uuid as _uuid
+
+        final = d / f"{_uuid.uuid4().hex}.json"
+        tmp = final.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "kind": "continue",
+                    "why": why,
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        os.replace(tmp, final)
+    except OSError as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
+    return {"ok": True}
+
+
+# Escalation. The retry budget bounds ONE AGENT'S STRETCH at one approach, not
+# the effort: past it the loop asks a different agent for guidance and carries
+# on with what it is told. Stopping was the old behaviour and it is wrong --
+# a goal that needs a different tactic is not a goal that needs a person.
+# The card that is NOT running the implementer. See KIND_MODEL in
+# csd-gateway-complete for why this matters more than which model it is.
+ESCALATION_ROLE = os.environ.get("AUTODEV_ESCALATION_ROLE", "helper")
+# How many times one goal may be escalated before it is set aside. Set aside is
+# not abandoned: the row stays open, the blocker is recorded on it, and the
+# queue returns to it once something else has moved.
+MAX_ESCALATIONS = 3
+MAIL_CLI = ROOT / "scripts/csd-agent-mail"
+
+
+def ask_for_help(goal: str, evidence: str, tried: list[str]) -> dict:
+    """Ask a peer agent how to get unstuck, and return its guidance.
+
+    WHY A DIFFERENT AGENT. The implementer has now failed the same way several
+    times; asking it again buys another identical failure. The peer runs at a
+    different role and budget and is given what the implementer never sees --
+    the SHAPE of the failures rather than the goal -- so it can say "the file is
+    too large for one reply, do it in sections" where the implementer only knows
+    that something was refused.
+
+    Guidance is advice, not an order. It reaches the next attempt as a note the
+    implementer may act on or explain away, exactly like a reviewer objection.
+    """
+    prompt = (
+        "You are advising another agent that is stuck.\n\n"
+        "It has attempted the goal below several times and been refused each "
+        "time, for the reason shown. Do not attempt the goal yourself.\n\n"
+        "Answer in at most eight lines, as instructions to that agent:\n"
+        "  1. What is actually going wrong, in one sentence.\n"
+        "  2. A DIFFERENT approach it should take next. Be specific and "
+        "concrete -- name the tactic, not the intention.\n"
+        "  3. If the goal itself is the problem -- underspecified, or asking "
+        "for something that cannot be done in one file -- say exactly that, "
+        "and say how the goal should be reworded.\n\n"
+        f"GOAL:\n{goal}\n\n"
+        f"WHAT WAS TRIED:\n" + "\n".join(f"  - {t}" for t in tried[:8]) + "\n\n"
+        f"HOW IT FAILED:\n{evidence[:2000]}\n"
+    )
+    rc, text = _run(
+        [
+            str(QUEUE),
+            "complete",
+            "--kind",
+            ESCALATION_ROLE,
+            "--prompt",
+            prompt,
+            "--timeout",
+            "300",
+        ],
+        timeout=360,
+        limit=4000,
+    )
+    guidance = text.strip()
+    return {"ok": rc == 0 and bool(guidance), "rc": rc, "guidance": guidance[:1200]}
+
+
+def post_mail(goal: str, evidence: str, tried: list[str], guidance: str) -> dict:
+    """Record the escalation in the agent mailbox.
+
+    The mailbox is the durable record of one agent asking another for help. The
+    loop's own state is a heartbeat that the next tick overwrites; this is what
+    remains afterwards for a person asking why a goal changed approach.
+    """
+    if not readable_file(MAIL_CLI):
+        return {"ok": False, "skipped": "no mail CLI"}
+    argv = [
+        str(MAIL_CLI),
+        "send",
+        "--to",
+        ESCALATION_ROLE,
+        "--from",
+        "implementer",
+        "--task",
+        goal_id(goal),
+        "--repo",
+        TARGET_REPO or "",
+        "--worktree",
+        TARGET_WT or "",
+        "--request",
+        "Blocked after the retry budget; advise a different approach.",
+        "--expects",
+        "guidance",
+        "--evidence",
+        evidence[:600],
+        "--blocking",
+    ]
+    for t in tried[:6]:
+        argv += ["--attempt", t[:200]]
+    if guidance:
+        argv += ["--decision", guidance[:600]]
+    rc, text = _run(argv, timeout=60, limit=2000)
+    return {"ok": rc == 0, "rc": rc, "tail": text.strip()[-200:]}
+
+
+def escalate(goal: str, evidence: str, tried: list[str], escalations: int) -> dict:
+    """Break the within-agent loop, get help, and keep going.
+
+    Returns a record carrying `approach_note` -- the guidance the next attempt
+    should act on -- and `set_aside` when this goal has been escalated too many
+    times to keep spending on it now.
+    """
+    if escalations >= MAX_ESCALATIONS:
+        # The approaches are exhausted, so the remaining suspect is the GOAL.
+        # Ask the helper to rewrite it rather than parking it: a bad work item
+        # returned to unchanged is a bad work item forever, and it blocks the
+        # repository's release gate while it sits there.
+        fix = ask_for_help(
+            goal,
+            evidence + "\n\nEvery approach has failed. Assume the GOAL is wrong. Reply "
+            "with ONLY the corrected goal text -- one paragraph, no preamble, "
+            "naming exactly one file and one outcome. If the goal cannot be "
+            "made achievable at all, say why in one sentence instead.",
+            tried,
+        )
+        # ONLY the guidance. Falling back to the evidence turned "the helper
+        # said nothing" into "here is a diagnosis", and invalidated the goal
+        # on the strength of the failure message that prompted the question.
+        rewrite = rewrite_goal(goal, str(fix.get("guidance") or ""))
+        note_blocker(goal, evidence)
+        emit_continue(f"{goal_id(goal)} {rewrite.get('action') or 'set aside'}")
+        return {
+            "ok": True,
+            "set_aside": True,
+            # A REWRITTEN goal is a new goal and earns a fresh escalation
+            # budget. Bounded anyway: rewrite_goal marks the row, and the
+            # second time round marks it invalid rather than rewriting again.
+            "escalations": 0 if rewrite.get("action") == "rewritten" else escalations,
+            "rewrite": rewrite,
+            "why": evidence[:400],
+            # A rewritten goal is a NEW goal and earns fresh budgets.
+            "implement_attempts": 0,
+            "apply_attempts": 0,
+            "declines": 0,
+            "git_attempts": 0,
+        }
+    help_rec = ask_for_help(goal, evidence, tried)
+    guidance = str(help_rec.get("guidance") or "")
+    mail = post_mail(goal, evidence, tried, guidance)
+    # Wake ourselves so the new approach is tried now rather than at the next
+    # forge event. This is the "continue" the operator asked for: do not give
+    # up, ask for help, then try something different.
+    emit_continue(f"{goal_id(goal)} escalated; new approach advised")
+    return {
+        "ok": bool(guidance),
+        "escalations": escalations + 1,
+        "asked": ESCALATION_ROLE,
+        "approach_note": guidance,
+        "mail": mail,
+        "help_rc": help_rec.get("rc"),
+    }
+
+
+def rewrite_goal(goal: str, guidance: str) -> dict:
+    """Replace a goal's text with a better one, once.
+
+    The escalation ladder can reach a conclusion nothing acted on: that the
+    GOAL is wrong. The helper is asked for exactly that -- "if the goal itself
+    is the problem, say exactly that, and say how the goal should be reworded"
+    -- and it answered on G-LOOP-1: the named file is a static configuration
+    dictionary, not a logic module, so the goal cannot be done in one file. The
+    goal was written by the loop's own adoption pass.
+
+    Setting it aside forever is not the answer either: it stayed open, blocked
+    the rung's release, and would be returned to unchanged every time the queue
+    drained. Bad work items should be repaired, not parked.
+
+    ONCE, and marked, so a goal cannot be rewritten round and round. The second
+    failure marks it `invalid` with the reason, which takes it out of the queue
+    and out of the release gate while leaving the evidence on the row.
+    """
+    if not readable_file(GOALS):
+        return {"ok": False, "skipped": "no goals file"}
+    gid = goal_id(goal)
+    try:
+        text = GOALS.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+    new_text = " ".join(str(guidance or "").split())[:900]
+    if not new_text:
+        # The helper said nothing at all. That is a failure of the HELPER, not
+        # evidence that the goal is wrong, and invalidating a goal on it would
+        # discard real work because a model timed out. Leave the row open; the
+        # blocker note still records the attempt.
+        return {"ok": False, "skipped": "no guidance to act on"}
+    # IS THIS A GOAL, OR AN EXPLANATION OF WHY THERE ISN'T ONE? The helper is
+    # asked for a corrected goal OR, failing that, for the reason. It answers
+    # with the reason far more often -- and writing a reason into the goal cell
+    # replaced seven goals with sentences like "The goal is unachievable
+    # because...", destroying the original intent in the process.
+    #
+    # A goal is an instruction naming a file. A diagnosis opens by talking about
+    # the goal. Cheap to tell apart, and the cost of being wrong is asymmetric:
+    # mistaking a goal for a diagnosis only delays it by one round.
+    diagnosis = bool(
+        re.match(r"^(the |this )?goal\b", new_text, re.I)
+        or re.search(
+            r"\b(unachievable|impossible|cannot be (done|made))\b", new_text, re.I
+        )
+    )
+    looks_like_goal = "`" in new_text and not diagnosis
+
+    out, action = [], "none"
+    for line in text.splitlines():
+        cells = line.split("|")
+        if len(cells) == 5 and cells[1].strip() == gid:
+            if "rewritten:" in cells[2] or not looks_like_goal:
+                # Either the rewrite already had its turn, or there was never a
+                # corrected goal to apply. Mark it invalid and KEEP THE ORIGINAL
+                # TEXT -- whoever reads this row next needs to know what was
+                # being asked, not only that it failed.
+                cells[3] = " invalid "
+                if "invalid because:" not in cells[2]:
+                    cells[2] = f"{cells[2].rstrip()} invalid because: {new_text[:300]} "
+                action = "invalid"
+            else:
+                cells[2] = f" rewritten: {new_text} "
+                action = "rewritten"
+            line = "|".join(cells)
+        out.append(line)
+    if action == "none":
+        return {"ok": False, "skipped": "goal row not found or no guidance"}
+    try:
+        GOALS.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": str(e)[:200]}
+    return {"ok": True, "action": action, "goal": gid}
+
+
+def note_blocker(goal: str, why: str) -> dict:
+    """Write the blocker onto the goal row, so the queue can pass over it.
+
+    The row STAYS open. `blocked:` is a note for the reader and for whatever
+    picks the goal up next, not a state that removes it from the queue -- the
+    instruction is that a skipped goal must eventually be returned to.
+    """
+    if not readable_file(GOALS):
+        return {"ok": False, "skipped": "no goals file"}
+    try:
+        text = GOALS.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": str(e)[:200]}
+    gid = goal_id(goal)
+    out, hit = [], False
+    for line in text.splitlines():
+        # A row is `| id | goal | state |`, so splitting on the pipe gives
+        # ['', id, goal, state, '']. Rebuild it rather than string-surgery on
+        # the whole line: the goal cell routinely contains backticked paths and
+        # commas, and one bad edit corrupts the queue for every later tick.
+        cells = line.split("|")
+        if len(cells) == 5 and cells[1].strip() == gid and "blocked:" not in cells[2]:
+            cells[2] = f"{cells[2].rstrip()} blocked: {why[:200]} "
+            line = "|".join(cells)
+            hit = True
+        out.append(line)
+    if not hit:
+        return {"ok": False, "skipped": "goal row not found"}
+    try:
+        GOALS.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": str(e)[:200]}
+    return {"ok": True, "goal": gid}
+
+
+def attempt_count(last: dict, goal: str, key: str) -> int:
+    """How many times THIS goal has failed THIS way, across ticks.
+
+    Every tick is a fresh process, so a counter read from the current run is
+    always 1 and any budget expressed in attempts is never reached. That defect
+    has now been written three times independently -- for the implementer, for
+    apply refusals, and for gate refusals, where `approach_fails` sat at 0 on
+    every tick and the retry ladder could not advance to escalation. So it lives
+    in one place.
+
+    Resets when the goal changes: a budget is per goal, not per session.
+    """
+    if isinstance(last, dict) and str(last.get("goal") or "") == goal[:120]:
+        return int(last.get(key) or 0) + 1
+    return 1
+
+
+def retry_or_escalate(goal: str, why: str, attempts: int, last: dict) -> dict:
+    """Try again while the budget lasts; past it, get help and keep going.
+
+    THE BUDGET BOUNDS ONE AGENT'S STRETCH AT ONE APPROACH, NOT THE EFFORT. It
+    used to end the attempt: emit_retry returned ok=false at the budget and the
+    goal sat until an operator looked at it, which is "give up" wearing the word
+    bounded. The pipeline's rule is the opposite -- do not give up, ask for
+    help, then try something different.
+
+    So at the budget this asks a peer agent what to do differently, carries the
+    answer back to the implementer as a note, and resets the within-agent count
+    so the new approach gets its own full stretch. Only after MAX_ESCALATIONS
+    without progress is the goal set aside, and even then the row stays open for
+    the queue to return to.
+    """
+    tried = [t for t in (last.get("tried") or []) if isinstance(t, str)]
+    tried = [*tried, why][-8:]
+    budget = approach_retries()
+    if attempts < budget:
+        return {
+            "stage": "retry",
+            "tried": tried,
+            # A RETRY THAT SENDS THE SAME PROMPT CANNOT SUCCEED. This was the
+            # single most expensive lesson of the session: an unparseable reply
+            # was retried nine times, byte for byte, and the goal was then
+            # invalidated for failing nine times. The reason travels with the
+            # retry, exactly as escalation guidance does -- the difference is
+            # that this costs nothing and happens on the FIRST failure.
+            "approach_note": f"Your previous attempt was rejected: {why[:600]}",
+            # CARRY THE ESCALATION COUNT THROUGH THE RETRIES. Only the escalate
+            # branch used to set it, so the retries between two escalations
+            # dropped it from the heartbeat and the second escalation read zero:
+            # observed as `escalations: 1` twice in a row, which would never
+            # reach MAX_ESCALATIONS and never set a hopeless goal aside.
+            "escalations": int(last.get("escalations") or 0),
+            "retry": emit_retry(goal, why, attempts),
+        }
+    esc = escalate(goal, why, tried, int(last.get("escalations") or 0))
+    out = {
+        "stage": "set-aside" if esc.get("set_aside") else "escalate",
+        "tried": tried,
+        "escalations": esc.get("escalations"),
+        # Reset the within-agent counter: a new approach earns a full stretch.
+        "implement_attempts": 0,
+        "approach_note": esc.get("approach_note") or "",
+        "set_aside": bool(esc.get("set_aside")),
+        "escalation": esc,
+    }
+    # A goal being REWRITTEN or marked invalid is the loop editing its own work
+    # queue. That belongs in the tick record where an operator will see it, not
+    # buried inside the escalation detail.
+    if esc.get("rewrite"):
+        out["rewrite"] = esc["rewrite"]
+    for key in ("apply_attempts", "declines", "git_attempts"):
+        if key in esc:
+            out[key] = esc[key]
+    return out
+
+
+def emit_retry(goal: str, why: str, attempts: int) -> dict:
+    """Wake ourselves once more, because a failed attempt IS an event.
+
+    THE LAST HOLE IN UNATTENDED OPERATION. Every other transition emits: a merge,
+    a PR, a push, and CI via watch-ci. A tick that gets refused by the test gate
+    emitted nothing at all -- so a goal the model got wrong on the first try sat
+    untouched until the hourly reconcile, and a run of three bad attempts cost
+    three hours of doing nothing.
+
+    BOUNDED, because a self-emitted event is a self-retrigger: it stops at the
+    same approach-retry budget the loop already uses to decide when to change
+    tactic. Past that the goal needs a person, and continuing to spin would only
+    bury the evidence. autodev-tick.service also carries StartLimitBurst as a
+    backstop that does not depend on this function being correct.
+    """
+    budget = approach_retries()
+    if attempts >= budget:
+        return {
+            "ok": False,
+            "stopped": "retry budget exhausted",
+            "attempts": attempts,
+            "budget": budget,
+        }
+
+    d = Path(os.environ.get("AUTODEV_EVENT_DIR", "/home/svc-autodev/events"))
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        import uuid as _uuid
+
+        final = d / f"{_uuid.uuid4().hex}.json"
+        tmp = final.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "kind": "retry",
+                    "why": why,
+                    "goal": goal_id(goal),
+                    "attempt": attempts + 1,
+                    "budget": budget,
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        os.replace(tmp, final)
+    except OSError as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
+    return {"ok": True, "attempt": attempts + 1, "budget": budget}
+
+
+def autotune() -> dict:
+    """Fold the traffic since last time into the budget profile.
+
+    The fast path already demotes a setting the moment it fails. This is the slow
+    path: p99 answer sizes and the measured chars-per-token, from calls that
+    actually happened, applied once there are enough of them to mean something.
+
+    On the ADOPTION tick, not every tick. It reads the whole call log and the
+    numbers move slowly, so per-tick would spend the time to learn nothing new.
+    The calibrator refuses to write a kind below its sample floor, so an early
+    run is a no-op rather than a wrong guess.
+    """
+    if not CALIBRATE_CLI.is_file():
+        return {"ok": True, "skipped": "no calibrator"}
+    rc, text = _run(
+        [sys.executable, str(CALIBRATE_CLI), "--apply"], timeout=120, limit=3000
+    )
+    return {"ok": rc == 0, "rc": rc, "tail": text.strip()[-300:]}
+
+
+def try_advance() -> dict:
+    """Release the current repo if it is done, and take up the next one.
+
+    Runs on the adoption tick, after autotune and BEFORE adoption queues more
+    work: if this repo is finished there is no point queueing another finding
+    against it, and if it is not, csd-release says so and nothing moves.
+
+    The definition of done is not negotiable here. csd-ladder refuses to advance
+    past a rung that fails any of the ten checks, and refuses to start one whose
+    blockers are unmet -- attempting a blocked rung can produce a release that
+    passed because the checks could not run, which is the worst artefact this
+    pipeline could emit.
+    """
+    if not LADDER_CLI.is_file():
+        return {"ok": True, "skipped": "no ladder CLI"}
+    rc, text = _run(
+        [sys.executable, str(LADDER_CLI), "advance"], timeout=1800, limit=4000
+    )
+    return {
+        "ok": rc == 0,
+        "rc": rc,
+        "advanced": "ADVANCED" in text,
+        "tail": text.strip()[-400:],
+    }
+
+
+def self_queue_adoption() -> dict:
+    """With an empty queue, adopt the house standard instead of idling.
+
+    THIS IS THE PART I DID BY HAND AND SHOULD NOT HAVE. Onboarding this repo --
+    declare the config, watch it go red with sixteen findings, fix them down to
+    zero -- was entirely mechanical or entirely goals, and a process only an
+    operator can run is a process that happens once.
+
+    An empty goal queue is not "nothing to do". It means the hand-written goals
+    are finished and the repo can now be measured against the standard: security
+    first, then stubs, then tooling. csd-adopt reports the FIRST blocker and
+    queues it as one goal, because a batch of sixteen produces a diff nobody can
+    review.
+
+    Bounded by construction: it queues at most one goal per call, and only when
+    nothing is open. A repo that is fully adopted returns nothing and the loop
+    goes quiet, which is the correct behaviour for finished work.
+    """
+    if not ADOPT_CLI.is_file() or not TARGET_WT:
+        return {"ok": True, "skipped": "no adopt CLI or no target worktree"}
+    if GOALS.is_file() and "| open |" in GOALS.read_text(encoding="utf-8"):
+        return {"ok": True, "skipped": "goals remain open"}
+    rc, text = _run(
+        [sys.executable, str(ADOPT_CLI), TARGET_WT, "--goals", str(GOALS)],
+        timeout=900,
+        limit=6000,
+    )
+    queued = "queued as a goal" in text
+    if queued:
+        emit_continue("adoption queued a goal")
+    return {
+        "ok": True,
+        "rc": rc,
+        "queued": queued,
+        "adopted": rc == 0,
+        "tail": text.strip()[-600:],
+    }
+
+
+def tick() -> dict:
+    """Drain the wake sentinels, run one cycle, and record why it ran.
+
+    Started by an event (autodev-tick.path) rather than a clock. The drain is a
+    wrapper rather than a step inside the cycle for two reasons: it must happen
+    before ANY early return, since an undrained directory stops the path unit
+    from ever firing again; and every record the cycle produces should carry the
+    reason it exists, which is otherwise lost down the dozen return paths below.
+
+    Note what the events are NOT used for. They say WHEN something happened; the
+    forge is still asked WHAT happened. Trusting a webhook body to decide whether
+    a PR merged would make the loop's state a function of a message that can
+    arrive twice, out of order, or not at all.
+    """
+    events = drain_events()
+    rec = run_cycle()
+    if isinstance(rec, dict):
+        rec.setdefault("events", events)
+    return rec
+
+
+def run_cycle() -> dict:
+    """One autodev cycle: pick, implement or wait, land, merge-when-green."""
+    ensure_idle_ping()
+    ensure_steer_cluster()
+    beat()
+    # GPU PLANNING AND MODEL ROUTING ARE NO LONGER THIS LOOP'S JOB.
+    # csd-gpu-plan and csd-model-router belonged to the LocalAI era, when the loop
+    # had to claim a card and pin an alias before it could talk to a model. The
+    # gateway now owns routing, fallbacks, retries and cooldowns, and card
+    # residency is fleet-gpu-mode's business. These are called only if the scripts
+    # are actually present, so an older deployment keeps working; on a current one
+    # they are absent and skipped rather than fatal.
+    if PLAN.is_file():
+        _run([str(PLAN)], timeout=40)
+    if ROUTER.is_file():
+        _router(
+            "request",
+            "--alias",
+            "local/code",
+            "--why",
+            "autodev",
+            "--ttl",
+            "3600",
+            "--noping",
+        )
+        _router("pack")
+    if steered_pause():
+        return {"ok": True, "skipped": "steer.pause"}
+
+    # Clean and current before anything else. A branch deleted on the forge --
+    # which delete-on-merge does on every landed PR -- leaves a stale local ref
+    # that the next merge trips over.
+    if TARGET_WORKTREE_SYNC:
+        _last = _read_json(HEART).get("last")
+        _last = discover_inflight(TARGET_REPO, _last if isinstance(_last, dict) else {})
+        synced = sync_worktree(
+            Path(TARGET_WT) if TARGET_WT else dest_worktree(""),
+            repo=TARGET_REPO,
+            inflight=_last,
+        )
+        if not synced.get("ok"):
+            beat({"last": {"ok": False, "error": "worktree sync failed", "sync": synced}})
+            return {"ok": False, "error": "worktree sync failed", "sync": synced}
+        # (a successful sync is attached to the record below)
+        if synced.get("merged_since_last"):
+            # The previous change landed. Close its goal so the next tick moves
+            # on -- leaving it open makes the loop rebuild work already merged --
+            # and clear the in-flight record so nothing tries to update a merged
+            # PR.
+            prev = str((_last or {}).get("head") or "").strip()
+            closed = close_goal(prev) if prev else {"ok": False, "reason": "no branch"}
+            synced["closed_goal"] = closed
+            # A merge advanced the queue; take the next goal now rather than at
+            # the next hourly reconcile.
+            if closed.get("ok"):
+                synced["continue"] = emit_continue("previous PR merged")
+            beat(
+                {
+                    "last": {
+                        "ok": True,
+                        "merged": True,
+                        "closed_goal": closed,
+                        "note": "previous PR merged; worktree synced to "
+                        + str(synced.get("base")),
+                    }
+                }
+            )
+    last = (
+        _read_json(HEART).get("last")
+        if isinstance(_read_json(HEART).get("last"), dict)
+        else {}
+    )
+    if TARGET_WORKTREE_SYNC:
+        # Discovery already asked the forge; re-reading the heartbeat here would
+        # discard an adopted PR the heartbeat has never heard of.
+        last = discover_inflight(TARGET_REPO, last)
+    inflight_extra: dict = {}
+    if last.get("number") and not last.get("merged"):
+        rec = handle_inflight(last)
+        if rec.get("clear_inflight"):
+            # The PR is gone. Forget it and fall through to the queue in this
+            # same tick, rather than writing it back into the heartbeat and
+            # rediscovering it on the next one.
+            beat({"last": {k: v for k, v in rec.items() if k != "clear_inflight"}})
+            last = {}
+            rec = {}
+        if last.get("consumed_note") and not rec.get("consumed_note"):
+            rec["consumed_note"] = last["consumed_note"]
+        # Carry a reviewer objection across the tick boundary; each tick is a
+        # fresh process, so anything not in the heartbeat is forgotten.
+        if last.get("review_note") and not rec.get("review_note"):
+            rec["review_note"] = last["review_note"]
+        if rec and not rec.get("retry_implement"):
+            beat({"last": rec})
+            return rec
+        inflight_extra = rec
+    briefs = intake_briefs()
+    goal = str(inflight_extra.get("goal") or next_open_goal())
+    if not goal:
+        return {
+            "ok": True,
+            "skipped": "no open goal",
+            "briefs": briefs,
+            "autotune": autotune(),
+            "ladder": try_advance(),
+            "adoption": self_queue_adoption(),
+        }
+    # Open the run on the shared surface before the model call so the live
+    # feed and halt path have a run_id (S13 / R3).
+    run_id = str(inflight_extra.get("run_id") or "") or None
+    if not run_id:
+        try:
+            opened = record_run(
+                {
+                    "goal": goal[:120],
+                    "status": "running",
+                    "source": "loop",
+                    "ok": None,
+                }
+            )
+            if isinstance(opened, dict) and opened.get("run_id"):
+                run_id = str(opened["run_id"])
+        except Exception as exc:
+            inflight_extra = {**inflight_extra, "run_record_error": str(exc)[:200]}
+    if run_id:
+        inflight_extra = {**inflight_extra, "run_id": run_id}
+        try:
+            publish_event(run_id, "tick", {"goal": goal[:120]})
+            publish_event(run_id, "phase", {"name": "tick", "state": "start"})
+        except Exception:
+            pass
+    impl = implement(goal, inflight_extra)
+    if impl.get("rc") != 0:
+        # The implementer failed. What happens next depends on WHICH programme
+        # this is:
+        #
+        #   * CSD: hand off to the csd-python-first-drive workflow, which is
+        #     what that fallback was built for.
+        #   * a ladder repo: there is no such workflow. Dispatching it asked
+        #     CogSynDelta for csd-python-first-drive.yml, got 404, and returned
+        #     `skipped: queue-failed` with the 404 in the record and the
+        #     IMPLEMENTER'S OWN ERROR NOWHERE -- so a goal stalled with the only
+        #     useful evidence discarded. Retry here instead, on the same bounded
+        #     ladder every other refusal uses.
+        rec = {
+            "ok": False,
+            "goal": goal[:120],
+            "skipped": "implement-failed",
+            # Keep the reason. The old record threw it away and reported the
+            # fallback's failure as though it were the cause.
+            "implement": {
+                "rc": impl.get("rc"),
+                "error": str(impl.get("error") or "")[:400],
+                "tail": str(impl.get("text") or "")[-400:],
+            },
+            "ti": ti_ok(),
+        }
+        if TARGET_REPO:
+            # COUNT ACROSS TICKS. Each tick is a fresh process, so an attempt
+            # number taken from this run's own record is always 1 and the
+            # bounded retry never reaches its budget -- which turns "retry a
+            # transient failure" into an unbounded self-retrigger. Observed:
+            # nine consecutive `why=retry` ticks on one goal.
+            attempts = attempt_count(last, goal, "implement_attempts")
+            rec["implement_attempts"] = attempts
+            rec.update(
+                retry_or_escalate(
+                    goal,
+                    f"implementer rc={impl.get('rc')}: "
+                    + str(impl.get("error") or impl.get("text") or "")[-300:],
+                    attempts,
+                    last if isinstance(last, dict) else {},
+                )
+            )
+        else:
+            rec["workflow"] = launch_local_workflow(goal, "queue-failed")
+        beat({"last": rec})
+        return rec
+    dest = dest_worktree(goal)
+    applied = apply_proposal(
+        extract_json(str(impl.get("text") or "")),
+        dest,
+        worktree=apply_worktree_name(goal),
+        # The goal is what says whether a deletion is intended.
+        goal=goal,
+    )
+    if applied.get("skipped") and TARGET_REPO:
+        # A DECLINE IS NOT PROGRESS, AND REPEATING ONE IS A STALL.
+        #
+        # The model declining is usually a good signal -- it declines when a
+        # goal is underspecified, and that is worth listening to. But a decline
+        # is recorded as ok=true, so nothing retried and nothing escalated, and
+        # the goal stayed open for the next tick to decline again. Politely,
+        # forever.
+        #
+        # G-ARCH-PIPELINE did exactly that: its "blocked until X has landed"
+        # condition named a phrase that the corrected document no longer
+        # matched the way the goal's author meant, so the prerequisite HAD
+        # landed and the model went on refusing on the old wording. Nothing was
+        # wrong except the goal, and nothing in the loop could say so.
+        #
+        # The first decline is free. A second on the same goal goes to the
+        # helper, whose brief already asks "if the goal itself is the problem,
+        # say exactly that, and say how it should be reworded".
+        declines = attempt_count(last, goal, "declines")
+        rec = {
+            "ok": True,
+            "goal": goal[:120],
+            "applied": applied,
+            "declined": str(applied.get("skipped"))[:400],
+            "declines": declines,
+            # Carried for the same reason the retry branch carries it: the tick
+            # between two escalations would otherwise drop the count and the
+            # second escalation would read zero, so a goal that can never be
+            # done is never set aside.
+            "escalations": int((last or {}).get("escalations") or 0),
+        }
+        if declines > 1:
+            rec.update(
+                retry_or_escalate(
+                    goal,
+                    f"declined {declines} times: {str(applied.get('skipped'))[:300]}",
+                    # Straight past the retry budget: an identical decline is not
+                    # a transient failure, and trying again unchanged is the
+                    # thing that already did not work.
+                    approach_retries(),
+                    last if isinstance(last, dict) else {},
+                )
+            )
+            rec["declines"] = 0
+        else:
+            # A DECLINE IS PROGRESS THROUGH THE QUEUE, so wake once more. The
+            # first decline is free and emits nothing, so with seven goals open
+            # the loop went quiet for the hour after declining the first one.
+            # emit_continue is a no-op when nothing is open, so this cannot
+            # spin on an empty queue.
+            rec["continue"] = emit_continue(f"{goal_id(goal)} declined; next goal")
+        beat({"last": rec})
+        return rec
+
+    if not applied.get("ok") and not applied.get("skipped"):
+        # apply refused: a shrink guard, a parse error, a path refusal. These
+        # never reach the gate, so without this they produced a failing tick
+        # with no retry and no escalation at all -- the goal simply stopped.
+        tries = attempt_count(last, goal, "apply_attempts")
+        apply_extra = retry_or_escalate(
+            goal,
+            f"apply refused: {str(applied.get('error') or '')[:300]}",
+            tries,
+            last if isinstance(last, dict) else {},
+        )
+        # Escalating starts a new approach, which earns a fresh stretch.
+        apply_extra["apply_attempts"] = (
+            tries if apply_extra.get("stage") == "retry" else 0
+        )
+    else:
+        apply_extra = {}
+    git_rec = land_git(goal, applied)
+    pr_rec = land_pr(goal, git_rec)
+    rec = {
+        "ok": bool(
+            applied.get("ok")
+            and (git_rec.get("ok") or git_rec.get("skipped"))
+            and (pr_rec.get("ok") or pr_rec.get("skipped") or pr_rec.get("number"))
+        ),
+        "goal": goal[:120],
+        "applied": applied,
+        "git": git_rec,
+        "pr": pr_rec,
+        "ti": ti_ok(),
+        "t": time.time(),
+        "repo": pr_rec.get("repo") or git_rec.get("repo"),
+        "sha": pr_rec.get("sha") or git_rec.get("sha"),
+        "number": pr_rec.get("number") or inflight_extra.get("number"),
+        "consumed_note": inflight_extra.get("consumed_note"),
+        "implemented_sha": (pr_rec.get("sha") or git_rec.get("sha")),
+        "approach_fails": inflight_extra.get("approach_fails") or 0,
+        "approach_id": inflight_extra.get("approach_id") or 0,
+        "change_approach": bool(inflight_extra.get("change_approach")),
+        "merged": bool(pr_rec.get("merged")),
+        "required_ran": bool(pr_rec.get("required_ran")),
+        "required_succeeded": bool(pr_rec.get("required_succeeded")),
+        "head": pr_rec.get("head") or git_rec.get("branch"),
+        "text": str(impl.get("text") or "")[:4000],
+        "rc": impl.get("rc"),
+        **({"briefs": briefs} if briefs.get("goals_added") else {}),
+        **apply_extra,
+    }
+    # A refused push is an EVENT, not a dead end: emit one so the next attempt
+    # starts in seconds rather than at the next hourly reconcile. Bounded by the
+    # same approach-retry budget the loop uses to decide when to change tactic --
+    # past that, the goal needs a person and spinning would bury the evidence.
+    if not git_rec.get("ok") and (git_rec.get("gates") or git_rec.get("no_op")):
+        tries = attempt_count(last, goal, "git_attempts")
+        rec.update(
+            retry_or_escalate(
+                goal,
+                str(git_rec.get("error") or "gate"),
+                tries,
+                last if isinstance(last, dict) else {},
+            )
+        )
+        rec["git_attempts"] = tries if rec.get("stage") == "retry" else 0
+
+    if pr_rec.get("merged") and pr_rec.get("required_ran"):
+        rec["next_goal"] = advance_next_goal(goal)
+        rec["ok"] = True
+    elif pr_rec.get("wait") and str((pr_rec.get("wait") or {}).get("state") or "") in {
+        "failure",
+        "error",
+    }:
+        rec["ping"] = maybe_ping_stall(
+            goal,
+            "required pytest red",
+            "Forgejo required checks failed; is the oracle contract wrong?",
+            f"blocker: wait state; paths: {applied.get('path') or ''}; "
+            "tried: local pytest, forgejo wait",
+            paths=[str(applied.get("path") or "")],
+            tried=["localai-queue", "git push", "forgejo/wait"],
+        )
+        rec["ok"] = False
+        if rec["ping"].get("need"):
+            rec["workflow"] = launch_local_workflow(goal, "checks-failed")
+    elif pr_rec.get("error") and not pr_rec.get("number"):
+        rec["ping"] = maybe_ping_stall(
+            goal,
+            "pr-create failed",
+            "Forgejo pr-create failed twice; wrong repo or missing head?",
+            (
+                f"blocker: {pr_rec.get('error')}; "
+                "paths: scripts/csd-autodev-loop; tried: git push, pr-create"
+            ),
+            paths=["scripts/csd-autodev-loop"],
+            tried=["git push", "pr-create"],
+        )
+        rec["ok"] = False
+        if rec["ping"].get("need"):
+            rec["workflow"] = launch_local_workflow(goal, "pr-create-failed")
+    if rec.get("required_succeeded") is True:
+        rec["pytest_rc"] = 0
+    elif rec.get("required_ran") is True:
+        rec["pytest_rc"] = 1
+    OUT.mkdir(parents=True, exist_ok=True)
+    dest = OUT / f"{int(time.time())}.json"
+    slim = {k: rec.get(k) for k in rec if k != "ping"}
+    dest.write_text(json.dumps(slim, indent=2), encoding="utf-8")
+    rec["out"] = str(dest)
+    # Shared run surface — same HTTP API a human client uses (S13).
+    try:
+        fields = {
+            "goal": rec.get("goal"),
+            "ok": rec.get("ok"),
+            "status": "done" if rec.get("ok") else "error",
+            "repo": rec.get("repo"),
+            "sha": rec.get("sha"),
+            "number": rec.get("number"),
+            "head": rec.get("head"),
+            "out": rec.get("out"),
+            "checkpoint_sha256": rec.get("checkpoint_sha256"),
+            "source": "loop",
+        }
+        if run_id:
+            fields["run_id"] = run_id
+        run_rec = record_run(fields)
+        if isinstance(run_rec, dict) and run_rec.get("run_id"):
+            rec["run_id"] = run_rec["run_id"]
+            with contextlib.suppress(Exception):
+                publish_event(
+                    str(run_rec["run_id"]),
+                    "phase",
+                    {
+                        "name": "tick",
+                        "state": "end",
+                        "ok": rec.get("ok"),
+                    },
+                    checkpoint_sha256=rec.get("checkpoint_sha256"),
+                )
+    except Exception as exc:
+        rec["run_record_error"] = str(exc)[:200]
+        if run_id:
+            rec["run_id"] = run_id
+    beat({"last": rec})
+    return rec
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--worker", action="store_true")
+    args = ap.parse_args()
+    if args.worker:
+        while True:
+            rec = tick()
+            beat({"last": rec})
+            print(json.dumps(rec), flush=True)
+            time.sleep(30)
+    print(json.dumps(tick()))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

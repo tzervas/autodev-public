@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Answer git's credential prompt from the environment.
+#
+# WHY AN ASKPASS AND NOT `-c http.extraheader=`: the extraheader form puts the
+# token on the command line, where any user on the host can read it out of `ps`.
+# Here the token arrives as TOKEN in the environment -- placed there by
+# `secret exec` -- and is written only to git's own pipe.
+#
+# The previous GIT_ASKPASS pointed into the operator's home, which the service
+# accounts cannot execute; every push failed with "cannot exec ... Permission
+# denied" and then "could not read Username", which reads like an auth problem
+# and is not one.
+set -uo pipefail
+
+prompt="${1:-}"
+case "$prompt" in
+  *[Uu]sername*) printf '%s' "${GIT_USERNAME:-autodev}" ;;
+  *[Pp]assword*|*[Tt]oken*) printf '%s' "${TOKEN:-}" ;;
+  # Unknown prompt: say nothing. Echoing the token at a prompt we do not
+  # recognise is how a credential ends up somewhere it was never meant to go.
+  *) printf '' ;;
+esac

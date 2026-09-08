@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""Completion via the LiteLLM gateway.
+
+Drop-in replacement for `csd-localai-queue complete`, deliberately presenting the
+SAME command line. The loop wraps that invocation in cancellation, event
+publishing and timeout handling; changing the call site would mean re-deriving all
+of it, so the transport changes and nothing else does.
+
+LocalAI is retired. The gateway (LiteLLM) fronts vLLM on the 5080 and the 3090 Ti
+and does the routing, fallbacks, retries and cooldowns that `csd-model-router`
+used to approximate locally -- which is why the router calls are gone rather than
+ported.
+
+CREDENTIAL: from the environment only, never argv. The unit supplies it with
+`secret exec AUTODEV_GATEWAY_KEY=inference/gateway-key -- ...`, so the value is
+never in a process listing.
+
+REASONING MODELS: both Qwen3.5 tiers emit `reasoning_content` and leave `content`
+null until they finish thinking. A truncated response therefore looks like an
+empty answer rather than an error. We ask for a large completion budget and, if we
+still get truncated with no content, we say exactly that instead of returning ""
+and letting the caller record a mysterious empty patch.
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        The first version of this fallback returned the caller's default, which
+        was None -- so a script run outside the unit crashed on `None + str`
+        instead of using the committed defaults. A fallback that cannot do the
+        job is not a fallback; it is a delayed failure.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("AUTODEV_GATEWAY_URL", FLEET.get("gateway.url")).rstrip("/")
+
+# One logical name per kind. These are gateway names, not model names: which
+# physical model serves them is the gateway's business, and changes when a card
+# is swapped without this file caring.
+KIND_MODEL = {
+    "autodev": os.environ.get("AUTODEV_MODEL_IMPLEMENT", "coder-deep"),
+    "plan": os.environ.get("AUTODEV_MODEL_PLAN", "planner"),
+    "review": os.environ.get("AUTODEV_MODEL_REVIEW", "reviewer"),
+    "utility": os.environ.get("AUTODEV_MODEL_UTILITY", "utility"),
+    # THE HELPER IS A SECOND AGENT ON A SECOND CARD, and that is the whole point
+    # of it having its own kind. When the implementer gets stuck it asks the
+    # helper what to do differently; if both are served from the SAME card, that
+    # question either queues behind the implementer's own work or forces a model
+    # swap on the card the implementer is using -- so the cheapest moment to get
+    # unstuck becomes the most expensive one.
+    #
+    # Measured on this fleet before the split: `coder-deep` (implementer) and
+    # `planner` (then the escalation target) were both served from
+    # 203.0.113.10:8001. Escalation contended with the work it was meant to
+    # unblock. `coder-fast` lives on the other card, so the helper answers while
+    # the implementer keeps its weights resident.
+    #
+    # Deliberately NOT a duplicate of the implementer: different weights give a
+    # genuinely second opinion, which is the reason to ask at all.
+    "helper": os.environ.get("AUTODEV_MODEL_HELPER", "coder-fast"),
+}
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic budget. Static per-role settings failed three components this session.
+# --------------------------------------------------------------------------- #
+#
+# THE FAILURE, three times over. `reviewer` at effort=high timed out on any diff
+# larger than a few lines. `planner` at effort=high timed out writing a single
+# goal row. `coder-deep` unbounded spent 28,908 characters reasoning and returned
+# nothing at all. Each was fixed by hand, per model, after it broke.
+#
+# The mechanism is the same every time: THINKING IS CHARGED AGAINST THE SAME
+# BUDGET AS THE ANSWER. A long prompt plus deep reasoning leaves no room for the
+# reply, and `finish_reason=length` with empty content is what that looks like.
+# A fixed number cannot be right for both a 400-character prompt and a 40,000-
+# character diff, so it is computed instead of configured.
+#
+# MEASURED, from 20 real calls with prompts over 500 characters: p50 3.87, p10
+# 3.48. My guess of 3.0 was pessimistic by about sixteen percent, which is the
+# safe direction but wasted headroom on every call.
+#
+# The p10 rather than the median, because the estimate must not UNDERSHOOT: one
+# that says a prompt is smaller than it is budgets for a prompt that does not
+# exist. SAFETY_TOKENS covers the tail below it.
+#
+# Prompts under ~500 characters are excluded from the measurement -- a 22-char
+# prompt reports 17 tokens, a ratio of 1.29, because the chat template dominates
+# anything that short. The ratio only has to be right where the budget is tight.
+# Re-derive with csd-budget-calibrate; do not adjust it by feel.
+CHARS_PER_TOKEN = 3.48
+CONTEXT_WINDOW = int(os.environ.get("AUTODEV_CONTEXT_WINDOW", "65536"))
+SAFETY_TOKENS = 2048
+
+# How much room the ANSWER needs, and how much thinking helps, per kind.
+#   review  -- comparison. The diff and the goal are both in front of it; there
+#              is little to derive, and at effort=high it timed out on every
+#              real diff while producing WORSE verdicts than at none.
+#   plan    -- judgement. Writing a well-scoped goal is a real decision, so some
+#              thinking earns its budget; `high` did not.
+#   autodev -- generation. It must emit a whole file, so the answer itself is
+#              large and the reasoning has to be capped to leave room.
+KIND_BUDGET = {
+    "review": {"effort": "none", "answer_tokens": 1500},
+    # MEASURED, and it overturned my estimate. At effort=low `plan` hit
+    # finish_reason=length in 5 of 6 calls while the gateway also forced low --
+    # 4000 completion tokens spent, nothing returned, 54 seconds the first time.
+    # With that override removed it succeeds at low, but takes 39-50s and 2888-
+    # 3649 completion tokens. At effort=none the same prompts answered in ~3
+    # seconds with ~206 tokens, every time. Writing a goal row is a judgement, so
+    # I gave it thinking room; ten times the latency bought nothing the answer
+    # did not already contain.
+    "plan": {"effort": "none", "answer_tokens": 2000},
+    "utility": {"effort": "none", "answer_tokens": 1000},
+    # Advice, not code: eight lines was the brief. Short answers keep the other
+    # card free and keep the guidance readable enough to act on.
+    "helper": {"effort": "none", "answer_tokens": 1200},
+    "autodev": {"effort": "low", "answer_tokens": 12000},
+}
+
+# Ordered cheapest-first. On a timeout the call is retried one step down rather
+# than failing: a timeout is a budget that was too ambitious, not an outage, and
+# an unattended loop that gives up on it stalls until a person notices.
+# Strongest first. A retry may only move RIGHT along this list: a budget failure
+# means there was too much thinking, so answering it with more is the one thing
+# guaranteed not to help.
+EFFORT_ORDER = ["high", "medium", "low", "none"]
+DEGRADE = ["low", "none"]
+
+
+# --------------------------------------------------------------------------- #
+# The learned profile: what has ACTUALLY worked, per kind
+# --------------------------------------------------------------------------- #
+#
+# KIND_BUDGET above is the cold start -- my estimates, plus the two the traffic
+# has already corrected. It should not stay the authority. Every call records
+# what it cost, csd-budget-calibrate turns that into measurements, and this file
+# is where those measurements become the settings the next call uses.
+#
+# Two feedback paths, deliberately different speeds:
+#
+#   SLOW, from the calibrator: `csd-budget-calibrate --apply` writes p99 answer
+#   sizes and the measured chars-per-token once there are enough samples to mean
+#   something. Considered, batched, and refuses below the sample floor.
+#
+#   FAST, from a failure: a call that returns nothing (rc 6) or is still
+#   truncated after continuation demotes its kind's effort IMMEDIATELY. Waiting
+#   for a calibration run would repeat the same 54-second failure every time in
+#   between -- and that is exactly what `plan` did, nine times, before a person
+#   looked at the log.
+#
+# The profile is DATA, not code. A missing or corrupt file falls back to
+# KIND_BUDGET silently, because an autotuner that can break the caller when its
+# own state file is unreadable is worse than no autotuner.
+# The DEFAULT is per-user, never a named service account's live state. It used
+# to be /home/svc-autodev/state/budget-profile.json outright, so importing this
+# module on that host silently inherited that agent's learned tuning: the
+# budget test asserted the cold-start effort "low", read the profile the
+# autotuner had legitimately demoted to "none", and failed for the agent while
+# passing for everyone else -- which made the repo's own gate red at baseline
+# and blocked the loop from working here at all.
+#
+# Deployment does not rely on this: deploy/bin/autodev-tick sets the variable
+# explicitly, and says why.
+PROFILE_PATH = os.environ.get(
+    "AUTODEV_BUDGET_PROFILE",
+    os.path.join(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+        "autodev",
+        "budget-profile.json",
+    ),
+)
+
+
+def load_profile() -> dict:
+    try:
+        with open(PROFILE_PATH) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_profile(prof: dict) -> None:
+    try:
+        parent = os.path.dirname(PROFILE_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = PROFILE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(prof, f, indent=2)
+        os.replace(tmp, PROFILE_PATH)
+    except OSError:
+        pass
+
+
+def demote(kind: str, why: str) -> None:
+    """One step weaker, now, because this setting just produced nothing.
+
+    Recorded with its reason so the next person to read the profile sees WHY a
+    kind is running at a lower effort than the cold start says, rather than
+    finding an unexplained number and raising it again.
+    """
+    prof = load_profile()
+    k = prof.setdefault("kinds", {}).setdefault(kind, {})
+    cur = k.get("effort") or KIND_BUDGET.get(kind, KIND_BUDGET["autodev"])["effort"]
+    if cur not in EFFORT_ORDER:
+        return
+    i = EFFORT_ORDER.index(cur)
+    if i >= len(EFFORT_ORDER) - 1:
+        return  # already at none; nothing weaker exists
+    k["effort"] = EFFORT_ORDER[i + 1]
+    k["demoted_from"] = cur
+    k["demoted_why"] = why[:200]
+    k["demoted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    save_profile(prof)
+    print(f"  autotune: {kind} effort {cur} -> {k['effort']} ({why})", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Instrumentation: the budget numbers are guesses until traffic says otherwise
+# --------------------------------------------------------------------------- #
+#
+# CHARS_PER_TOKEN = 3.0 and the per-kind answer sizes were picked from three
+# measured failures and my judgement. That was enough to stop the collapses, and
+# it is not enough to call them right. The API returns `usage` with real prompt
+# and completion token counts on every call, so the ratio and the answer sizes
+# can be MEASURED instead of argued about.
+#
+# One JSONL line per call. Append-only, no rotation here -- csd-budget-calibrate
+# reads it and the storage lifecycle owns the file.
+CALL_LOG = os.environ.get("AUTODEV_CALL_LOG", "/home/svc-autodev/state/calls.jsonl")
+
+
+def record_call(rec: dict) -> None:
+    """Never let telemetry break the call it is measuring.
+
+    A logging failure that propagates would turn a working completion into a
+    failed tick -- the instrumentation would cause the outage it exists to
+    explain.
+    """
+    try:
+        with open(CALL_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def plan_budget(kind: str, prompt: str, effort: str | None = None) -> dict:
+    """Size the call from the prompt actually being sent.
+
+    Returns the max_tokens and reasoning_effort to use, and says why, so a
+    journal line explains a truncated answer without anyone re-deriving it.
+    """
+    spec = dict(KIND_BUDGET.get(kind, KIND_BUDGET["autodev"]))
+    prof = load_profile()
+    learned = (prof.get("kinds") or {}).get(kind) or {}
+    # Learned values win where they exist; the cold start fills the rest.
+    if learned.get("effort") in EFFORT_ORDER:
+        spec["effort"] = learned["effort"]
+    if isinstance(learned.get("answer_tokens"), int):
+        spec["answer_tokens"] = learned["answer_tokens"]
+    ratio = prof.get("chars_per_token") or CHARS_PER_TOKEN
+    prompt_tokens = int(len(prompt) / float(ratio))
+    room = CONTEXT_WINDOW - prompt_tokens - SAFETY_TOKENS
+    want = spec["answer_tokens"]
+    chosen = effort or spec["effort"]
+
+    # Thinking needs its own room on top of the answer. Ask for less of it when
+    # the prompt has already eaten the window.
+    think = {"none": 0, "low": want, "medium": want * 2, "high": want * 4}
+    while chosen != "none" and want + think[chosen] > room:
+        chosen = (
+            DEGRADE[min(DEGRADE.index(chosen) + 1, len(DEGRADE) - 1)]
+            if chosen in DEGRADE
+            else "none"
+        )
+    budget = min(want + think.get(chosen, 0), max(room, 512))
+
+    # A call that cannot fit its own answer is doomed before it is made. Half the
+    # needed room is the line: below that the model returns a truncated file,
+    # which apply_proposal will happily write. Saying so costs nothing; making
+    # the call costs a model minute and produces a corrupt patch.
+    doomed = room < want // 2
+
+    return {
+        "max_tokens": int(budget),
+        "reasoning_effort": chosen,
+        "prompt_tokens": prompt_tokens,
+        "room": room,
+        "doomed": doomed,
+        "why": (
+            f"prompt ~{prompt_tokens} tok of {CONTEXT_WINDOW}; "
+            f"{room} left; answer needs ~{want}; effort={chosen}"
+        ),
+    }
+
+
+def complete(
+    kind: str, prompt: str, timeout: int, effort: str | None = None
+) -> tuple[int, str]:
+    key = os.environ.get("AUTODEV_GATEWAY_KEY", "")
+    if not key:
+        return 2, (
+            "no AUTODEV_GATEWAY_KEY in the environment; the unit must supply it "
+            "with `secret exec AUTODEV_GATEWAY_KEY=inference/gateway-key`"
+        )
+
+    model = KIND_MODEL.get(kind, KIND_MODEL["autodev"])
+    plan = plan_budget(kind, prompt, effort)
+    if plan["doomed"]:
+        return 8, (
+            f"prompt is too large for {model} to answer: {plan['why']}. "
+            "Shrink the context (fewer files, an abridged diff) rather than "
+            "raising the budget -- there is no budget that fits."
+        )
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "reasoning_effort": plan["reasoning_effort"],
+            # MEASURED, not guessed: coder-deep spent 28,908 characters of reasoning on
+            # a single implementation goal and produced no answer at 8192 tokens. These
+            # are reasoning models -- the thinking is charged against the same budget as
+            # the output, so a budget sized for the patch alone yields nothing at all.
+            # 32768 leaves room for the reasoning AND the patch; the 9B serves 131072.
+            "max_tokens": int(
+                os.environ.get("AUTODEV_MAX_TOKENS", "") or plan["max_tokens"]
+            ),
+            "temperature": float(os.environ.get("AUTODEV_TEMPERATURE", "0.2")),
+        }
+    ).encode()
+
+    started = time.time()
+    req = urllib.request.Request(
+        f"{BASE}/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:600]
+        # 400 with "not found" here usually means the logical name maps to a model
+        # that is not currently resident -- e.g. `reviewer` while nemotron is
+        # swapped out. That is a real, visible failure and must not be smoothed over.
+        return 3, f"gateway HTTP {e.code} for model={model}: {detail}"
+    except Exception as e:
+        return 4, f"gateway unreachable at {BASE}: {type(e).__name__}: {str(e)[:200]}"
+
+    try:
+        choice = d["choices"][0]
+        msg = choice.get("message") or {}
+        text = (msg.get("content") or "").strip()
+        finish = choice.get("finish_reason")
+    except Exception:
+        return 5, f"unexpected gateway response shape: {json.dumps(d)[:400]}"
+
+    # What it ACTUALLY cost, from the server rather than from our estimate.
+    usage = d.get("usage") or {}
+    reasoning = msg.get("reasoning_content") or ""
+    record_call(
+        {
+            "ts": time.time(),
+            "kind": kind,
+            "model": model,
+            "effort": plan["reasoning_effort"],
+            "budget": plan["max_tokens"],
+            "prompt_chars": len(prompt),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "answer_chars": len(text),
+            "reasoning_chars": len(reasoning),
+            "finish_reason": finish,
+            "elapsed_s": round(time.time() - started, 2),
+        }
+    )
+
+    if not text:
+        reasoning = (msg.get("reasoning_content") or "").strip()
+        if reasoning and finish == "length":
+            return 6, (
+                f"model {model} exhausted its token budget while reasoning and "
+                f"produced no answer (finish_reason=length, "
+                f"{len(reasoning)} chars of reasoning). Raise AUTODEV_MAX_TOKENS."
+            )
+        return 7, f"model {model} returned empty content (finish_reason={finish})"
+    # rc 9 means "good output, but it was CUT OFF". Distinct from rc 0 so a
+    # caller can continue it, and distinct from rc 6 (thought until the budget
+    # was gone, produced nothing) which cannot be continued -- there is nothing
+    # to continue from.
+    if finish == "length":
+        return 9, text
+    return 0, text
+
+
+# --------------------------------------------------------------------------- #
+# Continuation: long context AND deep reasoning, without either eating the other
+# --------------------------------------------------------------------------- #
+#
+# THE PROBLEM. A reasoning model charges its thinking against the same budget as
+# its answer, so the two compete. Raising the budget hits the context window and
+# risks OOM on the server; lowering it truncates the answer or returns nothing at
+# all. plan_budget() defused this by REFUSING calls that could not fit -- honest,
+# but a refusal is not a result, and the tasks most worth doing are exactly the
+# large ones.
+#
+# TWO TECHNIQUES, and they compose.
+#
+# 1. SEPARATE THE PHASES. Deep reasoning and long output never need to be in the
+#    same call. Phase one thinks hard and returns a SHORT plan; phase two emits
+#    the artifact with almost no reasoning, because the thinking is already
+#    written down in front of it. Each call fits comfortably, and the model gets
+#    high effort AND a full-length answer -- just not simultaneously.
+#
+# 2. CONTINUE A TRUNCATED ANSWER. When output is cut off (finish_reason=length
+#    with content), the work so far is not wasted: send it back and ask for the
+#    remainder. This is what makes an artifact larger than one budget possible at
+#    all, and it is why complete() returns rc 9 rather than folding truncation
+#    into success.
+#
+# The guards matter more than the mechanism. An unattended continuation loop that
+# does not check for progress will spend a card until someone notices.
+
+MAX_CONTINUATIONS = int(os.environ.get("AUTODEV_MAX_CONTINUATIONS", "4"))
+OVERLAP_CHARS = 400
+
+
+def _dedupe_join(have: str, more: str) -> str:
+    """Join a continuation, dropping any overlap the model repeated.
+
+    Models routinely restate the last line or two before carrying on, and a
+    naive concatenation duplicates it -- in a Python file that is a syntax error
+    or, worse, a silently doubled statement. The longest suffix of `have` that
+    prefixes `more` is removed.
+    """
+    window = have[-OVERLAP_CHARS:]
+    # LONGEST overlap wins, down to a floor. The floor was 20 characters, which
+    # missed a repeated 15-character line and doubled it. It cannot go to zero
+    # either: a short common fragment like "    return " would match by accident
+    # and eat real output. So a short match must be a WHOLE LINE -- a repeated
+    # newline-terminated fragment is a restatement; a bare token is a coincidence.
+    for n in range(len(window), 5, -1):
+        frag = window[-n:]
+        if not more.startswith(frag):
+            continue
+        if n >= 30 or "\n" in frag:
+            return have + more[n:]
+    return have + more
+
+
+def complete_continued(
+    kind: str, prompt: str, timeout: int, effort: str | None = None
+) -> tuple[int, str]:
+    """Complete, and pick up an answer that was cut off mid-flight.
+
+    STOPS ON NO PROGRESS. A continuation that returns nothing new means the model
+    considers itself finished, or is stuck; either way another round produces the
+    same thing and costs the same minute. Without this check an unattended loop
+    burns a GPU until a person notices, which is the failure this whole system
+    exists to remove.
+    """
+    rc, text = complete(kind, prompt, timeout, effort=effort)
+    if rc != 9:
+        return rc, text
+
+    rounds = 0
+    last_chunk = ""
+    while rc == 9 and rounds < MAX_CONTINUATIONS:
+        rounds += 1
+        tail = text[-1500:]
+        more_prompt = (
+            f"{prompt}\n\n"
+            "--- YOUR PREVIOUS REPLY WAS CUT OFF ---\n"
+            "This is how it ended:\n"
+            f"...{tail}\n\n"
+            "Continue from EXACTLY where that stops. Do not restate what you "
+            "already wrote, do not summarise, and do not start again. Emit only "
+            "the remainder."
+        )
+        # Continuation is transcription, not deliberation: the decisions were
+        # made in the first call. Effort here would spend the budget re-deciding.
+        rc, more = complete(kind, more_prompt, timeout, effort="none")
+        if rc not in (0, 9) or not more.strip():
+            break
+        # NO PROGRESS is checked on what came back, not on what survived dedupe.
+        # A model repeating itself verbatim defeats a length check whenever the
+        # repeat is too short to dedupe -- "same" appended to "same" looks like
+        # growth. Comparing the chunk itself catches it regardless of length.
+        if more.strip() == last_chunk:
+            print(f"  continuation {rounds} repeated itself; stopping", file=sys.stderr)
+            break
+        last_chunk = more.strip()
+        before = len(text)
+        text = _dedupe_join(text, more)
+        if len(text) <= before:
+            print(
+                f"  continuation {rounds} added nothing; stopping",
+                file=sys.stderr,
+            )
+            break
+        print(
+            f"  continued ({rounds}/{MAX_CONTINUATIONS}): +{len(text) - before} chars",
+            file=sys.stderr,
+        )
+
+    if rc == 9:
+        return 9, text + "\n[still truncated after "
+        f"{rounds} continuation(s); the artifact is too large for this model]"
+    return 0, text
+
+
+def complete_two_phase(kind: str, prompt: str, timeout: int) -> tuple[int, str]:
+    """Think hard in one call, write long in the next.
+
+    For prompts plan_budget() would otherwise refuse. Phase one gets the deep
+    reasoning and is asked for a SHORT plan, so its budget is spent on thinking
+    rather than on prose. Phase two carries that plan and needs almost no
+    reasoning of its own, so the whole budget goes to the artifact.
+
+    If phase one fails, fall back to a single direct call rather than giving up:
+    a plan is an optimisation, and the direct call is what happens today.
+    """
+    plan_prompt = (
+        f"{prompt}\n\n"
+        "--- FIRST, PLAN ONLY ---\n"
+        "Do not write the artifact yet. In at most 15 short lines, state the "
+        "decisions you have made: which file, what changes, what each must "
+        "prove, and anything in the context that constrains it. This plan is "
+        "handed to the step that writes the code, so it must be complete enough "
+        "to act on without re-reading everything."
+    )
+    rc, plan = complete("plan", plan_prompt, timeout, effort="low")
+    if rc not in (0, 9) or not plan.strip():
+        return complete_continued(kind, prompt, timeout)
+
+    write_prompt = (
+        f"{prompt}\n\n"
+        "--- YOUR PLAN, ALREADY DECIDED ---\n"
+        f"{plan.strip()[:4000]}\n\n"
+        "Now write the artifact exactly as planned. The thinking is done; do not "
+        "revisit it."
+    )
+    return complete_continued(kind, write_prompt, timeout, effort="none")
+
+
+def complete_with_recovery(kind: str, prompt: str, timeout: int) -> tuple[int, str]:
+    """Retry a timeout or an exhausted budget with LESS reasoning, not more.
+
+    A timeout here is almost never an outage -- the gateway answers a trivial
+    prompt in three seconds. It is a budget that was too ambitious for this
+    prompt, and the two failure modes say the same thing:
+
+      rc 4, TimeoutError            the model is still thinking
+      rc 6, finish_reason=length    it thought until the budget was gone
+
+    Both were fixed by hand three times this session, per model, after each one
+    broke in production. Retrying one step down the effort ladder fixes them
+    without a person: an unattended loop that gives up on a timeout stalls until
+    somebody notices, which is the failure the whole event system exists to
+    remove.
+
+    It does NOT retry a 3 (model not resident) or a 7 (empty for another
+    reason). Those are real and must stay visible; retrying them would just burn
+    the budget twice and report the same thing.
+    """
+    # A prompt too large to answer in one call is not a refusal any more: split
+    # the thinking from the writing and both fit. Refusing was honest but a
+    # refusal is not a result, and the largest tasks are the ones worth doing.
+    if plan_budget(kind, prompt)["doomed"]:
+        print("  prompt too large for one call; splitting reason/emit", file=sys.stderr)
+        return complete_two_phase(kind, prompt, timeout)
+
+    # SKIP AN EFFORT THAT WAS JUST TRIED. Traffic caught this: `plan` defaults to
+    # low, so the ladder [None, "low", "none"] retried low immediately after low
+    # had failed -- and the gateway's cache returned the identical failure in
+    # 0.04s. A wasted round that looks like a real attempt in the log, and on a
+    # cache miss it would be a wasted minute instead.
+    # DEGRADE ONLY DOWNWARD. Naively deduping [None, *DEGRADE] against the
+    # default produced ["none", "low"] for a kind whose default is already none
+    # -- a retry with MORE thinking after a budget failure, which is the exact
+    # wrong direction and would have burned the budget harder each round.
+    default = KIND_BUDGET.get(kind, KIND_BUDGET["autodev"])["effort"]
+    weaker = EFFORT_ORDER.index(default) if default in EFFORT_ORDER else 0
+    ladder: list[str | None] = [None]
+    for e in EFFORT_ORDER[weaker + 1 :]:
+        ladder.append(e)
+
+    attempts: list[str] = []
+    for i, effort in enumerate(ladder):
+        rc, text = complete_continued(kind, prompt, timeout, effort=effort)
+        if rc not in (4, 6, 8):
+            if attempts and rc == 0 and effort in EFFORT_ORDER:
+                # This effort worked where the previous one did not. Promote it
+                # to the profile so the NEXT call starts here instead of
+                # repeating the failure that got us here.
+                prof = load_profile()
+                k = prof.setdefault("kinds", {}).setdefault(kind, {})
+                if k.get("effort") != effort:
+                    k["effort"] = effort
+                    k["learned_why"] = (
+                        f"succeeded after {len(attempts)} failed attempt(s) at a "
+                        "higher effort"
+                    )
+                    k["learned_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                    save_profile(prof)
+                    print(
+                        f"  autotune: {kind} settled on effort={effort}", file=sys.stderr
+                    )
+            if attempts and rc == 0:
+                # Say what it took. A silent recovery hides a budget that is
+                # chronically wrong for this kind of prompt.
+                print(
+                    f"  recovered after {len(attempts)} retry(ies): "
+                    f"{'; '.join(attempts)}",
+                    file=sys.stderr,
+                )
+            return rc, text
+        attempts.append(f"effort={effort or 'default'} -> rc={rc}")
+        # LEARN FROM IT NOW. rc 6 means the thinking consumed the whole budget
+        # and nothing came back; rc 4 means it was still thinking when the clock
+        # ran out. Both say the effort was too high for this kind of prompt, and
+        # both recur every call until something changes. `plan` produced this
+        # failure nine times before a person read the log -- the retry recovered
+        # each one, so nothing looked broken, and each recovery cost 54 seconds.
+        if rc in (4, 6) and effort is None:
+            demote(kind, f"rc={rc} at the profile's own setting")
+        if i == len(ladder) - 1:
+            break
+    return rc, (text + "\n[budget recovery exhausted: " + "; ".join(attempts) + "]")
+
+
+def backends() -> dict:
+    """Which backend serves each kind, and whether the split actually holds.
+
+    The implementer and the helper are supposed to be on DIFFERENT cards -- that
+    is what makes escalation cheap. Nothing enforces it: the mapping lives in
+    the gateway, an alias can be repointed there without touching this
+    repository, and the loop would go on escalating into contention with no
+    symptom beyond being slow.
+
+    So ask, and say plainly when the split has collapsed. Reported rather than
+    fatal: a degraded arrangement should still work, it should just not be
+    silent about it.
+    """
+    key = os.environ.get("AUTODEV_GATEWAY_KEY", "")
+    req = urllib.request.Request(
+        BASE.rsplit("/v1", 1)[0] + "/v1/model/info",
+        headers={"Authorization": f"Bearer {key}"} if key else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
+
+    where = {}
+    for m in data.get("data", []):
+        params = m.get("litellm_params") or {}
+        where[m.get("model_name")] = params.get("api_base") or params.get("model") or ""
+
+    kinds = {k: {"model": v, "backend": where.get(v, "")} for k, v in KIND_MODEL.items()}
+    impl = kinds.get("autodev", {}).get("backend")
+    helper = kinds.get("helper", {}).get("backend")
+    split = bool(impl and helper and impl != helper)
+    rec = {"ok": True, "kinds": kinds, "split": split}
+    if not split:
+        rec["warning"] = (
+            "the implementer and the helper resolve to the SAME backend "
+            f"({impl or 'unknown'}): escalation will contend with the work it is "
+            "meant to unblock, or force a model swap on the card in use. Point "
+            "AUTODEV_MODEL_HELPER at an alias served by the other card."
+        )
+    return rec
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("complete")
+    c.add_argument("--kind", default="autodev")
+    c.add_argument("--prompt", required=True)
+    c.add_argument("--timeout", type=int, default=240)
+    sub.add_parser("cards", help="which backend serves each kind")
+    a = ap.parse_args()
+
+    if a.cmd == "cards":
+        rec = backends()
+        print(json.dumps(rec, indent=2))
+        # Non-zero when the split has collapsed, so a unit or a check can act on
+        # it without parsing the JSON.
+        return 0 if rec.get("ok") and rec.get("split") else 1
+
+    rc, text = complete_with_recovery(a.kind, a.prompt, a.timeout)
+    # stdout on success, stderr on failure: the loop concatenates both, but a human
+    # reading the journal should be able to tell them apart.
+    print(text, file=sys.stdout if rc == 0 else sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

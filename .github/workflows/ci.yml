@@ -1,0 +1,42 @@
+name: CI
+
+# quoted: YAML 1.1 parses a bare `on` key as the boolean True
+"on":
+  pull_request:
+  push:
+    branches: [feat/bootstrap]
+
+env:
+  RUFF_VERSION: "0.14.13"
+  SHELLCHECK_PY_VERSION: "0.11.0.1"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/feat/bootstrap' }}
+
+jobs:
+  gate:
+    name: Repo gate
+    # NEVER a self-hosted runner on a pull_request in a repo that may be
+    # public: a fork PR runs arbitrary code on the hardware, and once someone
+    # has one merged PR they clear the first-time-contributor gate by default.
+    # This ran on self-hosted while the repo was private, which is exactly the
+    # setting that changes when you flip visibility.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, podman]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify uv (baked into job image)
+        run: |
+          # uv is baked into fleet-ci-base. Shellcheck is not — scripts/gate
+          # falls back to uvx shellcheck-py when the system binary is absent.
+          command -v uv >/dev/null 2>&1 || {
+            echo "uv missing — job image is not fleet-ci-base" >&2; exit 1; }
+          uv --version
+
+      - name: Repo gate (lint, format, shellcheck, pytest)
+        run: bash scripts/gate
+        env:
+          RUFF_VERSION: ${{ env.RUFF_VERSION }}
+          SHELLCHECK_PY_VERSION: ${{ env.SHELLCHECK_PY_VERSION }}

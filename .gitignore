@@ -1,0 +1,27 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.pyc
+
+# Nothing here stopped a future .env, key, or decrypted secret from being
+# committed by an agent working in this tree. The audit found no credential --
+# this is so the next one finds none either.
+*.env
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*.dec
+age.txt
+.netrc
+.git-credentials
+secrets/
+.secrets/
+
+# The PRIVATE override. config/fleet.example.json is the committed, publishable
+# default; this holds the real addresses and must never be committed.
+config/fleet.json

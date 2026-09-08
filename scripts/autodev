@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""autodev — hand the pipeline work, and watch it do it.
+
+The loop already runs unattended. This is the operator's side of it: a way to
+put work IN and see what is happening, without editing a table by hand or
+reading journalctl.
+
+    autodev submit brief.md              # a brief becomes goals in the queue
+    autodev queue                        # what is queued, for which repo
+    autodev status                       # units, rung, queue depth, in-flight
+    autodev watch                        # one line per tick, live
+    autodev run --once                   # one tick in the foreground
+    autodev start / autodev stop         # unattended, on forge events
+    autodev pause "reviewing #12" / autodev resume
+    autodev target cabal-collective/mycelium
+
+WHAT SUBMIT ACCEPTS. Anything from a paragraph to a finished plan:
+
+  * A brief -- an idea, a problem, a page of intent. It is decomposed into goal
+    rows by the planner, shown to you, and appended once you accept.
+  * A file that ALREADY contains `| G-... | ... | open |` rows. Those are taken
+    verbatim: a plan you decomposed yourself is not improved by a model
+    rewriting it.
+
+Both go to the same place, because the pipeline downstream is the same.
+
+WHY A FILE AND NOT A FLAG. A goal is prose that has to be precise, and prose
+that has to be precise wants an editor. It is also worth keeping: the file is
+the thing you edit and resubmit when the first attempt was underspecified.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+_SRC = ROOT / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+
+# EVERY path comes from the same place. STATE read the fleet config and EVENTS
+# did not, so `autodev submit` on a real deployment wrote the brief to the right
+# directory and then tried to wake the loop in /var/lib/autodev/events -- the
+# documentation-safe default, which does not exist here. It reported the failure
+# honestly and fell back to the hourly net, which is correct behaviour for a
+# wrong answer, and still the wrong answer.
+def _cfg(dotted: str, env: str, fallback: str) -> Path:
+    raw = os.environ.get(env) or ""
+    if not raw:
+        try:
+            from csd_autodev import fleet as _fleet
+
+            raw = str(_fleet.get(dotted) or "")
+        except Exception:  # pragma: no cover - the CLI must run without the package
+            raw = ""
+    return Path(raw or fallback)
+
+
+STATE = _cfg("paths.state", "AUTODEV_STATE", "/var/lib/autodev/state")
+EVENTS = _cfg("events.dir", "AUTODEV_EVENT_DIR", "/var/lib/autodev/events")
+LADDER = Path(os.environ.get("AUTODEV_LADDER", ROOT / "config/ladder.json"))
+QUEUE = ROOT / "scripts/csd-gateway-complete"
+UNITS = ("autodev-events.service", "autodev-tick.path", "autodev-tick.timer")
+GOAL_ROW = re.compile(r"^\|\s*(G-[A-Z0-9-]+)\s*\|(.+?)\|\s*(\w+)\s*\|\s*$")
+# The states a row may be in. Used to find the state cell in a row that has more
+# columns than it should.
+STATES = {"open", "done", "blocked", "invalid", "wip", "skip"}
+
+
+def normalise_row(line: str) -> str:
+    """Coerce a goal row to `| id | text | state |`.
+
+    Models add columns. Asked for three cells the planner produced four -- id,
+    what to do, `open`, and a fourth holding the acceptance criteria -- and a
+    strict parser would have rejected four perfectly good goals for a formatting
+    slip, on the operator's first use of the tool.
+
+    The extra cell was part of the goal, so it is folded into the goal text
+    rather than dropped. Returns "" for a line that is not a goal row at all.
+    """
+    if not line.strip().startswith("|"):
+        return ""
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 2 or not re.fullmatch(r"G-[A-Z0-9-]+", cells[0]):
+        return ""
+    gid = cells[0]
+    rest = cells[1:]
+    state = "open"
+    # The LAST cell that is a state word is the state; anything after it in the
+    # row is commentary and belongs with the goal.
+    for i in range(len(rest) - 1, -1, -1):
+        if rest[i].lower() in STATES:
+            state = rest[i].lower()
+            rest = rest[:i] + rest[i + 1 :]
+            break
+    text = ". ".join(c for c in rest if c).replace("..", ".")
+    if not text:
+        return ""
+    return f"| {gid} | {text} | {state} |"
+
+
+# --------------------------------------------------------------------------- #
+# Where the work lives
+# --------------------------------------------------------------------------- #
+def current_repo() -> str:
+    """The rung the loop is on. One source of truth, the same file the tick reads."""
+    try:
+        return str(json.loads(LADDER.read_text(encoding="utf-8")).get("current") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def goals_path(repo: str = "") -> Path:
+    """The queue file for a repo. Named from the repo, as the wrapper names it."""
+    repo = repo or current_repo()
+    if not repo:
+        raise SystemExit(
+            "autodev: no target repo. Pass --repo owner/name, or set one with "
+            "`autodev target owner/name`."
+        )
+    return STATE / f"GOALS-{repo.rsplit('/', 1)[-1]}.md"
+
+
+def read_rows(path: Path) -> list[tuple[str, str, str]]:
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = GOAL_ROW.match(line)
+        if m:
+            out.append((m.group(1), m.group(2).strip(), m.group(3)))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# submit
+# --------------------------------------------------------------------------- #
+def rows_in(text: str) -> list[str]:
+    """Goal rows in a brief or a model reply, normalised to three cells."""
+    out = []
+    for ln in text.splitlines():
+        row = normalise_row(ln)
+        if row:
+            out.append(row)
+    return out
+
+
+def hand_over(brief_file: Path, repo: str) -> int:
+    """Drop a brief where the loop will find it, and wake it.
+
+    NOT decomposed here. The operator has no gateway credential and should not
+    have one -- the agent holds its own, in its own vault, which is the point of
+    the identity split. So the brief is handed over and the LOOP decomposes it
+    on its next tick.
+
+    Submitting work therefore needs nothing but write access to one directory,
+    from any machine, with no secret on this side at all.
+    """
+    briefs = STATE / "briefs"
+    try:
+        briefs.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = briefs / f"{stamp}-{brief_file.stem}.md"
+        dest.write_text(brief_file.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError as e:
+        raise SystemExit(f"autodev: cannot write to {briefs}: {e}") from e
+    print(f"\n  handed to {repo}: {dest.name}")
+    if wake(f"brief {dest.name}"):
+        print("  the loop decomposes it into goals on its next tick.")
+        print("  watch it land:  autodev watch -f")
+    return 0
+
+
+def cmd_submit(a: argparse.Namespace) -> int:
+    brief_file = Path(a.file)
+    if not brief_file.is_file():
+        raise SystemExit(f"autodev: no such file: {brief_file}")
+    brief = brief_file.read_text(encoding="utf-8")
+    repo = a.repo or current_repo()
+    path = goals_path(repo)
+    existing = [r[0] for r in read_rows(path)]
+
+    rows = rows_in(brief)
+    if not rows:
+        return hand_over(brief_file, repo)
+    how = "taken verbatim (the brief is already decomposed)"
+
+    clashes = [r for r in rows if GOAL_ROW.match(r).group(1) in existing]
+    print(f"\n  {len(rows)} row(s), {how}:\n")
+    for r in rows:
+        mark = "  CLASH" if r in clashes else ""
+        print(f"    {r}{mark}")
+    if clashes:
+        print(
+            f"\n  {len(clashes)} id(s) already in the queue. Rename them in the "
+            "brief and resubmit; two goals sharing an id share a branch."
+        )
+        return 1
+
+    if not a.yes:
+        print(f"\n  append to {path}? [y/N] ", end="", file=sys.stderr, flush=True)
+        if (sys.stdin.readline().strip().lower() or "n") not in {"y", "yes"}:
+            print("  not appended.", file=sys.stderr)
+            return 1
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(rows) + "\n")
+    print(f"\n  appended {len(rows)} row(s) to {path.name}")
+    wake(f"{len(rows)} goal(s) submitted")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# steering and state
+# --------------------------------------------------------------------------- #
+def wake(why: str) -> bool:
+    """Drop a sentinel so the loop starts now rather than at the next event.
+
+    Returns whether it worked, and the caller SAYS SO. This swallowed its own
+    failure and returned nothing: the event directory was readable but not
+    writable from the operator's account, so `submit` printed "the loop
+    decomposes it on its next tick" and then no tick came for twenty minutes.
+    A latency improvement that fails silently is a lie about what just happened.
+    """
+    import uuid
+
+    d = EVENTS
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f"{uuid.uuid4().hex}.tmp"
+        tmp.write_text(
+            json.dumps({"kind": "continue", "why": why, "ts": time.time()}) + "\n"
+        )
+        tmp.replace(tmp.with_suffix(".json"))
+        return True
+    except OSError as e:
+        print(
+            f"\n  could not wake the loop ({e.strerror}). The work is queued and "
+            "will\n  be picked up on the next forge event or the hourly net.",
+            file=sys.stderr,
+        )
+        return False
+
+
+def steer(fields: dict) -> int:
+    p = STATE / "steer.json"
+    try:
+        cur = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+    except ValueError:
+        cur = {}
+    cur.update(fields)
+    p.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+    print("  steer: " + json.dumps(fields))
+    return 0
+
+
+def cmd_pause(a: argparse.Namespace) -> int:
+    return steer({"pause": True, "note": a.note or "paused from the CLI"})
+
+
+def cmd_resume(_a: argparse.Namespace) -> int:
+    rc = steer({"pause": False})
+    wake("resumed")
+    return rc
+
+
+def cmd_target(a: argparse.Namespace) -> int:
+    if "/" not in a.repo:
+        raise SystemExit("autodev: target needs owner/name")
+    try:
+        d = json.loads(LADDER.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"autodev: cannot read the ladder: {e}") from e
+    known = {r.get("repo") for r in d.get("rungs", [])}
+    if a.repo not in known:
+        raise SystemExit(
+            f"autodev: {a.repo} is not a rung. Known: {', '.join(sorted(known))}"
+        )
+    d["current"] = a.repo
+    LADDER.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
+    print(f"  target: {a.repo}")
+    return 0
+
+
+def cmd_queue(a: argparse.Namespace) -> int:
+    repo = a.repo or current_repo()
+    path = goals_path(repo)
+    rows = read_rows(path)
+    if not rows:
+        print(f"  {repo}: no goals in {path.name}")
+        return 0
+    counts: dict[str, int] = {}
+    for _, _, state in rows:
+        counts[state] = counts.get(state, 0) + 1
+    print(f"\n  {repo}  ({path.name})")
+    print(f"  {', '.join(f'{n} {s}' for s, n in sorted(counts.items()))}\n")
+    for gid, text, state in rows:
+        if state != "open" and not a.all:
+            continue
+        flag = " [blocked]" if "blocked:" in text else ""
+        print(f"    {state:<8} {gid:<22}{flag} {text[:80]}")
+    if not a.all:
+        print("\n  (open only; --all for the rest)")
+    return 0
+
+
+def unit_state(name: str) -> str:
+    rc, out = run(["systemctl", "is-active", name], 10)
+    return out.strip() or ("active" if rc == 0 else "unknown")
+
+
+def cmd_status(_a: argparse.Namespace) -> int:
+    repo = current_repo()
+    print(f"\n  target      {repo or '(none)'}")
+    failed = []
+    for u in UNITS:
+        st = unit_state(u)
+        if st == "failed":
+            failed.append(u)
+        print(f"  {u:<26} {st}")
+    if failed:
+        print(
+            f"\n  {len(failed)} unit(s) FAILED. Nothing will run until they are "
+            "reset,\n  and every other indicator here will keep looking healthy."
+            "\n  Fix:  autodev start"
+        )
+
+    try:
+        rows = read_rows(goals_path(repo))
+        counts: dict[str, int] = {}
+        for _, _, st in rows:
+            counts[st] = counts.get(st, 0) + 1
+        print(f"  queue       {', '.join(f'{n} {s}' for s, n in sorted(counts.items()))}")
+    except SystemExit:
+        pass
+
+    hb = STATE / "heartbeat.json"
+    if hb.is_file():
+        try:
+            rec = json.loads(hb.read_text(encoding="utf-8"))
+            last = rec.get("last") or {}
+            age = int(time.time() - float(rec.get("t") or 0))
+            print(f"  last beat   {age}s ago")
+            if last.get("number"):
+                print(f"  in flight   PR #{last['number']}  {last.get('head') or ''}")
+            if last.get("stage"):
+                print(f"  stage       {last['stage']}")
+        except (ValueError, TypeError):
+            pass
+
+    st = STATE / "steer.json"
+    if st.is_file():
+        try:
+            s = json.loads(st.read_text(encoding="utf-8"))
+            if s.get("pause"):
+                print(f"  PAUSED      {s.get('note') or ''}")
+        except ValueError:
+            pass
+    print()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# watching
+# --------------------------------------------------------------------------- #
+def tick_line(d: dict) -> str:
+    goal = str(d.get("goal") or "")
+    gid = goal.split("|")[1].strip() if "|" in goal else goal[:24]
+    ap = d.get("applied") or {}
+    what = "skipped" if ap.get("skipped") else ("wrote" if ap.get("ok") else "-")
+    if d.get("rewrite"):
+        what = str((d["rewrite"] or {}).get("action") or what)
+    elif d.get("stage"):
+        what = str(d["stage"])
+    pr = (d.get("pr") or {}).get("number") or d.get("number") or ""
+    why = (d.get("events") or {}).get("why", "")
+    ok = "ok " if d.get("ok") else "FAIL"
+    return f"  {ok}  {gid:<24} {what:<10} {pr!s:<5} {why}"
+
+
+JOURNAL_GROUP = "systemd-journal"
+
+
+def can_read_journal() -> bool:
+    """Can this process actually see the tick journal?
+
+    journalctl exits 0 and prints NOTHING for a user outside systemd-journal.
+    That is indistinguishable from "the loop has not ticked", so `autodev watch`
+    printed its header and exited, and the operator had no way to tell which of
+    the two had happened. A silent success is the failure this whole repository
+    is about.
+    """
+    if os.geteuid() == 0:
+        return True
+    try:
+        import grp
+
+        gid = grp.getgrnam(JOURNAL_GROUP).gr_gid
+        # getgroups() is the SUPPLEMENTARY list. `sg systemd-journal -c ...`
+        # makes it the primary gid instead, so checking only the supplementary
+        # list told a correctly-configured operator they were not in the group.
+        return gid == os.getgid() or gid in os.getgroups()
+    except (KeyError, OSError):
+        # Cannot tell. Say nothing rather than accuse the operator wrongly.
+        return True
+
+
+def why_empty() -> str:
+    """The likeliest reason nothing was printed, and what to do about it."""
+    if not can_read_journal():
+        return (
+            f"  Nothing to show, and this account is not in the {JOURNAL_GROUP} "
+            "group,\n  so journalctl returns nothing rather than an error. "
+            "That is almost\n  certainly the reason.\n\n"
+            f"    sudo usermod -aG {JOURNAL_GROUP} $USER      # then log out and in\n"
+            f"    sg {JOURNAL_GROUP} -c 'autodev watch'       # or just for now\n"
+        )
+    return (
+        "  No ticks in the journal yet. The loop writes one line per tick, so\n"
+        "  this is normal on a fresh install or after a journal rotation.\n\n"
+        "    autodev status      # is it running, and is anything queued?\n"
+        "    autodev run         # make it tick once, now\n"
+    )
+
+
+def cmd_watch(a: argparse.Namespace) -> int:
+    # FOLLOWS BY DEFAULT, because that is what the word means. It used to need
+    # -f, so the bare command printed a header and exited, which reads as "there
+    # is nothing here" whether or not that is true.
+    argv = ["journalctl", "-u", "autodev-tick.service", "-o", "cat", "-n", str(a.lines)]
+    if not a.once:
+        argv.append("-f")
+    print(f"  {'ok':<5} {'goal':<24} {'what':<10} {'pr':<5} why")
+
+    if not can_read_journal():
+        print()
+        print(why_empty(), end="")
+        return 1
+
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        raise SystemExit("autodev: journalctl not found") from None
+    assert proc.stdout is not None
+    shown = 0
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                print(tick_line(json.loads(line)), flush=True)
+                shown += 1
+            except ValueError:
+                continue
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
+
+    if not shown:
+        print()
+        print(why_empty(), end="")
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# running
+# --------------------------------------------------------------------------- #
+def run(argv: list[str], timeout: int) -> tuple[int, str]:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, f"not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+
+
+def systemctl(action: str, units: tuple[str, ...]) -> int:
+    rc, out = run(["systemctl", action, *units], 60)
+    if rc != 0:
+        print(out.strip()[-400:], file=sys.stderr)
+        print(
+            f"\n  (needs privilege: sudo systemctl {action} {' '.join(units)})",
+            file=sys.stderr,
+        )
+    return rc
+
+
+def cmd_start(_a: argparse.Namespace) -> int:
+    # RESET FIRST, ALWAYS. When autodev-tick.service trips StartLimitBurst the
+    # PATH unit fails too, and it stays failed after the service recovers --
+    # while every other indicator still looks right: the receiver is active, the
+    # timer is armed, sentinels accumulate, and nothing consumes them. The
+    # runbook's answer is `systemctl reset-failed` on BOTH names, every time,
+    # which is a dance no operator should have to remember.
+    run(["systemctl", "reset-failed", "autodev-tick.service", "autodev-tick.path"], 30)
+    rc = systemctl("start", UNITS)
+    if rc == 0:
+        print(f"  started: {', '.join(UNITS)}")
+    return rc
+
+
+def cmd_stop(_a: argparse.Namespace) -> int:
+    # The service is deliberately NOT stopped: each tick is its own process, so
+    # stopping the triggers stops the NEXT one rather than killing work in
+    # flight and leaving a branch half-landed.
+    rc = systemctl("stop", ("autodev-tick.path", "autodev-tick.timer"))
+    if rc == 0:
+        print("  stopped the triggers. A tick already running will finish.")
+    return rc
+
+
+def cmd_run(a: argparse.Namespace) -> int:
+    """One tick, in the foreground, printing as it goes."""
+    rc, out = run(["systemctl", "start", "autodev-tick.service"], a.timeout)
+    if rc != 0:
+        print(out.strip()[-400:], file=sys.stderr)
+        return rc
+    _rc, journal = run(
+        [
+            "journalctl",
+            "-u",
+            "autodev-tick.service",
+            "-n",
+            "1",
+            "--no-pager",
+            "-o",
+            "cat",
+        ],
+        30,
+    )
+    for line in journal.splitlines():
+        if line.strip().startswith("{"):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            print(tick_line(d))
+            if a.verbose:
+                print(json.dumps(d, indent=2))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="autodev",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("submit", help="turn a brief into queued goals")
+    s.add_argument("file")
+    s.add_argument("--repo", default="")
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask")
+    s.set_defaults(fn=cmd_submit)
+
+    q = sub.add_parser("queue", help="what is queued")
+    q.add_argument("--repo", default="")
+    q.add_argument("--all", action="store_true", help="closed and invalid rows too")
+    q.set_defaults(fn=cmd_queue)
+
+    sub.add_parser("status", help="units, rung, queue, in-flight").set_defaults(
+        fn=cmd_status
+    )
+
+    w = sub.add_parser("watch", help="one line per tick, following by default")
+    w.add_argument(
+        "-1", "--once", action="store_true", help="print recent ticks and exit"
+    )
+    w.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="accepted and implied; watch follows unless --once",
+    )
+    w.add_argument("-n", "--lines", type=int, default=20, help="history to show first")
+    w.set_defaults(fn=cmd_watch)
+
+    r = sub.add_parser("run", help="one tick in the foreground")
+    r.add_argument("--once", action="store_true", help="accepted and implied")
+    r.add_argument("-v", "--verbose", action="store_true")
+    r.add_argument("--timeout", type=int, default=1800)
+    r.set_defaults(fn=cmd_run)
+
+    sub.add_parser("start", help="unattended, on forge events").set_defaults(fn=cmd_start)
+    sub.add_parser("stop", help="stop the triggers").set_defaults(fn=cmd_stop)
+
+    p = sub.add_parser("pause", help="hold without stopping")
+    p.add_argument("note", nargs="?", default="")
+    p.set_defaults(fn=cmd_pause)
+
+    sub.add_parser("resume", help="release a pause").set_defaults(fn=cmd_resume)
+
+    t = sub.add_parser("target", help="set the rung the loop works")
+    t.add_argument("repo")
+    t.set_defaults(fn=cmd_target)
+
+    a = ap.parse_args(argv)
+    return int(a.fn(a))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

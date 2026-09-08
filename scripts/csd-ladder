@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Advance the ladder: release what is done, and take up the next repository.
+
+WHY. The loop works ONE repository, named in its unit file. Moving to the next
+one meant an operator editing that file, which makes "then it moves on" a manual
+step wearing the word autonomous.
+
+WHAT IT DOES, in this order:
+  1. Ask csd-release whether the current rung meets the definition of done.
+  2. If it does, cut the Forgejo release (never an external registry).
+  3. Mark it complete, pick the next rung that is not blocked, and rewrite the
+     wrapper so the next tick works on it.
+
+WHAT IT REFUSES:
+  - to advance past a rung that is not done. The whole point of a definition of
+    done is that it is not negotiable when the queue is slow.
+  - to start a rung whose blockers are unmet. Attempting one wastes cycles and,
+    worse, can produce a release that passed because the checks could not run.
+  - to touch the wrapper it cannot read back. A half-written unit file leaves the
+    loop pointing at nothing.
+
+Usage:
+    csd-ladder status
+    csd-ladder advance [--dry-run]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+LADDER = ROOT / "config" / "ladder.json"
+RELEASE = ROOT / "scripts" / "csd-release"
+WRAPPER = Path(os.environ.get("AUTODEV_WRAPPER", "/usr/local/bin/autodev-tick"))
+WORK = Path(os.environ.get("AUTODEV_WORK", "/home/svc-autodev/work"))
+STATE = Path(os.environ.get("AUTODEV_STATE", "/home/svc-autodev/state"))
+
+
+def load() -> dict:
+    return json.loads(LADDER.read_text())
+
+
+def goals_path(repo: str) -> Path:
+    return STATE / f"GOALS-{repo.split('/')[-1]}.md"
+
+
+def unmet(rung: dict, ladder: dict) -> list[str]:
+    """Blockers are goal ids; a rung is startable when none of them remain open.
+
+    Read from the PLATFORM goal file rather than tracked here, so a blocker is
+    cleared by doing the work rather than by editing this list.
+    """
+    ids = rung.get("blocked_on") or []
+    if not ids:
+        return []
+    # Unreadable is the same answer as missing: BLOCKED. This runs as the agent
+    # in production and as the operator when checking status, and the state dir
+    # is 700 -- so it must report "cannot tell" rather than raising, or a status
+    # command turns into a traceback and an advance turns into a crash.
+    plat = STATE / "GOALS-platform.md"
+    try:
+        body = plat.read_text(encoding="utf-8")
+    except OSError:
+        return ids
+    still = []
+    for gid in ids:
+        for line in body.splitlines():
+            if line.strip().startswith(f"| {gid} ") and "| open |" in line:
+                still.append(gid)
+                break
+    return still
+
+
+def promote(ids: list[str]) -> None:
+    """Move a blocker to the front of the platform queue.
+
+    The loop takes the first open row, so ordering IS priority. A blocker sitting
+    at position forty is a rung that returns in a month; at position one it is
+    the next thing built.
+
+    Rewrites only the order of existing rows -- it never invents a goal, because
+    a blocker that has no row is a planning gap and should be visible as one
+    rather than papered over with a generated task.
+    """
+    plat = STATE / "GOALS-platform.md"
+    try:
+        lines = plat.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    wanted, rest, seen = [], [], set()
+    for ln in lines:
+        t = ln.strip()
+        hit = next((g for g in ids if t.startswith(f"| {g} ") and "| open |" in t), None)
+        if hit and hit not in seen:
+            seen.add(hit)
+            wanted.append(ln)
+        else:
+            rest.append(ln)
+    if not wanted:
+        return
+    # Put them immediately before the first other open row, so they are next
+    # without disturbing the header or the done rows above.
+    out, placed = [], False
+    for ln in rest:
+        if not placed and "| open |" in ln and ln.strip().startswith("| "):
+            out.extend(wanted)
+            placed = True
+        out.append(ln)
+    if not placed:
+        out.extend(wanted)
+    try:
+        plat.write_text("\n".join(out) + "\n", encoding="utf-8")
+        print(f"  promoted to the front of the platform queue: {', '.join(seen)}")
+    except OSError:
+        pass
+
+
+def status(a: argparse.Namespace) -> int:
+    d = load()
+    print(f"  current: {d['current']}")
+    for r in d["rungs"]:
+        blockers = unmet(r, d)
+        mark = r["state"] if not blockers else f"blocked({','.join(blockers)})"
+        print(f"    {mark:<22} {r['repo']:<42} {r['language']}")
+    return 0
+
+
+def advance(a: argparse.Namespace) -> int:
+    d = load()
+    cur = d["current"]
+    rung = next((r for r in d["rungs"] if r["repo"] == cur), None)
+    if rung is None:
+        print(json.dumps({"ok": False, "error": f"{cur} is not in the ladder"}))
+        return 2
+
+    token = os.environ.get("TOKEN", "")
+    if not token or not RELEASE.is_file():
+        print(json.dumps({"ok": False, "error": "no TOKEN or no csd-release"}))
+        return 3
+
+    wt = WORK / cur.split("/")[-1]
+    argv = [
+        sys.executable,
+        str(RELEASE),
+        str(wt),
+        "--repo",
+        cur,
+        "--goals",
+        str(goals_path(cur)),
+    ]
+    if a.dry_run:
+        argv.append("--dry-run")
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+    out = (p.stdout or "") + (p.stderr or "")
+    print(out.rstrip())
+
+    if p.returncode != 0:
+        # NOT DONE, and that is the answer. A definition of done that bends when
+        # the queue is slow is not one.
+        print(f"\n  {cur} stays current: it is not done yet.")
+        return 1
+
+    nxt = None
+    skipped: list[dict] = []
+    for r in d["rungs"]:
+        if r["state"] in ("complete",) or r["repo"] == cur:
+            continue
+        blockers = unmet(r, d)
+        if blockers:
+            # A SKIP IS TEMPORARY; THE RETURN IS MANDATORY. Recording "blocked"
+            # and moving on is a stall with better vocabulary -- the rung never
+            # comes back, because nothing is working on what blocks it. The
+            # blocker is the next piece of work.
+            print(
+                f"  {r['repo']} is blocked on {','.join(blockers)} — "
+                "promoting those to the front of the platform queue rather "
+                "than skipping past them"
+            )
+            promote(blockers)
+            skipped.append({"repo": r["repo"], "blocked_on": blockers})
+            continue
+        nxt = r
+        break
+    if nxt is None:
+        print(
+            "\n  no startable rung left — the ladder is finished or every "
+            "remaining rung is blocked."
+        )
+        return 0
+
+    if a.dry_run:
+        print(f"\n  would advance: {cur} -> {nxt['repo']}")
+        return 0
+
+    rung["state"] = "complete"
+    d["current"] = nxt["repo"]
+    nxt["state"] = "in-progress"
+    LADDER.write_text(json.dumps(d, indent=2) + "\n")
+
+    # NO WRAPPER REWRITE. This used to edit /usr/local/bin/autodev-tick, which
+    # made the deployed file and the repo copy two sources of truth for the same
+    # fact -- and re-installing the repo copy then silently reverted the live
+    # target to a repo already finished. The wrapper now READS `current` from
+    # this file, so writing it here is the whole handover.
+    print(f"\n  ADVANCED: {cur} released and complete -> now working {nxt['repo']}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    st = sub.add_parser("status")
+    st.set_defaults(fn=status)
+    ad = sub.add_parser("advance")
+    ad.add_argument("--dry-run", action="store_true")
+    ad.set_defaults(fn=advance)
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

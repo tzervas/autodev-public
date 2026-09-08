@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""An independent agent reads the diff before anything merges.
+
+WHY. Until now autodev merged on CI alone. CI proves the suite is green; it
+cannot tell you the change does what the goal asked, does ONLY that, or is not
+quietly wrong in a way no existing test covers. G-SCHEMA-1 landed a behaviour
+change with none of the tests its goal demanded, passed CI, and closed -- nothing
+failed and nothing said a word. A reviewer reading the diff against the goal is
+what catches that class.
+
+WHAT MAKES IT INDEPENDENT, and what does not:
+
+  - It reads the DIFF THAT LANDED, not the implementer's reply. The reply is what
+    the model claims it wrote; the diff is what the forge actually has.
+  - It runs on a DIFFERENT MODEL AND HOST from the implementer, and this script
+    REFUSES TO RUN if they resolve to the same model. A reviewer that degrades to
+    the model that wrote the code returns a correlated opinion labelled
+    independent -- worse than no review, because it reads as a second signal.
+  - Today that is qwen3.5-4b on host-gpu-b versus qwen3.5-9b on host-a: a real
+    but WEAKER claim than a different lineage would be. Same family, different
+    size, weights and machine. Said plainly rather than implied.
+
+WHAT IT REFUSES:
+  - to approve on an unparseable reply. Silence is not assent; anything it cannot
+    read is REQUEST_CHANGES.
+  - to approve a diff it could not fetch.
+  - to run at all when the reviewer and implementer resolve to one model.
+
+Exit codes, so the loop can branch without parsing prose:
+  0  APPROVE          the merge gate may proceed
+  1  REQUEST_CHANGES  a defect worth another pass; the goal stays open
+  2  REJECT           the change should not land at all
+  3  could not review (no diff, no model, same model as the implementer)
+
+Usage:
+    csd-autodev-review <owner/repo> <pr-number> --goal '<goal row>'
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        The first version of this fallback returned the caller's default, which
+        was None -- so a script run outside the unit crashed on `None + str`
+        instead of using the committed defaults. A fallback that cannot do the
+        job is not a fallback; it is a delayed failure.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+GATEWAY_CLI = ROOT / "scripts" / "csd-gateway-complete"
+FORGE_API = os.environ.get("AUTODEV_FORGE_API", FLEET.get("forge.api"))
+GATEWAY = os.environ.get("AUTODEV_GATEWAY_URL", FLEET.get("gateway.url"))
+DIFF_MAX = int(os.environ.get("AUTODEV_REVIEW_DIFF_MAX", "40000"))
+
+VERDICTS = ("APPROVE", "REQUEST_CHANGES", "REJECT")
+
+
+def api(path: str, token: str, *, raw: bool = False):
+    req = urllib.request.Request(
+        FORGE_API + path,
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "text/plain" if raw else "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            body = r.read()
+            return r.status, (
+                body.decode("utf-8", "replace") if raw else json.loads(body or b"{}")
+            )
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()[:300].decode("utf-8", "replace")
+
+
+def resolved_models(key: str) -> dict:
+    """Which model each role actually resolves to, from the gateway itself.
+
+    Asked rather than assumed: the whole independence claim rests on these two
+    being different, and a config edit could silently make them the same.
+    """
+    req = urllib.request.Request(
+        GATEWAY.rstrip("/").rsplit("/v1", 1)[0] + "/model/info",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = json.load(r)
+    except Exception as e:
+        return {"_error": f"{type(e).__name__}: {e}"[:200]}
+    out = {}
+    for m in data.get("data", []):
+        lp = m.get("litellm_params") or {}
+        out[m.get("model_name")] = f"{lp.get('model')}@{lp.get('api_base')}"
+    return out
+
+
+def build_prompt(goal: str, diff: str, ci: str, files: list[str]) -> str:
+    return f"""You are reviewing a pull request written by a DIFFERENT model. Be
+sceptical. Your job is not to be agreeable; it is to catch what the tests did not.
+
+THE GOAL THE CHANGE WAS SUPPOSED TO ACHIEVE:
+{goal}
+
+CONTINUOUS INTEGRATION: {ci}
+FILES CHANGED ({len(files)}): {", ".join(files) or "(none)"}
+
+THE DIFF THAT WOULD MERGE:
+```diff
+{diff}
+```
+
+THE BAR IS CORRECTNESS AND COMPLETENESS, NOT TASTE. Only these four things
+block a merge:
+
+1. INCOMPLETE — the diff does not do what the goal asked. Quote the part of the
+   goal that is not satisfied. A goal asking for a behaviour change AND its tests
+   is not satisfied by the behaviour change alone.
+2. OUT OF SCOPE — it does something the goal did not ask for: unrelated edits,
+   deleted tests, loosened assertions, behaviour smuggled into a test-only change.
+3. WRONG — something in it is incorrect. Name the line and what breaks. Green
+   tests do not prove a path no test exercises.
+4. WEAKENED — it removes or softens an existing check, guard or test.
+
+DO NOT BLOCK ON ANYTHING ELSE. Specifically, these are NOT reasons to request
+changes, and citing them is a mistake:
+  - style, naming, formatting, or an approach you would have taken differently
+  - "fragile" or "brittle" assertions, when the goal asked for that assertion
+  - missing tests the goal did not ask for
+  - tests you would have added as well
+  - anything you would call a nitpick, a suggestion, or a minor improvement
+
+If the change satisfies the goal and is correct, APPROVE it even if you would
+have written it differently. An unattended loop cannot argue with you: a
+REQUEST_CHANGES that names no defect from the four above stalls the work
+permanently.
+
+Then output EXACTLY one line, on its own, as the last line of your reply:
+
+VERDICT: APPROVE
+or
+VERDICT: REQUEST_CHANGES - <which of the four, and what to fix>
+or
+VERDICT: REJECT - <why this must not land at all>
+
+If you are unsure whether something is a defect or a preference, it is a
+preference: APPROVE."""
+
+
+def parse_verdict(text: str) -> tuple[str, str]:
+    """The last VERDICT line wins, and anything unreadable is NOT an approval.
+
+    Scanned from the end because a reasoning model will often restate the options
+    while thinking; the decision is the one it lands on.
+    """
+    for line in reversed(text.strip().splitlines()):
+        m = re.match(
+            r"\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES|REJECT)\b[\s-]*(.*)",
+            line.strip(),
+            re.I,
+        )
+        if m:
+            return m.group(1).upper(), m.group(2).strip()[:400]
+    return "REQUEST_CHANGES", "the reviewer's reply had no VERDICT line"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("repo")
+    ap.add_argument("number", type=int)
+    ap.add_argument("--goal", default="")
+    ap.add_argument("--ci", default="unknown")
+    ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument(
+        "--no-post",
+        action="store_true",
+        help="do not post the review to the PR (for testing)",
+    )
+    a = ap.parse_args()
+
+    token = os.environ.get("TOKEN", "")
+    key = os.environ.get("AUTODEV_GATEWAY_KEY", "")
+    if not token:
+        print(json.dumps({"ok": False, "error": "no TOKEN"}))
+        return 3
+
+    # INDEPENDENCE, CHECKED. Not a comment in a config file -- asked of the
+    # gateway, every time, and fatal when it fails.
+    impl_role = os.environ.get("AUTODEV_MODEL_IMPLEMENT", "coder-deep")
+    rev_role = os.environ.get("AUTODEV_MODEL_REVIEW", "reviewer")
+    models = resolved_models(key) if key else {"_error": "no gateway key"}
+    impl_m, rev_m = models.get(impl_role), models.get(rev_role)
+    if impl_m and rev_m and impl_m == rev_m:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "verdict": None,
+                    "error": "reviewer is the implementer",
+                    "detail": f"{impl_role} and {rev_role} both resolve to {impl_m}; "
+                    "a correlated review labelled independent is worse than "
+                    "none",
+                    "models": {impl_role: impl_m, rev_role: rev_m},
+                }
+            )
+        )
+        return 3
+
+    status, diff = api(f"/repos/{a.repo}/pulls/{a.number}.diff", token, raw=True)
+    if status != 200 or not isinstance(diff, str) or not diff.strip():
+        print(json.dumps({"ok": False, "error": f"no diff (HTTP {status})"}))
+        return 3
+    truncated = len(diff) > DIFF_MAX
+    if truncated:
+        diff = diff[:DIFF_MAX] + "\n... [diff truncated]\n"
+
+    files = sorted({m.group(1) for m in re.finditer(r"^\+\+\+ b/(.+)$", diff, re.M)})
+
+    prompt = build_prompt(a.goal or "(the goal was not supplied)", diff, a.ci, files)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(GATEWAY_CLI),
+            "complete",
+            "--kind",
+            "review",
+            "--prompt",
+            prompt,
+            "--timeout",
+            str(a.timeout),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=a.timeout + 60,
+    )
+    reply = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "review call failed",
+                    "rc": proc.returncode,
+                    "out": reply[:400],
+                }
+            )
+        )
+        return 3
+
+    verdict, why = parse_verdict(reply)
+    # A truncated diff cannot be approved: the reviewer did not see all of it.
+    if truncated and verdict == "APPROVE":
+        verdict, why = (
+            "REQUEST_CHANGES",
+            ("the diff was too large to review in full; split the change"),
+        )
+
+    rec = {
+        "ok": True,
+        "verdict": verdict,
+        "why": why,
+        "repo": a.repo,
+        "number": a.number,
+        "files": files,
+        "truncated": truncated,
+        "models": {impl_role: impl_m, rev_role: rev_m},
+    }
+
+    if not a.no_post:
+        body = (
+            f"## Autodev review — {verdict}\n\n"
+            f"{why or 'No blocking findings.'}\n\n"
+            f"Reviewed by `{rev_role}` ({rev_m}), which is a different model "
+            f"and host from the implementer `{impl_role}` ({impl_m}).\n"
+            f"CI at review time: {a.ci}. Files: {', '.join(files) or 'none'}."
+            f"\n\n<details><summary>reviewer's reasoning</summary>\n\n"
+            f"```\n{reply.strip()[-4000:]}\n```\n</details>"
+        )
+        st, _ = api_post(
+            f"/repos/{a.repo}/issues/{a.number}/comments", token, {"body": body}
+        )
+        rec["posted"] = st in (200, 201)
+
+    print(json.dumps(rec, indent=2))
+    return {"APPROVE": 0, "REQUEST_CHANGES": 1, "REJECT": 2}[verdict]
+
+
+def api_post(path: str, token: str, body: dict):
+    req = urllib.request.Request(
+        FORGE_API + path,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"Authorization": f"token {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return r.status, r.read()[:200]
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()[:200]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

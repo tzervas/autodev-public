@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Repo gate: ruff lint + format check, shellcheck, pytest.
+# CI and pre-commit both defer here so local and PR results do not drift.
+#
+# Tools (all declared or uvx-pinned; never rely on a random system install):
+#   - uv          — required on PATH (fleet-ci-base)
+#   - ruff        — uvx ruff@RUFF_VERSION
+#   - shellcheck  — system binary, else uvx shellcheck-py
+#   - pytest      — dependency-groups.dev via uv sync + uv run
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+RUFF_VERSION="${RUFF_VERSION:-0.14.13}"
+SHELLCHECK_PY_VERSION="${SHELLCHECK_PY_VERSION:-0.11.0.1}"
+
+# Lint the whole repository, not a hand-kept subset. pyproject's
+# `extend-include` already names every extensionless Python script by shebang,
+# and this list had drifted to ten of the twenty it declares -- so half the
+# scripts were configured for linting and never actually linted, which is the
+# blind spot that config comment exists to warn about, one layer up.
+PY_PATHS=(.)
+
+SHELL_PATHS=(
+  deploy/bin/autodev-operator-access.sh
+  scripts/csd-autodev-git
+  scripts/csd-autodev-priority
+  scripts/csd-secret-rotate
+  scripts/gate
+)
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "gate: uv not on PATH" >&2
+  exit 1
+fi
+
+echo "gate: ruff check"
+uvx "ruff@${RUFF_VERSION}" check "${PY_PATHS[@]}"
+
+echo "gate: ruff format --check"
+uvx "ruff@${RUFF_VERSION}" format --check "${PY_PATHS[@]}"
+
+run_shellcheck() {
+  if command -v shellcheck >/dev/null 2>&1; then
+    echo "gate: shellcheck (system)"
+    shellcheck -x "${SHELL_PATHS[@]}"
+    return
+  fi
+  echo "gate: shellcheck (uvx shellcheck-py==${SHELLCHECK_PY_VERSION})"
+  uvx --from "shellcheck-py==${SHELLCHECK_PY_VERSION}" shellcheck -x "${SHELL_PATHS[@]}"
+}
+
+run_shellcheck
+
+echo "gate: uv sync --frozen --group dev"
+# Lockfile is the source of truth; --frozen keeps CI and local identical.
+uv sync --frozen --group dev
+
+echo "gate: pytest (uv run from project env)"
+# pytest comes from dependency-groups.dev only — never a system install.
+uv run pytest -q
+
+echo "gate: ok"

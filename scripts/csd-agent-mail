@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Durable handoffs between agents. An inbox, not a shared scratchpad.
+
+WHY. Handoffs live in `heartbeat.json` today: ONE dict, rewritten every tick. A
+reviewer's objection survives only because the next tick happens to copy it
+forward, and anything two agents would need to exchange while a third is running
+is simply lost. That is the anti-pattern this replaces -- a handoff must survive
+until the RECIPIENT is ready for it, not until the next write.
+
+WHAT A MESSAGE IS. The envelope carries what the receiving agent needs to act
+without re-deriving it: who sent it, who it is for, the repository and worktree,
+the task, the state, the artefacts, the decisions already made, the attempts
+already performed, the evidence, the requested action, whether it blocks, and
+what response is expected.
+
+That last group is what makes escalation work. The point of handing a stuck
+problem to another agent is not to make it try harder -- it is to let a different
+model, or a different ROLE, say "this is not an implementation defect at all".
+It can only do that if the attempts and evidence travel with the problem.
+
+STATES. A message is `unread` until claimed, `claimed` while an agent works it,
+then `done` or `failed`. Claiming is atomic (O_EXCL rename), so two agents cannot
+take the same message; nothing is ever deleted, so a failed handoff is
+reconstructable afterwards.
+
+Usage:
+    csd-agent-mail send --to architect --from implementer --task G-X \\
+        --request "the interface is ambiguous" --blocking [--evidence F ...]
+    csd-agent-mail inbox --for architect [--state unread] [--json]
+    csd-agent-mail claim --for architect            # atomically take the oldest
+    csd-agent-mail close <id> --state done|failed [--note "..."]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+import time
+import uuid
+from datetime import UTC, datetime
+
+MAIL_DIR = pathlib.Path(os.environ.get("AUTODEV_MAIL_DIR", "/home/svc-autodev/mail"))
+STATES = ("unread", "claimed", "done", "failed")
+ROLES = pathlib.Path(__file__).resolve().parents[1] / "config" / "roles.json"
+
+
+def known_roles() -> set[str]:
+    """Addresses are checked against the registry, not free text.
+
+    A message addressed to a role that does not exist is a message nobody will
+    ever read, and it would sit in the directory looking like pending work.
+    """
+    try:
+        return set(json.loads(ROLES.read_text())["roles"]) | {"operator"}
+    except Exception:
+        return set()
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def box(state: str) -> pathlib.Path:
+    d = MAIL_DIR / state
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def send(a: argparse.Namespace) -> int:
+    roles = known_roles()
+    if roles and a.to not in roles:
+        print(
+            f"unknown role: {a.to} (known: {', '.join(sorted(roles))})", file=sys.stderr
+        )
+        return 2
+    msg = {
+        "id": f"{int(time.time())}-{uuid.uuid4().hex[:8]}",
+        "ts": now(),
+        "from": a.from_,
+        "to": a.to,
+        "repo": a.repo,
+        "worktree": a.worktree,
+        "task": a.task,
+        "state_of_work": a.state_of_work,
+        "artifacts": a.artifact or [],
+        "decisions": a.decision or [],
+        "attempts": a.attempt or [],
+        "evidence": a.evidence or [],
+        "request": a.request,
+        "blocking": bool(a.blocking),
+        "expects": a.expects,
+        "status": "unread",
+    }
+    p = box("unread") / f"{msg['id']}.json"
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(msg, indent=2) + "\n")
+    os.replace(tmp, p)
+    print(json.dumps({"ok": True, "id": msg["id"], "to": a.to}))
+    return 0
+
+
+def _load(p: pathlib.Path) -> dict:
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        return {"id": p.stem, "_unreadable": type(e).__name__}
+
+
+def inbox(a: argparse.Namespace) -> int:
+    states = [a.state] if a.state else list(STATES)
+    rows = []
+    for st in states:
+        for p in sorted(box(st).glob("*.json")):
+            m = _load(p)
+            if a.for_ and m.get("to") != a.for_:
+                continue
+            m["status"] = st
+            rows.append(m)
+    if a.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print(f"  no messages for {a.for_ or 'anyone'}")
+        return 0
+    for m in rows:
+        flag = "BLOCKING" if m.get("blocking") else "        "
+        print(
+            f"  {m.get('status', '?'):<8} {flag} {m['id']}  "
+            f"{m.get('from', '?')} -> {m.get('to', '?')}  "
+            f"[{m.get('task') or '-'}]  {str(m.get('request') or '')[:60]}"
+        )
+    return 0
+
+
+def claim(a: argparse.Namespace) -> int:
+    """Atomically take the oldest unread message for a role.
+
+    O_EXCL rename, so two agents racing for the same inbox cannot both get it --
+    which would be two agents doing the same corrective work, and one of them
+    pushing over the other.
+    """
+    for p in sorted(box("unread").glob("*.json")):
+        m = _load(p)
+        if a.for_ and m.get("to") != a.for_:
+            continue
+        if a.blocking_only and not m.get("blocking"):
+            continue
+        dest = box("claimed") / p.name
+        try:
+            os.link(p, dest)
+            p.unlink()
+        except FileExistsError:
+            continue  # someone else has it
+        except OSError:
+            continue
+        m["status"] = "claimed"
+        m["claimed_at"] = now()
+        dest.write_text(json.dumps(m, indent=2) + "\n")
+        print(json.dumps(m, indent=2))
+        return 0
+    print(json.dumps({"ok": True, "empty": True, "for": a.for_}))
+    return 1
+
+
+def close(a: argparse.Namespace) -> int:
+    if a.state not in ("done", "failed"):
+        print("close needs --state done|failed", file=sys.stderr)
+        return 2
+    for st in ("claimed", "unread"):
+        p = box(st) / f"{a.id}.json"
+        if not p.is_file():
+            continue
+        m = _load(p)
+        m["status"] = a.state
+        m["closed_at"] = now()
+        if a.note:
+            m["close_note"] = a.note[:2000]
+        dest = box(a.state) / p.name
+        dest.write_text(json.dumps(m, indent=2) + "\n")
+        p.unlink()
+        print(json.dumps({"ok": True, "id": a.id, "state": a.state}))
+        return 0
+    print(json.dumps({"ok": False, "error": f"no message {a.id}"}))
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send")
+    s.add_argument("--to", required=True)
+    s.add_argument("--from", dest="from_", required=True)
+    s.add_argument("--task", default="")
+    s.add_argument("--repo", default="")
+    s.add_argument("--worktree", default="")
+    s.add_argument("--state-of-work", dest="state_of_work", default="")
+    s.add_argument("--request", required=True)
+    s.add_argument("--expects", default="")
+    s.add_argument("--artifact", action="append")
+    s.add_argument("--decision", action="append")
+    s.add_argument("--attempt", action="append")
+    s.add_argument("--evidence", action="append")
+    s.add_argument("--blocking", action="store_true")
+    s.set_defaults(fn=send)
+
+    i = sub.add_parser("inbox")
+    i.add_argument("--for", dest="for_", default="")
+    i.add_argument("--state", choices=STATES)
+    i.add_argument("--json", action="store_true")
+    i.set_defaults(fn=inbox)
+
+    c = sub.add_parser("claim")
+    c.add_argument("--for", dest="for_", required=True)
+    c.add_argument("--blocking-only", action="store_true")
+    c.set_defaults(fn=claim)
+
+    k = sub.add_parser("close")
+    k.add_argument("id")
+    k.add_argument("--state", required=True)
+    k.add_argument("--note", default="")
+    k.set_defaults(fn=close)
+
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,291 @@
+{
+  "schema": "csd-decision-table/v1",
+  "revision": "2026-09-07",
+  "source": "notes/AUTONOMOUS-LOOP-SCOPE-2026-09-07.md, notes/SIGNAL-TRUST-TABLE-2026-09-07.md",
+
+  "default": {
+    "action": "stop_escalate",
+    "retryable": false,
+    "escalate": true,
+    "route": "orchestration",
+    "reason": "no table entry; anything not in the table stops and escalates"
+  },
+
+  "outcomes": {
+    "running": {
+      "meaning": "in flight",
+      "action": "wait",
+      "retryable": null,
+      "escalate": false,
+      "terminal": false
+    },
+    "passed": {
+      "meaning": "ran, gate cleared",
+      "action": "proceed",
+      "retryable": null,
+      "escalate": false,
+      "terminal": true
+    },
+    "rejected": {
+      "meaning": "ran cleanly, gate not cleared - a RESULT, not an error",
+      "action": "stop_record",
+      "retryable": false,
+      "escalate": false,
+      "terminal": true,
+      "note": "the experiment answered no; retrying re-runs a question already answered"
+    },
+    "inconclusive": {
+      "meaning": "ran, gate could not be evaluated",
+      "action": "stop_escalate",
+      "retryable": true,
+      "retry_after": "fix",
+      "escalate": true,
+      "route": "experiment",
+      "terminal": true,
+      "note": "retryable only after a fix; a bare re-run reproduces the same non-evaluation"
+    },
+    "crashed": {
+      "meaning": "the job's own code failed",
+      "action": "stop_escalate",
+      "retryable": null,
+      "escalate": true,
+      "route": "experiment",
+      "requires": ["log_tail"],
+      "terminal": true
+    },
+    "infra_failed": {
+      "meaning": "the environment died under the job",
+      "action": "retry",
+      "retryable": true,
+      "escalate": false,
+      "retry_cap": 2,
+      "terminal": false,
+      "note": "MEASURED 2026-09-07: exitcode -1 / podman context deadline exceeded hit 5 job types across 4 PRs, every one needing a re-run"
+    },
+    "refused": {
+      "meaning": "a fail-closed guard prevented start - the guard working",
+      "action": "stop_record",
+      "retryable": false,
+      "escalate": false,
+      "terminal": true,
+      "note": "NEVER file under failure; filing a refusal as a failure trains the operator to ignore the signal guards exist to produce"
+    },
+    "halted": {
+      "meaning": "operator stopped it",
+      "action": "stop",
+      "retryable": true,
+      "escalate": false,
+      "terminal": true
+    }
+  },
+
+  "retry": {
+    "consecutive_same_stage_cap": 2,
+    "on_cap": {
+      "action": "stop_escalate",
+      "route": "experiment",
+      "reason": "infrastructure that fails twice in the same place probably is not infrastructure"
+    }
+  },
+
+  "evidence_escalation": {
+    "no_pass_in_k_runs": {
+      "k": 5,
+      "route": "orchestration",
+      "reason": "no passed outcome in K consecutive runs is evidence the setup is wrong, not that the work is hard"
+    },
+    "all_arms_passed": {
+      "min_arms": 2,
+      "route": "research",
+      "reason": "every arm passing usually means the gate is not discriminating, exactly as G29 does today"
+    },
+    "margin_trend_growing": {
+      "min_points": 3,
+      "route": "experiment",
+      "reason": "a gate failing by a GROWING margin is regression; only the sequence shows which"
+    }
+  },
+
+  "margin": {
+    "severity_bands": [
+      {"name": "marginal", "max_abs_over_spread": 1.0, "note": "|margin| within one seed spread - cannot discriminate"},
+      {"name": "narrow", "max_abs_over_spread": 3.0},
+      {"name": "wide", "max_abs_over_spread": null}
+    ],
+    "inconclusive_when": "abs(margin) <= spread",
+    "note": "the margin is the severity; a bare verdict discards it, and a shrinking margin across runs is progress that reads as another FAIL"
+  },
+
+  "signals": {
+    "act": {
+      "action": "consume",
+      "escalate": false,
+      "members": {
+        "runner.exitcode_minus_one": "MEASURED 2026-09-07: 5 distinct job types across 3 PRs, every one needing a re-run, none a code change",
+        "runner.context_deadline_exceeded": "MEASURED 2026-09-07: podman socket deadline; same class as exitcode -1",
+        "pytest.failures_block_named_test": "structurally distinguishable from infra: a real assertion has a FAILURES block, a lost container does not",
+        "checkpoint_sha256_mismatch_same_seed": "MEASURED: 11 distinct checkpoints across thread pins at one seed - the pin is missing or wrong",
+        "margin_over_per_item_spread": "MEASURED exactly scale-invariant under logit scaling x1/x10/x100",
+        "update_norm_ratio": "online plasticity proxy, computable during the run",
+        "mi_with_null": "the null is what makes it a measurement"
+      }
+    },
+    "do_not_consume": {
+      "action": "record_only",
+      "escalate": true,
+      "route": "experiment",
+      "members": {
+        "G29.verdict": "MEASURED: passes on 3 of 4 seeds and 3 of 4 thread pins in an arm whose MI is exactly zero; flips on thread count alone",
+        "G35.verdict": "MEASURED: 0.00-10.94 point seed spread against a 5.00 ceiling; train operand 1.0 in all 147 runs. Consume the margin, never the verdict",
+        "mean_a_store": "MEASURED decoupled from information - random-walks, verdict independent of MI",
+        "design_doc_status_column": "MEASURED unreliable: E1 marked todo while already merged",
+        "agent_self_reported_success": "MEASURED 2026-09-07: an agent reported success while git worktree add had failed. Verify the external effect"
+      }
+    },
+    "low_trust": {
+      "action": "verify_then_act",
+      "escalate": false,
+      "members": {
+        "recall_at_1": "step function of continuous scores; report, never gate",
+        "rank_metric": "same as recall@1",
+        "conventions_lint_ci_failure": "one died with exitcode -1 after cz check printed success; re-run once before believing it",
+        "ci_status_stale_after_retrigger": "MEASURED 2026-09-07: a PR status was read as resolved from stale entries after a retrigger, and a concurrency cancel-in-progress files \"Has been cancelled\" as a failure. Read the CURRENT head's run, never a superseded one",
+        "single_seed_result": "replicate on the seed axis; the thread axis is a nuisance parameter to pin away"
+      }
+    },
+    "audit_only": {
+      "action": "record_only",
+      "escalate": false,
+      "members": {
+        "loss_barrier": "retrospective - knowable only after both branches train out; belongs in audit:, never shift:",
+        "fisher_trace_peak": "pending evidence on whether it is detectable online (g56)"
+      }
+    },
+    "escalate": {
+      "action": "stop_escalate",
+      "escalate": true,
+      "route": "experiment",
+      "members": {
+        "task_loss_stalling_high_accuracy": "MEASURED shortcut signature (0.757 vs ~0.55 with accuracy 1.000); the loop should not rationalise it",
+        "gate_failing_by_growing_margin": "a trend, not a point",
+        "two_consecutive_infra_failed_same_stage": "infrastructure that fails twice in the same place is probably not infrastructure",
+        "policy_lookup_miss": "a lookup MISS is not evidence of absence; it never licenses improvisation"
+      }
+    }
+  },
+
+  "classifiers": {
+    "note": "ordered; first rule with a match wins. Patterns are lowercase substrings matched against the failure text. Hard infra signatures run BEFORE the result rules because they are measured to mean infra even when the log also carries earlier assertion text (a conventions job died with exitcode -1 after cz check had printed success).",
+    "rules": [
+      {
+        "id": "guard-refusal",
+        "outcome": "refused",
+        "any": [
+          "refusing to start",
+          "refuse to start",
+          "refusing wan bind",
+          "admission refused",
+          "guard refused",
+          "budget exceeds",
+          "exceeds free vram",
+          "exceeds the target card",
+          "projected disk",
+          "fail-closed"
+        ],
+        "why": "a fail-closed guard prevented start - this is the guard working, not a failure"
+      },
+      {
+        "id": "infra-hard",
+        "outcome": "infra_failed",
+        "any": [
+          "exitcode -1",
+          "context deadline exceeded",
+          "podman",
+          "cannot connect to the docker daemon",
+          "runner lost",
+          "no space left on device"
+        ],
+        "why": "MEASURED 2026-09-07: these signatures hit 5 job types across 4 PRs, every one needing a re-run and none a code change"
+      },
+      {
+        "id": "gate-not-evaluable",
+        "outcome": "inconclusive",
+        "any": [
+          "could not be evaluated",
+          "not evaluable",
+          "no null reported",
+          "gate unavailable",
+          "insufficient samples",
+          "is nan",
+          "nan value",
+          "division by zero",
+          "empty eval set"
+        ],
+        "why": "the gate could not be evaluated; a bare re-run reproduces the non-evaluation"
+      },
+      {
+        "id": "assertion-or-gate-miss",
+        "outcome": "rejected",
+        "any": [
+          "= failures =",
+          "assertionerror",
+          "assert ",
+          "gate not cleared",
+          "threshold not met",
+          "below threshold"
+        ],
+        "why": "a named assertion or gate miss is a RESULT; stop, record, do not retry"
+      },
+      {
+        "id": "infra-soft",
+        "outcome": "infra_failed",
+        "any": [
+          "connection refused",
+          "connection reset",
+          "network unreachable",
+          "name or service not known",
+          "temporary failure in name resolution",
+          "timed out",
+          "timeout",
+          "deadline",
+          "broken pipe",
+          "the operation was canceled",
+          "has been cancelled",
+          "cancelled"
+        ],
+        "why": "environment failure with no result in the log; re-run rather than edit code"
+      }
+    ],
+    "fallback": "crashed"
+  },
+
+  "escalation": {
+    "routes": {
+      "research": {
+        "to": "grok",
+        "question_shape": "is this true / has it been done / what does the literature say",
+        "why": "research, prior art, adversarial review"
+      },
+      "orchestration": {
+        "to": "claude",
+        "question_shape": "what should we do / in what order / does this merge",
+        "why": "orchestration, sequencing, merge decisions, synthesis"
+      },
+      "experiment": {
+        "to": "runner",
+        "question_shape": "this is broken and I cannot tell why",
+        "why": "the answer is a measurement, not an opinion"
+      },
+      "operator": {
+        "to": "operator",
+        "question_shape": "irreversible or outward-facing",
+        "why": "promotion, visibility, history rewrites stay with the human"
+      }
+    },
+    "default_route": "orchestration",
+    "broadcast": false,
+    "required_context": ["receipt", "log_tail"],
+    "log_tail_lines": 80,
+    "note": "an escalation that arrives without the receipt and the last log lines just costs a round trip"
+  }
+}

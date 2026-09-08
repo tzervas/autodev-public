@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""Forge events, not a clock: receive, record, and hand the loop its reason to run.
+
+WHY THIS EXISTS. The loop ran on a five-minute timer. Nothing it reacts to is
+periodic -- a PR merges, CI reports, a branch appears -- so a timer is both too
+slow (up to five minutes of nothing happening after a merge) and far too fast
+(287 of every 288 daily ticks had no reason to exist). The fleet's standing rule
+is emitters, not polling. This is the emitter.
+
+FOUR SUBCOMMANDS, one per side of the seam:
+
+  install   Register the webhook on each target repo. Idempotent: it updates the
+            hook it previously created rather than stacking duplicates.
+  serve     Receive deliveries, verify the HMAC, write ONE SENTINEL FILE per
+            actionable event. It never runs the loop. A receiver that executes
+            what it is sent is remote code execution with extra steps; this one
+            writes a file and lets systemd's path unit decide.
+  watch-ci  The emitter this forge does not have. THIS FORGE EMITS NO CI EVENT
+            (probed: status, workflow_run, workflow_job, check_run and friends
+            are all silently dropped), so one bounded watcher per in-flight
+            commit polls the status API and writes a sentinel when it settles.
+            It exists only while a PR is undecided; with nothing in flight,
+            nothing here runs.
+  drain     Consume the sentinels and print what they were. The loop calls this
+            at the top of a tick so it knows WHY it woke, and so the directory
+            empties -- a path unit re-arms on the empty-to-nonempty edge, so an
+            undrained directory means the next event never fires the unit.
+
+WHAT serve REFUSES:
+  - a body whose HMAC does not verify (the secret comes from the agent's vault)
+  - an event from a repository that is not a configured target
+  - a body over 1 MiB, or any method other than POST
+
+Events that wake the loop, and why each is actionable:
+  pull_request closed/merged  the change landed: sync, close the goal, take the next
+  pull_request opened         a PR now exists to follow
+  ci (from watch-ci)          CI settled; the merge gate may now be decidable
+  push                        a branch moved under us
+Everything else is recorded and does NOT wake it. A loop woken by events it
+cannot act on is a timer wearing a costume.
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        The first version of this fallback returned the caller's default, which
+        was None -- so a script run outside the unit crashed on `None + str`
+        instead of using the committed defaults. A fallback that cannot do the
+        job is not a fallback; it is a delayed failure.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import argparse
+import contextlib
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
+
+EVENT_DIR = pathlib.Path(os.environ.get("AUTODEV_EVENT_DIR", "/home/svc-autodev/events"))
+LOG = EVENT_DIR / "received.jsonl"
+MAX_BODY = 1 << 20
+FORGE_API = os.environ.get("AUTODEV_FORGE_API", FLEET.get("forge.api"))
+
+# The events we ask the forge for. A shorter list than "everything": each one
+# below has a handler on the other side, and subscribing to more would fill the
+# directory with wake-ups the loop would drain and ignore.
+#
+# THERE IS NO CI EVENT. Probed against this forge (Forgejo 16.0.2+gitea-1.22.0)
+# one event name at a time, because it silently DROPS names it does not know
+# rather than erroring: `status`, `statuses`, `commit_status`, `workflow_run`,
+# `workflow_job`, `check_run` and `check_suite` are all dropped. Accepted:
+# push, pull_request (which expands to ten pull_request_* variants),
+# pull_request_sync, create, delete, release, repository, issues.
+#
+# So CI completion has no upstream emitter, and `watch-ci` below is the adapter
+# that makes one. Subscribing to `status` here would look like it worked and
+# silently never fire -- which is exactly how the timer got a second life.
+SUBSCRIBE = ["push", "pull_request", "pull_request_sync"]
+
+# (event, action) pairs worth waking for; a None action means any action.
+WAKES = {
+    ("pull_request", "closed"),  # Forgejo sends closed with merged=true
+    ("pull_request", "merged"),
+    ("pull_request", "opened"),
+    ("pull_request", "reopened"),
+    ("pull_request", "synchronized"),
+    ("status", None),
+    ("push", None),
+    ("ci", None),  # synthesised by watch-ci; the forge emits no such event
+    ("retry", None),  # emitted by the loop itself when the test gate refuses
+    ("continue", None),  # emitted when a goal closes and others remain open
+}
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def record(**fields) -> None:
+    EVENT_DIR.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(json.dumps({"ts": now(), **fields}) + "\n")
+
+
+def write_sentinel(payload: dict) -> pathlib.Path:
+    """Atomically, under a name NO INPUT can influence.
+
+    The name used to embed `kind`, which is the X-Forgejo-Event header: outside
+    the body the HMAC covers, and never validated. `pathlib`'s `/` does not
+    normalise `..` and os.replace resolves it, so the write target was
+    caller-chosen -- only ProtectSystem=strict stopped that from mattering, and
+    that is a property a future redeployment could silently drop.
+
+    A uuid also ends a collision: two deliveries in the same microsecond used to
+    overwrite one another, which ThreadingHTTPServer makes reachable.
+    """
+    EVENT_DIR.mkdir(parents=True, exist_ok=True)
+    final = EVENT_DIR / f"{uuid.uuid4().hex}.json"
+    tmp = final.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(tmp, final)
+    return final
+
+
+# --------------------------------------------------------------------------- #
+# serve
+# --------------------------------------------------------------------------- #
+class Handler(BaseHTTPRequestHandler):
+    # Set once on the class at startup, shared by every request instance;
+    # ClassVar states that rather than leaving it to look like a default.
+    secret: ClassVar[bytes] = b""
+    targets: ClassVar[set[str]] = set()
+
+    def _reply(self, code: int, msg: str) -> None:
+        body = json.dumps({"ok": code < 400, "detail": msg}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        """Silence BaseHTTPRequestHandler's stderr log.
+
+        INTENTIONAL: every delivery is already recorded in received.jsonl
+        with more detail than the base class prints.
+        """
+        return
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > MAX_BODY:
+            record(event="rejected", why="bad length", length=length)
+            return self._reply(413, "body too large or empty")
+
+        raw = self.rfile.read(length)
+
+        # Verify BEFORE parsing. Parsing attacker-controlled JSON in order to
+        # decide whether to trust it has the check backwards.
+        sig = (
+            self.headers.get("X-Forgejo-Signature")
+            or self.headers.get("X-Gitea-Signature")
+            or ""
+        )
+        want = hmac.new(self.secret, raw, hashlib.sha256).hexdigest()
+        if not sig or not hmac.compare_digest(sig, want):
+            record(event="rejected", why="signature mismatch")
+            return self._reply(401, "signature mismatch")
+
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            record(event="rejected", why="unparseable body")
+            return self._reply(400, "unparseable body")
+
+        kind = (
+            self.headers.get("X-Forgejo-Event")
+            or self.headers.get("X-Gitea-Event")
+            or "unknown"
+        )
+        repo = (payload.get("repository") or {}).get("full_name") or ""
+        action = payload.get("action")
+        pr = payload.get("pull_request") or {}
+
+        if repo not in self.targets:
+            record(event="ignored", why="repo not a target", repo=repo, kind=kind)
+            return self._reply(202, f"not a target: {repo}")
+
+        fields = {
+            "kind": kind,
+            "action": action,
+            "repo": repo,
+            "merged": bool(pr.get("merged")),
+            "number": pr.get("number"),
+            "head": (pr.get("head") or {}).get("ref")
+            if isinstance(pr.get("head"), dict)
+            else pr.get("head"),
+            "sha": payload.get("sha") or payload.get("after"),
+            "state": payload.get("state"),
+            "context": payload.get("context"),
+            "ref": payload.get("ref"),
+        }
+        wake = (kind, action) in WAKES or (kind, None) in WAKES
+        record(event="received", wake=wake, **fields)
+
+        if not wake:
+            return self._reply(202, f"recorded, not actionable: {kind}/{action}")
+        write_sentinel({"ts": now(), **fields})
+        return self._reply(200, f"woken by {kind}/{action}")
+
+    def do_GET(self):
+        # Liveness only, no data: anything that can reach the port gets this.
+        return self._reply(200, "ok")
+
+
+def serve(port: int, targets: set[str], secret: bytes) -> int:
+    Handler.secret = secret
+    Handler.targets = targets
+    EVENT_DIR.mkdir(parents=True, exist_ok=True)
+    # An explicit address, never 0.0.0.0. The forge reaches this over the LAN,
+    # so it binds the LAN address by name rather than binding everything.
+    host = os.environ.get("AUTODEV_EVENT_BIND", "127.0.0.1")
+    srv = ThreadingHTTPServer((host, port), Handler)
+    record(event="listening", host=host, port=port, targets=sorted(targets))
+    print(f"  listening on {host}:{port} for {', '.join(sorted(targets))}", flush=True)
+    srv.serve_forever()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# install
+# --------------------------------------------------------------------------- #
+def api(method: str, path: str, token: str, body: dict | None = None) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        FORGE_API + path,
+        data=data,
+        method=method,
+        headers={"Authorization": f"token {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return json.loads(raw) if raw.strip() else {"_status": r.status}
+    except urllib.error.HTTPError as e:
+        return {"_http": e.code, "_body": e.read()[:400].decode("utf-8", "replace")}
+
+
+def install(targets: set[str], token: str, secret: str, url: str) -> int:
+    rc = 0
+    for repo in sorted(targets):
+        existing = api("GET", f"/repos/{repo}/hooks", token)
+        if isinstance(existing, dict) and existing.get("_http"):
+            print(f"  {repo}: cannot list hooks: {existing}", file=sys.stderr)
+            rc = 1
+            continue
+        # Match on the URL, not on an id we would have to store. Re-running this
+        # must update the hook it made before, not stack a second one.
+        mine = [h for h in existing if (h.get("config") or {}).get("url") == url]
+        body = {
+            "type": "forgejo",
+            "active": True,
+            "events": SUBSCRIBE,
+            # Explicit on BOTH create and update. A PATCH that omits this leaves
+            # branch_filter empty, and an empty filter matched nothing: the hook
+            # reported active, the forge accepted a test delivery with 204, and
+            # no request was ever made.
+            "branch_filter": "*",
+            "config": {"url": url, "content_type": "json", "secret": secret},
+        }
+        if mine:
+            hid = mine[0]["id"]
+            r = api("PATCH", f"/repos/{repo}/hooks/{hid}", token, body)
+            verb = f"updated hook {hid}"
+        else:
+            r = api("POST", f"/repos/{repo}/hooks", token, body)
+            verb = f"created hook {r.get('id')}"
+        if isinstance(r, dict) and r.get("_http"):
+            print(
+                f"  {repo}: FAILED: {r['_http']} {r.get('_body', '')[:200]}",
+                file=sys.stderr,
+            )
+            rc = 1
+            continue
+        # Report what the forge ACCEPTED, not what we asked for. Forgejo
+        # silently drops event names it does not know, and a hook subscribed to
+        # fewer events than intended looks identical to a working one until the
+        # loop stops waking.
+        got = sorted(r.get("events") or [])
+        missing = sorted(set(SUBSCRIBE) - set(got))
+        bf = r.get("branch_filter")
+        print(f"  {repo}: {verb}, branch_filter={bf!r}, events={','.join(got)}")
+        if bf not in ("*", "**"):
+            print(f"    WARNING: branch_filter is {bf!r}; the hook will not fire")
+            rc = 1
+        if missing:
+            print(f"    NOT ACCEPTED by this forge: {','.join(missing)}")
+            rc = 1
+    return rc
+
+
+# --------------------------------------------------------------------------- #
+# drain
+# --------------------------------------------------------------------------- #
+def drain(*, keep: bool = False) -> dict:
+    """Consume every sentinel and summarise it. Called at the top of a tick.
+
+    The summary answers the only question the loop needs: did something land,
+    did CI report, and on which branch. Draining is what re-arms the path unit,
+    so this runs even when the loop then decides to do nothing.
+    """
+    EVENT_DIR.mkdir(parents=True, exist_ok=True)
+    events: list[dict] = []
+
+    # THE DIRECTORY MUST BE EMPTY WHEN THIS RETURNS. A path unit re-arms only on
+    # the empty-to-nonempty edge, so anything that can abort this loop before it
+    # finishes either stops the loop dead or -- because systemd re-checks the
+    # condition when the triggered unit deactivates -- retriggers it forever.
+    # Both failures are silent, so the order below is load-bearing:
+    #
+    #   open (O_NOFOLLOW)  a symlink is UNREADABLE, not merely discouraged: a
+    #                      *.json symlink into the agent's vault was otherwise
+    #                      read, and a parse failure put its first 400 bytes into
+    #                      the tick record, which is published.
+    #   unlink by name     while we still hold the fd, so the inode survives and
+    #                      the entry is gone even if the parse below throws.
+    #   read from the fd   parse failures can no longer block the re-arm.
+    #
+    # Every step is inside a per-entry try, so one bad entry cannot strand the
+    # rest. Relative names with dir_fd= mean no path is rebuilt from input.
+    dfd = os.open(str(EVENT_DIR), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        names = sorted(
+            n
+            for n in os.listdir(EVENT_DIR)
+            if n.endswith(".json") and n != "received.jsonl"
+        )
+        for name in names:
+            fd = None
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                if not keep:
+                    os.unlink(name, dir_fd=dfd)
+                with os.fdopen(fd, "rb") as fh:
+                    fd = None  # fdopen owns it now
+                    events.append(json.loads(fh.read(1 << 20)))
+            except Exception as e:
+                events.append(
+                    {"kind": "undrainable", "file": name, "error": type(e).__name__}
+                )
+                if not keep:
+                    with contextlib.suppress(OSError):
+                        os.unlink(name, dir_fd=dfd)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+    finally:
+        os.close(dfd)
+
+    merged = [e for e in events if e.get("merged")]
+    return {
+        "ok": True,
+        "count": len(events),
+        "kinds": sorted({str(e.get("kind")) for e in events}),
+        "merged_pr": merged[0].get("number") if merged else None,
+        "branches": sorted(
+            {str(e.get("head") or e.get("ref") or "") for e in events} - {""}
+        ),
+        "ci_states": sorted(
+            {str(e.get("state")) for e in events if e.get("kind") == "status"}
+        ),
+        "events": events,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# watch-ci -- the emitter this forge does not have
+# --------------------------------------------------------------------------- #
+def watch_ci(
+    repo: str,
+    sha: str,
+    number: int,
+    token: str,
+    *,
+    deadline_s: int = 1800,
+    quiet_s: int = 180,
+) -> int:
+    """Poll one commit's CI until it settles, then write ONE sentinel.
+
+    Polling, and deliberately so. The fleet rule is "emitters, not polling", and
+    the honest reading of it is that NOTHING SHOULD SIT IN A LOOP ASKING whether
+    anything has changed. This does poll -- but it is one bounded process, tied
+    to one commit, that exists only while that commit's CI is undecided, and its
+    output is an event. That is an adapter around a forge that emits no CI
+    webhook, not a clock: with no PR in flight, nothing here is running at all.
+
+    The alternative was to let the tick block on the status API, which is worse:
+    a tick that waits half an hour is a tick that cannot be stopped, cannot be
+    told about a merge that happened meanwhile, and holds its worktree the whole
+    time.
+
+    Settles on any of three conditions, each of which is a real answer:
+      - every declared check reported a terminal state
+      - the combined state stopped changing for `quiet_s` (this is what a
+        SKIPPED pipeline looks like -- and it is precisely the case the loop
+        must be told about, since a check that never ran is not a check
+        that passed)
+      - `deadline_s` elapsed, which is itself the answer "CI did not decide"
+    """
+    lock = EVENT_DIR / f".watch-{sha[:12]}.lock"
+    EVENT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        # O_EXCL: two watchers on one sha would write two sentinels and wake the
+        # loop twice for one answer.
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        print(f"  already watching {sha[:12]}", flush=True)
+        return 0
+
+    started = time.monotonic()
+    last_fingerprint = ""
+    last_change = started
+    state = "unknown"
+    checks: list[dict] = []
+    try:
+        while True:
+            waited = time.monotonic() - started
+            req = urllib.request.Request(
+                f"{FORGE_API}/repos/{repo}/commits/{sha}/status",
+                headers={"Authorization": f"token {token}"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    body = json.load(r)
+                state = str(body.get("state") or "")
+                checks = [
+                    {"context": c.get("context"), "state": c.get("status")}
+                    for c in (body.get("statuses") or [])
+                ]
+            except Exception as e:
+                record(event="watch-error", sha=sha, error=type(e).__name__)
+                state, checks = "unreachable", []
+
+            fingerprint = json.dumps(
+                [state, sorted((str(c["context"]), str(c["state"])) for c in checks)]
+            )
+            if fingerprint != last_fingerprint:
+                last_fingerprint, last_change = fingerprint, time.monotonic()
+
+            terminal = bool(checks) and all(
+                str(c["state"]) in {"success", "failure", "error"} for c in checks
+            )
+            quiet = (time.monotonic() - last_change) >= quiet_s and bool(fingerprint)
+            expired = waited >= deadline_s
+
+            if terminal or quiet or expired:
+                why = "terminal" if terminal else "settled" if quiet else "deadline"
+                write_sentinel(
+                    {
+                        "ts": now(),
+                        "kind": "ci",
+                        "repo": repo,
+                        "sha": sha,
+                        "number": number,
+                        "state": state,
+                        "checks": checks,
+                        "why": why,
+                        "waited_s": round(waited),
+                    }
+                )
+                record(
+                    event="watch-done",
+                    sha=sha,
+                    state=state,
+                    why=why,
+                    waited_s=round(waited),
+                    checks=len(checks),
+                )
+                print(f"  {sha[:12]} -> {state} ({why}, {round(waited)}s)", flush=True)
+                return 0
+
+            # Backoff: quick while CI is likely still starting, slow after.
+            time.sleep(10 if waited < 120 else 30)
+    finally:
+        pathlib.Path(lock).unlink(missing_ok=True)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("command", choices=["serve", "install", "drain", "watch-ci"])
+    ap.add_argument("--port", type=int, default=9119)
+    ap.add_argument("--targets", default="", help="comma-separated owner/repo")
+    ap.add_argument("--url", default="", help="install: the delivery URL")
+    ap.add_argument(
+        "--keep",
+        action="store_true",
+        help="drain: read without consuming (for debugging)",
+    )
+    ap.add_argument("--repo", default="", help="watch-ci: owner/repo")
+    ap.add_argument("--sha", default="", help="watch-ci: the commit to watch")
+    ap.add_argument("--pr", type=int, default=0, help="watch-ci: the PR number")
+    ap.add_argument(
+        "--deadline",
+        type=int,
+        default=1800,
+        help="watch-ci: give up after this many seconds",
+    )
+    a = ap.parse_args()
+
+    if a.command == "watch-ci":
+        token = os.environ.get("TOKEN", "")
+        if not (token and a.repo and a.sha):
+            print("watch-ci needs TOKEN, --repo and --sha", file=sys.stderr)
+            return 2
+        return watch_ci(a.repo, a.sha, a.pr, token, deadline_s=a.deadline)
+
+    if a.command == "drain":
+        print(json.dumps(drain(keep=a.keep), indent=2))
+        return 0
+
+    secret = os.environ.get("FORGE_WEBHOOK_SECRET", "")
+    if not secret:
+        print("need FORGE_WEBHOOK_SECRET (via secret exec)", file=sys.stderr)
+        return 2
+    targets = {t.strip() for t in a.targets.split(",") if t.strip()}
+    if not targets:
+        print("need --targets", file=sys.stderr)
+        return 2
+
+    if a.command == "install":
+        token = os.environ.get("TOKEN", "")
+        if not token:
+            print("need TOKEN (via secret exec)", file=sys.stderr)
+            return 2
+        if not a.url:
+            print("need --url", file=sys.stderr)
+            return 2
+        return install(targets, token, secret, a.url)
+
+    return serve(a.port, targets, secret.encode())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

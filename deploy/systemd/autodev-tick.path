@@ -1,0 +1,25 @@
+[Unit]
+Description=Run an autodev cycle when the forge emits something actionable
+Documentation=file:///home/svc-autodev/autodev/docs/EVENT-DRIVEN.md
+# A PATH UNIT HAS NO BUSINESS HAVING A START LIMIT. It inherits systemd's
+# default of 5 starts in 10 seconds, and it is not a thing that restarts in a
+# loop -- it sits and watches. All the limit does is make the unit fail with
+# `unit-start-limit-hit` when an operator starts it a few times in quick
+# succession, which is exactly what happens while working on the loop.
+#
+# Failing that way is uniquely bad here: the receiver stays active, the timer
+# stays armed, sentinels accumulate, and NOTHING CONSUMES THEM -- so every
+# indicator reads healthy while the loop is dead. The rate limit that matters
+# belongs on the service, which has one (60/hour, sized from observation).
+StartLimitIntervalSec=0
+
+[Path]
+# The whole scheduling model. A sentinel appears -> the tick runs -> the tick
+# drains the directory -> the unit re-arms on the next empty-to-nonempty edge.
+# If the tick did not drain, this would fire once and never again, so the drain
+# is not housekeeping: it is what keeps the loop alive.
+PathExistsGlob=/home/svc-autodev/events/*.json
+Unit=autodev-tick.service
+
+[Install]
+WantedBy=paths.target

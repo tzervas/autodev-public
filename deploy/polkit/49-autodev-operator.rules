@@ -1,0 +1,34 @@
+// Let the operator start, stop and restart the autodev units without a
+// password, and NOTHING else.
+//
+// WHY. `autodev start` / `stop` / `run` are the operator's primary commands and
+// they manage system units. Without this they fail with "Access denied" and the
+// tool tells you to go and type sudo, which makes the CLI a wrapper around
+// advice rather than a way to do the thing.
+//
+// SCOPE. Three unit names, three verbs, one user. Not a group, not a glob, and
+// not `manage-units` in general -- this grants the ability to run the agent,
+// not the ability to run anything.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user !== "operator") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var allowed = [
+        "autodev-events.service",
+        "autodev-tick.path",
+        "autodev-tick.timer",
+        "autodev-tick.service",
+    ];
+    if (allowed.indexOf(unit) === -1) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var verb = action.lookup("verb");
+    if (["start", "stop", "restart", "reload-or-restart"].indexOf(verb) !== -1) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

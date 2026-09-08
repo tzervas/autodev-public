@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# One autodev cycle. All the environment in one reviewed place.
+#
+# Every value here was arrived at by a failing run, so they are documented rather
+# than left as folklore:
+#   CSD_API          the harness state API; the loop has no private file door
+#   AUTODEV_TARGET_* the ladder repo, so the CSD decision table is bypassed
+#   AUTODEV_IMPL_TIMEOUT  600s, matched to the gateway's own request_timeout
+#   AUTODEV_EVENT_DIR     shared with autodev-events.service; they must agree
+#   PYTHONPATH       csd_client lives in the installed src/ tree
+#
+# The gateway key and Forgejo token come from the AGENT's vault via secret exec,
+# so neither is ever on a command line.
+set -uo pipefail
+
+export HOME=/home/svc-autodev
+export SECRET_VAULT=/home/svc-autodev/.secrets
+export PYTHONPATH=/home/svc-autodev/autodev/src
+export CSD_API=http://203.0.113.10:9118
+
+export CSD_STEER=/home/svc-autodev/state/steer.json
+export CSD_AUTODEV_OUT=/home/svc-autodev/state/out
+export CSD_AUTODEV_HEARTBEAT=/home/svc-autodev/state/heartbeat.json
+export CSD_GROK_NEED=/home/svc-autodev/state/need-grok.json
+export CSD_AUTODEV_STALL=/home/svc-autodev/state/stall.json
+export CSD_GPU_PLAN=/home/svc-autodev/state/gpu-plan.json
+# Where the webhook receiver drops wake sentinels. Stated here rather than left
+# to the script's default because the tick and the receiver MUST agree on it: if
+# they disagree the tick drains an empty directory, the path unit never re-arms,
+# and the loop stops with every unit still reporting active.
+export AUTODEV_EVENT_DIR=/home/svc-autodev/events
+export AUTODEV_CALL_LOG=/home/svc-autodev/state/calls.jsonl
+# The learned budget profile. csd-gateway-complete reads it per call and demotes
+# a setting the moment it fails; csd-budget-calibrate --apply folds the slower
+# measurements in on the adoption tick. Without BOTH of these the autotuner
+# writes to a default path the service account cannot reach, and silently learns
+# nothing while reporting success.
+export AUTODEV_BUDGET_PROFILE=/home/svc-autodev/state/budget-profile.json
+export CSD_PHASE1_BOARD=/home/svc-autodev/state/PHASE-1.md
+
+# THE TARGET COMES FROM THE LADDER, NOT FROM THIS FILE.
+#
+# It used to be hardcoded here, and csd-ladder rewrote the DEPLOYED copy when it
+# advanced. So `install`ing this file from the repo silently reverted the live
+# target: on 2026-09-08 that sent the loop back to a repo it had already
+# finished, where it span 59 ticks in 20 minutes against a goal that made no
+# sense for it. The two copies drifted and the deploy was the weapon.
+#
+# One source of truth. If the ladder cannot be read the tick refuses to run
+# rather than guessing -- working the wrong repository is worse than not working.
+LADDER=/home/svc-autodev/autodev/config/ladder.json
+AUTODEV_TARGET_REPO=$(python3 -c "import json;print(json.load(open('$LADDER'))['current'])" 2>/dev/null || true)
+if [ -z "${AUTODEV_TARGET_REPO:-}" ]; then
+    echo '{"ok": false, "error": "cannot read the ladder; refusing to guess a target repo"}'
+    exit 1
+fi
+export AUTODEV_TARGET_REPO
+export AUTODEV_TARGET_WORKTREE=/home/svc-autodev/work/${AUTODEV_TARGET_REPO##*/}
+export CSD_GOALS=/home/svc-autodev/state/GOALS-${AUTODEV_TARGET_REPO##*/}.md
+export AUTODEV_GATEWAY_URL=http://203.0.113.20:4000/v1
+export AUTODEV_IMPL_TIMEOUT=600
+export CSD_NEED_GROK=0
+
+export GIT_AUTHOR_NAME=autodev
+export GIT_AUTHOR_EMAIL=autodev@example.com
+export GIT_COMMITTER_NAME=autodev
+export GIT_COMMITTER_EMAIL=autodev@example.com
+export GIT_TERMINAL_PROMPT=0
+
+cd /home/svc-autodev || exit 1
+exec /usr/local/bin/secret exec \
+    AUTODEV_GATEWAY_KEY=inference/gateway-key \
+    TOKEN=forgejo/token \
+    -- /usr/bin/python3 /home/svc-autodev/autodev/scripts/csd-autodev-loop --once

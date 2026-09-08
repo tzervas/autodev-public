@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Turn real gateway traffic into the budget numbers, instead of my judgement.
+
+WHY. CHARS_PER_TOKEN = 3.0 and the per-kind answer sizes were picked from three
+measured failures and a guess. That was enough to stop the collapses; it is not
+enough to call the numbers right. Every call now records what it actually cost --
+the server reports real prompt and completion token counts -- so the ratio and
+the sizes can be measured.
+
+WHAT IT REPORTS, per kind:
+  - the REAL characters-per-token, from usage.prompt_tokens
+  - what answers actually cost, at p50 / p90 / p99
+  - how much of the budget went to reasoning rather than the answer
+  - how often a call truncated, timed out, or produced nothing
+
+AND WHAT IT REFUSES TO DO. It does not write the config. A recommendation from
+forty calls is a coincidence with error bars; below a floor of samples it says so
+and stops. It also reports p99 rather than the mean, because a budget sized to
+the average truncates half the large jobs -- and the large jobs are the ones that
+matter.
+
+Usage:
+    csd-budget-calibrate [--log PATH] [--min-samples N] [--json]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from collections import defaultdict
+from pathlib import Path
+
+LOG = os.environ.get("AUTODEV_CALL_LOG", "/home/svc-autodev/state/calls.jsonl")
+MIN_SAMPLES = 30
+# Below this a prompt is mostly chat template and its ratio is overhead.
+RATIO_FLOOR = 500
+
+
+def pct(xs: list[float], p: float) -> float:
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * p / 100))]
+
+
+def load(path: Path) -> list[dict]:
+    rows = []
+    try:
+        for ln in path.read_text().splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rows.append(json.loads(ln))
+            except ValueError:
+                continue  # a partial line from a crashed write
+    except OSError:
+        return []
+    return rows
+
+
+def analyse(rows: list[dict], floor: int) -> dict:
+    by_kind: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_kind[str(r.get("kind") or "?")].append(r)
+
+    # Chars-per-token is a property of the TOKENISER, not of the task, so it is
+    # measured across everything -- more samples, and the answer is the same.
+    # ONLY PROMPTS BIG ENOUGH TO MATTER. Measured: a 22-character prompt reports
+    # 17 tokens -- a ratio of 1.29 -- because the chat template's own tokens
+    # dominate anything that short. Including those dragged the p10 from 3.48 to
+    # 1.29, which would have made every budget wildly pessimistic. The ratio only
+    # has to be right where the budget is tight, and that is on large prompts.
+    ratios = [
+        r["prompt_chars"] / r["prompt_tokens"]
+        for r in rows
+        if r.get("prompt_tokens") and (r.get("prompt_chars") or 0) >= RATIO_FLOOR
+    ]
+    out: dict = {
+        "samples": len(rows),
+        "enough": len(rows) >= floor,
+        "chars_per_token": {
+            "p50": round(pct(ratios, 50), 2),
+            "p10": round(pct(ratios, 10), 2),
+            "n": len(ratios),
+            "floor_chars": RATIO_FLOOR,
+            "recommend": round(pct(ratios, 10), 2) if ratios else None,
+            "why": (
+                "the p10, not the mean: the estimate must not UNDERSHOOT the "
+                "token count, or the prompt is bigger than we budgeted for"
+            ),
+        },
+        "kinds": {},
+    }
+
+    for kind, rs in sorted(by_kind.items()):
+        answers = [r["completion_tokens"] for r in rs if r.get("completion_tokens")]
+        reasoning = [r["reasoning_chars"] for r in rs if r.get("reasoning_chars")]
+        trunc = [r for r in rs if r.get("finish_reason") == "length"]
+        empty = [r for r in rs if not r.get("answer_chars")]
+        out["kinds"][kind] = {
+            "n": len(rs),
+            "answer_tokens": {
+                "p50": int(pct(answers, 50)),
+                "p90": int(pct(answers, 90)),
+                "p99": int(pct(answers, 99)),
+            },
+            "reasoning_chars_p90": int(pct(reasoning, 90)),
+            "truncated": len(trunc),
+            "truncated_pct": round(100 * len(trunc) / max(len(rs), 1), 1),
+            "empty": len(empty),
+            "elapsed_p90": pct([r.get("elapsed_s") or 0 for r in rs], 90),
+            # p99 with headroom: a budget sized to the median truncates half the
+            # large jobs, and the large jobs are the ones worth doing.
+            "recommend_answer_tokens": int(pct(answers, 99) * 1.25) or None,
+            "enough": len(rs) >= floor,
+        }
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--log", default=LOG)
+    ap.add_argument("--min-samples", type=int, default=MIN_SAMPLES)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the measurements into the profile the gateway client reads",
+    )
+    ap.add_argument(
+        "--profile",
+        default=os.environ.get(
+            "AUTODEV_BUDGET_PROFILE", "/home/svc-autodev/state/budget-profile.json"
+        ),
+    )
+    a = ap.parse_args()
+
+    rows = load(Path(a.log))
+    rep = analyse(rows, a.min_samples)
+
+    if a.json:
+        print(json.dumps(rep, indent=2))
+        return 0
+
+    print(f"  {rep['samples']} call(s) in {a.log}")
+    if not rep["samples"]:
+        print("  nothing recorded yet — run some traffic first.")
+        return 1
+
+    cpt = rep["chars_per_token"]
+    print(f"\n  chars per token (n={cpt['n']}): p50 {cpt['p50']}, p10 {cpt['p10']}")
+    print(f"    recommend CHARS_PER_TOKEN = {cpt['recommend']}  — {cpt['why']}")
+
+    print(
+        f"\n  {'kind':<9} {'n':>4} {'ans p50':>8} {'p90':>7} {'p99':>7} "
+        f"{'trunc':>6} {'empty':>6} {'p90 s':>7}  recommend"
+    )
+    for kind, k in rep["kinds"].items():
+        at = k["answer_tokens"]
+        rec = (
+            f"answer_tokens={k['recommend_answer_tokens']}"
+            if k["enough"]
+            else f"only {k['n']} samples — not enough"
+        )
+        print(
+            f"  {kind:<9} {k['n']:>4} {at['p50']:>8} {at['p90']:>7} "
+            f"{at['p99']:>7} {k['truncated']:>6} {k['empty']:>6} "
+            f"{k['elapsed_p90']:>7}  {rec}"
+        )
+
+    if not rep["enough"]:
+        print(
+            f"\n  NOT ENOUGH TRAFFIC ({rep['samples']} < {a.min_samples}). "
+            "A recommendation from this many calls is a coincidence with error "
+            "bars. Run more and re-measure."
+        )
+        return 1
+    if not a.apply:
+        print(
+            "\n  Read these, then --apply to write them into the profile the "
+            "client reads. Nothing changes without it."
+        )
+        return 0
+
+    # ONLY WHAT IS MEASURED. A kind below the sample floor keeps whatever it has:
+    # overwriting a working setting with a coincidence is worse than leaving the
+    # cold start in place.
+    try:
+        with open(a.profile) as f:
+            prof = json.load(f)
+    except (OSError, ValueError):
+        prof = {}
+    prof["chars_per_token"] = rep["chars_per_token"]["recommend"]
+    prof["measured_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    prof["samples"] = rep["samples"]
+    kinds = prof.setdefault("kinds", {})
+    applied = []
+    for kind, k in rep["kinds"].items():
+        if not k["enough"] or not k["recommend_answer_tokens"]:
+            continue
+        kinds.setdefault(kind, {})["answer_tokens"] = k["recommend_answer_tokens"]
+        kinds[kind]["answer_tokens_from"] = f"p99*1.25 of {k['n']} calls"
+        applied.append(f"{kind}={k['recommend_answer_tokens']}")
+    tmp = a.profile + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(prof, f, indent=2)
+    os.replace(tmp, a.profile)
+    print(
+        f"\n  wrote {a.profile}: chars_per_token={prof['chars_per_token']}"
+        + (
+            f", {', '.join(applied)}"
+            if applied
+            else " (no kind had enough samples for an answer size)"
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

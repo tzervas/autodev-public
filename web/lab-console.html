@@ -1,0 +1,927 @@
+<!doctype html><meta charset=utf-8><title>CSD lab</title>
+<style>
+:root{
+  --bg:#0e1013; --panel:#15181c; --panel2:#1b2026; --line:#272c33;
+  --fg:#dbe1e8; --dim:#98a2ad; --faint:#707a85;
+  --ok:#3fb950; --run:#58a6ff; --warn:#d29922; --stale:#db6d28;
+  --fail:#f85149; --idle:#79838e;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  margin:0;background:var(--bg);color:var(--fg)}
+h1,h2,h3{font-weight:600;margin:0}
+a{color:#79c0ff}
+code,.mono{font-family:var(--mono);font-size:.9em}
+
+header{position:sticky;top:0;z-index:5;background:#0b0d10;
+  border-bottom:1px solid var(--line);padding:.6rem 1.1rem;
+  display:flex;gap:.9rem;align-items:center;flex-wrap:wrap}
+header h1{font-size:1rem;letter-spacing:.02em;white-space:nowrap}
+.tabs{display:flex;gap:.3rem;flex-wrap:wrap}
+.tabs button{background:transparent;color:var(--dim);border:1px solid transparent;
+  border-radius:6px;padding:.3rem .7rem;cursor:pointer;font-size:.9rem}
+.tabs button:hover{color:var(--fg);background:#1a1f25}
+.tabs button.on{background:#1d2b1d;border-color:#3c5a3c;color:#c7ecc7}
+.hdrright{margin-left:auto;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+
+main{padding:1rem 1.1rem 3rem;max-width:1560px}
+.pane{display:none}.pane.on{display:block}
+.lede{color:var(--dim);font-size:.88rem;margin:0 0 .9rem;max-width:80ch}
+
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start}
+.cols3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;align-items:start}
+@media(max-width:1150px){.cols3{grid-template-columns:1fr 1fr}}
+@media(max-width:820px){.cols,.cols3{grid-template-columns:1fr}}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:.85rem 1rem;margin-bottom:1rem;overflow:hidden}
+.cols .card,.cols3 .card{margin-bottom:0}
+.card h2{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--dim);margin-bottom:.6rem;display:flex;gap:.5rem;align-items:center;
+  flex-wrap:wrap}
+.card h3{font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--faint);margin:.9rem 0 .3rem}
+
+/* state banner - the first thing on every tab */
+.banner{border:1px solid var(--line);border-left:5px solid var(--idle);
+  border-radius:8px;background:var(--panel);padding:.85rem 1rem;margin-bottom:1.1rem;
+  display:flex;gap:1rem;align-items:flex-start;flex-wrap:wrap}
+.banner.b-ok{border-left-color:var(--ok);background:#111a12}
+.banner.b-stale{border-left-color:var(--stale);background:#1d1611}
+.banner.b-fail{border-left-color:var(--fail);background:#1e1213}
+.banner.b-warn{border-left-color:var(--warn);background:#1c1810}
+.bmain{flex:1 1 26rem;min-width:0;max-width:calc(100% - 14rem)}
+@media(max-width:900px){.bmain{max-width:100%}}
+.bfoot{margin:.5rem 0 0;color:var(--faint);font-size:.8rem;max-width:80ch}
+.bhead{font-size:1.12rem;font-weight:600;line-height:1.3;margin-bottom:.45rem}
+.bside{flex:0 0 auto;display:flex;flex-direction:column;gap:.35rem;align-items:flex-end}
+@media(max-width:700px){.bside{align-items:flex-start}}
+.bwarn{margin:.6rem 0 0;padding:.45rem .6rem;border-radius:5px;
+  background:#2a1517;color:#ffbcb5;font-size:.88rem}
+.banner.b-stale .bwarn{background:#2a1e12;color:#ffd7a8}
+
+/* state chips - colour AND word, never colour alone */
+.chip{display:inline-flex;align-items:center;gap:.35rem;font-size:.72rem;
+  font-weight:700;letter-spacing:.07em;padding:.15rem .5rem;border-radius:4px;
+  border:1px solid;white-space:nowrap;font-family:var(--mono)}
+.chip>i{width:.5rem;height:.5rem;border-radius:50%;background:currentColor;
+  flex:0 0 auto}
+.c-ok{color:var(--ok);border-color:#1d4429;background:#0f1f14}
+.c-run{color:var(--run);border-color:#1f3f63;background:#0d1722}
+.c-warn{color:var(--warn);border-color:#553d10;background:#1e1809}
+.c-stale{color:var(--stale);border-color:#5c2f11;background:#20140c}
+.c-fail{color:var(--fail);border-color:#5f2426;background:#20100f}
+.c-idle{color:var(--idle);border-color:#333a41;background:#15181c}
+/* the pulse is a liveness assertion - it is applied only while the worker
+   is actually beating, and never re-armed once it has stopped. */
+.chip.pulse>i{animation:blip 2s ease-in-out infinite}
+@keyframes blip{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* labelled values - the default view */
+.kv{display:grid;grid-template-columns:max-content minmax(0,1fr);
+  gap:.15rem .8rem;margin:0}
+.kv dt{color:var(--faint);font-size:.78rem;text-transform:uppercase;
+  letter-spacing:.05em;padding-top:.15rem}
+.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.kv dd.mono{font-family:var(--mono);font-size:.88rem}
+@media(max-width:520px){.kv{grid-template-columns:1fr;gap:0 0}
+  .kv dd{margin-bottom:.45rem}}
+.note{color:var(--dim);font-size:.85rem}
+.faint{color:var(--faint);font-size:.82rem}
+.big{font-size:1.35rem;font-weight:600;line-height:1.25}
+.prose{margin:.2rem 0 0;max-width:78ch;white-space:pre-wrap}
+.warnline{margin:.6rem 0 .2rem;font-size:.88rem;color:#ffd7a8}
+.frozen{color:var(--faint);font-size:.72rem;font-family:var(--mono);
+  border:1px solid var(--line);border-radius:3px;padding:0 .3rem;
+  letter-spacing:.05em;white-space:nowrap}
+.dtg{font-family:var(--mono);font-size:.88rem;white-space:nowrap}
+
+.aliaslist{display:flex;gap:.3rem;flex-wrap:wrap;margin:.2rem 0 0}
+.alias{background:#17251b;border:1px solid #2c4632;color:#b6dcbd;
+  padding:.1rem .45rem;border-radius:4px;font-family:var(--mono);font-size:.82rem}
+
+.meter{height:8px;background:#2f353c;border:1px solid var(--line);border-radius:4px;
+  overflow:hidden;margin:.45rem 0 .3rem}
+.meter>i{display:block;height:8px;background:linear-gradient(90deg,#3fb950,#58a6ff)}
+.meter.hot>i{background:linear-gradient(90deg,#d29922,#f85149)}
+.meter.share>i{background:#4a5560}
+.metric{margin:0;font-family:var(--mono);font-size:.86rem;color:var(--fg)}
+
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;
+  background:linear-gradient(90deg,var(--panel) 30%,transparent),
+    linear-gradient(90deg,transparent,var(--panel) 70%) 100% 0,
+    radial-gradient(farthest-side at 0 50%,rgba(0,0,0,.55),transparent),
+    radial-gradient(farthest-side at 100% 50%,rgba(0,0,0,.55),transparent) 100% 0;
+  background-repeat:no-repeat;background-size:3rem 100%,3rem 100%,1rem 100%,1rem 100%;
+  background-attachment:local,local,scroll,scroll}
+table.board{width:100%;border-collapse:collapse;font-size:.86rem}
+table.board th{text-align:left;font-weight:600;color:var(--faint);
+  font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
+  border-bottom:1px solid var(--line);padding:.35rem .6rem .35rem 0;white-space:nowrap}
+table.board td{border-bottom:1px solid #1e2228;padding:.42rem .6rem .42rem 0;
+  vertical-align:top}
+table.board tr:last-child td{border-bottom:0}
+table.board td.mono{font-family:var(--mono);font-size:.84rem;white-space:nowrap}
+table.board td.wrap{overflow-wrap:anywhere;min-width:9rem;white-space:normal}
+table.board td.chips{display:flex;gap:.25rem;flex-wrap:wrap;border-bottom:0}
+
+pre{background:#0a0c0f;border:1px solid var(--line);border-radius:6px;
+  padding:.6rem .7rem;overflow:auto;max-height:20rem;white-space:pre-wrap;
+  overflow-wrap:anywhere;font-family:var(--mono);font-size:.82rem;
+  line-height:1.45;color:#c3cbd4;margin:.2rem 0 0;
+  background-image:linear-gradient(#0a0c0f 30%,rgba(10,12,15,0)),
+    linear-gradient(rgba(10,12,15,0),#0a0c0f 70%),
+    radial-gradient(farthest-side at 50% 0,rgba(0,0,0,.6),rgba(0,0,0,0)),
+    radial-gradient(farthest-side at 50% 100%,rgba(0,0,0,.6),rgba(0,0,0,0));
+  background-position:0 0,0 100%,0 0,0 100%;background-repeat:no-repeat;
+  background-size:100% 2.4rem,100% 2.4rem,100% .7rem,100% .7rem;
+  background-attachment:local,local,scroll,scroll}
+details.raw{margin-top:.8rem;border-top:1px solid var(--line);padding-top:.5rem}
+details.raw>summary{cursor:pointer;color:var(--faint);font-size:.78rem;
+  letter-spacing:.04em;list-style:none}
+details.raw>summary::-webkit-details-marker{display:none}
+details.raw>summary:before{content:"\25b8 ";color:var(--faint)}
+details.raw[open]>summary:before{content:"\25be "}
+details.raw>summary:hover{color:var(--fg)}
+
+button{font:inherit}
+.btn{background:#1d2229;color:var(--fg);border:1px solid #333b44;border-radius:6px;
+  padding:.35rem .8rem;cursor:pointer}
+.btn:hover{background:#252c34}
+.btn.link{background:transparent;border-color:transparent;color:#79c0ff;
+  padding:.15rem .3rem;text-align:left}
+.btn.link:hover{text-decoration:underline;background:transparent}
+textarea,input{font:inherit;background:#0a0c0f;color:var(--fg);
+  border:1px solid #333b44;border-radius:6px;padding:.4rem .55rem}
+textarea{width:100%;max-width:60rem}
+.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.2rem 0 .8rem}
+.empty{color:var(--faint);font-size:.88rem;font-style:italic;margin:.3rem 0 0}
+</style>
+<header>
+  <h1>CSD lab</h1>
+  <nav class=tabs>
+    <button class=on data-tab=feed>GPUs</button>
+    <button data-tab=auto>Autodev</button>
+    <button data-tab=todos>Goals</button>
+    <button data-tab=chat>Chat</button>
+    <button data-tab=pool>Pool</button>
+    <button data-tab=spawn>Spawn</button>
+    <button data-tab=hist>History</button>
+    <button data-tab=steer>Steer</button>
+  </nav>
+  <span class=hdrright id=hdr></span>
+</header>
+<main>
+<div id=banner></div>
+<section class="pane on" id=feed>
+  <p class=lede>Loaded models only. Three hosts. Roles: 3090 autodev local/code &middot;
+  5080 chat+Comfy (CUDA via lock) &middot; 1080 Ti retrieve-index-light.</p>
+  <div class=cols3>
+    <div class=card id=c0></div>
+    <div class=card id=c1></div>
+    <div class=card id=c2></div>
+  </div>
+</section>
+<section class=pane id=auto>
+  <p class=lede>What the model is doing now. Goals board stays on the Goals tab.</p>
+  <div class=card>
+    <h2>now</h2>
+    <div id=ameta></div>
+    <div id=anow class=act></div>
+  </div>
+  <div class=cols>
+    <div class=card><h2>queue</h2><div id=q></div></div>
+    <div class=card><h2>heartbeat &mdash; last tick</h2><div id=ahb></div></div>
+  </div>
+  <div class=card><h2>recent ticks</h2><div id=ticks></div></div>
+</section>
+<section class=pane id=todos>
+  <p class=lede>PHASE-1 board from GET /api/goals. Not a second Open WebUI
+  (human chat stays the Chat tab).</p>
+  <div class=card><h2>intent</h2><div id=gnext></div></div>
+  <div class=card><h2>work queue &mdash; todos</h2><div id=gtodos></div></div>
+  <div class=cols>
+    <div class=card><h2>heartbeat</h2><div id=ghb></div></div>
+    <div class=card><h2>notes / reasoning</h2><div id=gnotes></div></div>
+  </div>
+  <div class=cols>
+    <div class=card><h2>grok ping</h2><div id=gping></div></div>
+    <div class=card><h2>scale ladder / HF</h2><div id=gladder></div></div>
+  </div>
+  <div class=card><h2>PHASE-1 board</h2><div id=gboard class=empty>loading&hellip;</div></div>
+  <div class=card><h2>where this came from</h2><div id=gsrc></div></div>
+</section>
+<section class=pane id=chat>
+  <p class=lede>Composed with existing Open WebUI (3090 LocalAI + Comfy).
+  Autodev queue still has priority.</p>
+  <iframe src="https://ai.example.com" style="width:100%;height:72vh;border:1px solid var(--line);border-radius:8px;background:#000" title="Open WebUI"></iframe>
+</section>
+<section class=pane id=spawn>
+  <p class=lede>Stand a catalog alias on leftover 3090 or idle 5080. Never dual 14B.</p>
+  <div class=row>
+    <input id=sa placeholder="local/code or embed-qwen3-0.6b" style="flex:1 1 22rem">
+    <button class=btn onclick="spawnNow()">spawn</button>
+  </div>
+  <div class=card><h2>result</h2><div id=so class=empty>nothing spawned yet</div></div>
+</section>
+<section class=pane id=pool>
+  <div id=cpool></div>
+</section>
+<section class=pane id=hist>
+  <p class=lede>Lab chats by day and autodev ticks. Click a row.</p>
+  <div class=cols>
+    <div class=card><h2>sessions</h2><div id=hlist class=empty>loading&hellip;</div></div>
+    <div class=card><h2>session</h2><div id=hview class=empty>pick one</div></div>
+  </div>
+</section>
+<section class=pane id=steer>
+  <div class=card>
+    <h2>controls</h2>
+    <div class=row>
+      <button class=btn onclick="steer({pause:true})">pause loops</button>
+      <button class=btn onclick="steer({pause:false})">resume</button>
+    </div>
+    <div class=row>
+      <textarea id=n rows=2 placeholder="steer note"></textarea>
+    </div>
+    <div class=row>
+      <button class=btn onclick="steer({note:document.getElementById('n').value})">set note</button>
+    </div>
+  </div>
+  <div class=card><h2>current steer</h2><div id=raw></div></div>
+  <p class=note>Human chat is the existing Open WebUI:
+  <a href="https://ai.example.com">ai.example.com</a>
+  (3090 LocalAI + Comfy through that instance). This page does not host a
+  second WebUI.</p>
+</section>
+</main>
+<script>
+const BASE='/lab';
+
+/* --- liveness thresholds, chosen from the measured heartbeat cadence ------
+   scripts/csd-autodev-loop --worker sleeps 30 s between ticks. Over the 1329
+   real intervals in /fleet-data/cabal/autodev-out the gap between beats was
+   p50 36 s, p90 48 s, p95 53 s, p99 68 s. LIVE_MAX_S=90 is p99 plus roughly
+   half a cadence, i.e. tolerate one missed beat -- and it is the same bound
+   the API already uses for heartbeat.live, so the page and the JSON agree.
+   STALE_MAX_S=600 is ~10 missed beats: past that it is not a slow tick. */
+const LIVE_MAX_S=90;
+const STALE_MAX_S=600;
+
+/* --- clocks --------------------------------------------------------------
+   Elapsed time is only ever shown for something that is still running. Once
+   a run has stopped it gets a DTG and nothing else: no counter, no re-render,
+   no per-row arithmetic on every poll. LOADED_AT is a single fixed anchor so
+   the one staleness figure the page does print is computed once, not ticked. */
+let LIVE=false;     /* worker beating right now */
+let SRV_NOW=null;   /* server-side "now", so ages agree with the API */
+let SEEN_STOPPED_AT=null; /* server clock when the stop was first observed */
+let LAST_KEY=null;  /* payload fingerprint, ignoring the volatile age fields */
+let LAST_WORKER_KEY=null; /* worker payload only, ignoring GPU telemetry */
+let LAST_WORKER_CHANGE=null; /* DTG the worker state last actually moved */
+
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function att(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function num(v){return (v==null||v===''||!isFinite(Number(v)))?null:Number(v);}
+const DASH='\u2014';
+
+/* --- human formatting: never show a raw float where a quantity is meant --- */
+function fmtDur(s){
+  const v=num(s); if(v==null) return DASH;
+  const t=Math.max(0,Math.round(v));
+  if(t<60) return t+' s';
+  const m=Math.floor(t/60), ss=t%60;
+  if(m<60) return ss?m+' m '+ss+' s':m+' m';
+  const h=Math.floor(m/60), mm=m%60;
+  if(h<24) return mm?h+' h '+mm+' m':h+' h';
+  const d=Math.floor(h/24), hh=h%24;
+  return hh?d+' d '+hh+' h':d+' d';
+}
+/* DTG: the only thing a stopped run gets. Absolute, UTC, never recomputed. */
+function dtg(epoch){
+  const v=num(epoch); if(v==null||v<1e8) return DASH;
+  const d=new Date(v*1000); if(isNaN(d.getTime())) return DASH;
+  const p=n=>String(n).padStart(2,'0');
+  return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())
+    +' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+'Z';
+}
+function dtgShort(epoch){
+  const full=dtg(epoch);
+  return full===DASH?DASH:full.slice(5);
+}
+/* Elapsed against the moment the stop was first seen. Set once and then
+   held, so it is a measurement with a timestamp, not a counter. */
+function stoppedGap(epoch){
+  const v=num(epoch); if(v==null||SEEN_STOPPED_AT==null) return null;
+  return Math.max(0,SEEN_STOPPED_AT-v);
+}
+function fmtMib(mib){
+  const v=num(mib); if(v==null) return DASH;
+  if(v<1024) return v+' MiB';
+  return (v/1024).toFixed(1)+' GiB';
+}
+function fmtSize(mib){
+  const v=num(mib); if(v==null) return DASH;
+  return fmtMib(v)+' ('+v.toLocaleString()+' MiB)';
+}
+function fmtBool(v){return v===true?'yes':(v===false?'no':DASH);}
+function fmtBytes(n){
+  const v=num(n); if(v==null) return DASH;
+  if(v<1024) return v+' B';
+  if(v<1048576) return (v/1024).toFixed(1)+' kB';
+  return (v/1048576).toFixed(1)+' MB';
+}
+
+/* --- semantic state: colour AND the word, never colour alone -------------- */
+const KIND={
+  next:'run',open:'warn',running:'run',queued:'warn',inflight:'run',
+  done:'ok',succeeded:'ok',passed:'ok',ok:'ok',merged:'ok',green:'ok',
+  blocked:'fail',failed:'fail',rejected:'fail',crashed:'fail',error:'fail',
+  timeout:'fail',red:'fail',
+  stale:'stale',cancelled:'idle',skipped:'idle',recorded:'idle',idle:'idle'
+};
+function chip(kind,word,title){
+  return '<span class="chip c-'+kind+'"'+(title?' title="'+att(title)+'"':'')
+    +'><i></i>'+esc(word)+'</span>';
+}
+/* Pulsing chip = "this is moving right now". Only ever called when LIVE. */
+function livechip(kind,word,title){
+  return '<span class="chip pulse c-'+kind+'"'+(title?' title="'+att(title)+'"':'')
+    +'><i></i>'+esc(word)+'</span>';
+}
+function statusChip(s){
+  const w=String(s==null?'unknown':s);
+  return chip(KIND[w.toLowerCase().replace(/[^a-z]/g,'')]||'idle',w.toUpperCase());
+}
+function okChip(v,okWord,badWord){
+  if(v===true) return chip('ok',okWord||'OK');
+  if(v===false) return chip('fail',badWord||'FAILED');
+  return chip('idle','UNKNOWN');
+}
+function rcChip(rc){
+  const v=num(rc); if(v==null) return chip('idle','NOT RUN');
+  return v===0?chip('ok','PASS rc 0'):chip('fail','FAIL rc '+v);
+}
+/* The API falls back to last.ok when no pytest rc was recorded, so this
+   number is "as reported", not necessarily a measured exit code. Say so. */
+const RC_NOTE='as reported by the API; it falls back to last.ok when no '
+  +'pytest exit code was recorded for the tick';
+function rcChipReported(rc){
+  const v=num(rc); if(v==null) return chip('idle','NOT RUN',RC_NOTE);
+  return v===0?chip('ok','PASS rc 0',RC_NOTE):chip('fail','FAIL rc '+v,RC_NOTE);
+}
+function workerState(age,flag){
+  if(age==null) return {k:'idle',w:'UNKNOWN'};
+  if(flag===true||age<=LIVE_MAX_S) return {k:'ok',w:'LIVE'};
+  if(age<=STALE_MAX_S) return {k:'stale',w:'STALE'};
+  return {k:'fail',w:'STOPPED'};
+}
+
+/* --- labelled values are the default; raw JSON stays, behind a toggle ----- */
+function kv(rows){
+  const body=(rows||[]).filter(r=>r).map(r=>
+    '<dt>'+esc(r[0])+'</dt><dd'+(r[2]==='mono'||r[2]==='dtg'?' class='+(r[2]==='dtg'?'dtg':'mono'):'')+'>'
+    +(r[2]==='html'?r[1]:esc(r[1]==null||r[1]===''?DASH:r[1]))+'</dd>').join('');
+  return body?'<dl class=kv>'+body+'</dl>':'';
+}
+function raw(label,obj){
+  return '<details class=raw><summary>raw JSON \u00b7 '+esc(label)
+    +'</summary><pre>'+esc(JSON.stringify(obj==null?null:obj,null,2))+'</pre></details>';
+}
+function empty(msg){return '<p class=empty>'+esc(msg)+'</p>';}
+/* Long text on the at-a-glance tab collapses instead of being clipped
+   mid-line by a max-height: a sliced glyph reads as a rendering fault. */
+function block(label,text,collapseOver){
+  const t=String(text||'');
+  const open='<h3>'+esc(label)+'</h3><pre>'+esc(t)+'</pre>';
+  if(!collapseOver||t.length<=collapseOver) return open;
+  return '<details class=raw><summary>'+esc(label)+' \u00b7 '+fmtBytes(t.length)
+    +' \u2014 click to read</summary><pre>'+esc(t)+'</pre></details>';
+}
+/* break long paths at their separators, not mid-token */
+function path(s){
+  if(s==null||s==='') return DASH;
+  return '<span class=mono>'
+    +esc(s).replace(/\//g,'/<wbr>').replace(/_/g,'_<wbr>')+'</span>';
+}
+
+function splitThink(t){
+  t=t||'';
+  const m=/<think>([\s\S]*?)<\/think>/i.exec(t);
+  return {think:m?m[1].trim():'', out:t.replace(/<think>[\s\S]*?<\/think>/gi,'').trim()};
+}
+function aliases(list){
+  if(!list||!list.length) return '<p class=empty>none loaded</p>';
+  return '<div class=aliaslist>'+list.map(x=>'<span class=alias>'+esc(x.alias)
+    +(x.physical===false?' (logical)':'')+'</span>').join('')+'</div>';
+}
+
+/* nvidia-smi is served as "name, used MiB, free MiB, util %" */
+function parseSmi(rawSmi){
+  const p=String(rawSmi||'').split(',').map(x=>x.trim());
+  if(p.length<3) return null;
+  const used=num(String(p[1]).replace(/[^0-9.]/g,''));
+  const free=num(String(p[2]).replace(/[^0-9.]/g,''));
+  if(used==null||free==null) return null;
+  const util=p.length>3?num(String(p[3]).replace(/[^0-9.]/g,'')):null;
+  return {name:p[0],used:used,free:free,total:used+free,util:util};
+}
+function vram(rawSmi){
+  const s=parseSmi(rawSmi);
+  if(!s) return empty('nvidia-smi unavailable');
+  const pct=s.total?Math.round(100*s.used/s.total):0;
+  return '<div class="meter'+(pct>=85?' hot':'')+'"><i style="width:'+pct+'%"></i></div>'
+    +'<p class=metric>'+fmtMib(s.used)+' / '+fmtMib(s.total)+' used ('+pct+'%)'
+    +(s.util==null?'':' \u00b7 '+s.util+'% util')+'</p>';
+}
+
+/* The run window the API actually serves: 8 ticks. First DTG, last DTG,
+   the duration between them and the cadence inside it. All three are frozen
+   the moment the worker stops - they are derived from tick DTGs only. */
+function tickSpan(ticks){
+  const ts=(ticks||[]).map(t=>num(t&&t.id)).filter(n=>n!=null&&n>1e8).sort((a,b)=>a-b);
+  if(ts.length<2) return null;
+  const gaps=[];
+  for(let i=1;i<ts.length;i++) gaps.push(ts[i]-ts[i-1]);
+  gaps.sort((a,b)=>a-b);
+  return {n:ts.length,span:ts[ts.length-1]-ts[0],
+    median:gaps[Math.floor(gaps.length/2)],first:ts[0],last:ts[ts.length-1]};
+}
+
+/* --- the headline: is what I am looking at alive? ------------------------- */
+function renderBanner(d){
+  const app=d.app||{};
+  const hb=app.heartbeat||{};
+  const beat=num(hb.t);
+  const age=num(app.worker_age_s);
+  SRV_NOW=(beat!=null&&age!=null)?beat+age:Date.now()/1000;
+  const st=workerState(age,app.worker_live);
+  LIVE=(st.k==='ok');
+  if(LIVE) SEEN_STOPPED_AT=null;              /* restart re-arms the anchor */
+  else if(SEEN_STOPPED_AT==null) SEEN_STOPPED_AT=SRV_NOW;
+  const paused=!!((d.steer||{}).pause);
+  const sp=tickSpan(app.ticks);
+  const goal=hb.next_goal||(hb.last||{}).goal||'';
+
+  let head, rows, warn='';
+  if(LIVE){
+    /* Running: elapsed time is the honest thing to show, so show it. */
+    head='autodev worker is running \u00b7 last beat '+fmtDur(age)+' ago';
+    rows=[
+      ['working on',goal||'no goal recorded'],
+      ['last beat',dtg(beat)+' ('+fmtDur(age)+' ago)','dtg'],
+      sp?['tick window',dtg(sp.first)+' \u2192 '+dtg(sp.last),'dtg']:null,
+      sp?['running for',fmtDur(sp.span)+' over '+sp.n+' ticks, ~'+fmtDur(sp.median)+' apart']:null
+    ];
+  }else{
+    const gap=stoppedGap(beat);
+    head='autodev worker stopped at '+dtg(beat);
+    rows=[
+      ['stopped',dtg(beat),'dtg'],
+      ['started',sp?dtg(sp.first):DASH,'dtg'],
+      ['ran',(sp?fmtDur(sp.span):DASH)+' <span class=frozen>FROZEN</span>','html'],
+      ['age when checked',(gap==null?DASH:fmtDur(gap))+' <span class=frozen>FIXED</span>','html'],
+      ['last intent',goal||'none'],
+      ['worker','pid '+(hb.pid==null?DASH:hb.pid)+(hb.identity?' \u00b7 '+hb.identity:''),'mono']
+    ];
+    warn='<p class=bwarn>Nothing on this page is current. Every panel below shows '
+      +'the state the worker left behind at '+esc(dtg(beat))+'.</p>'
+      +'<p class=bfoot>'
+      +(sp?('&ldquo;ran&rdquo; covers the '+sp.n+' ticks the API serves ('
+            +esc(dtg(sp.first))+' \u2192 '+esc(dtg(sp.last))+', ~'+esc(fmtDur(sp.median))
+            +' apart) &mdash; the visible window, not necessarily the whole run. ')
+          :'')
+      +'&ldquo;age when checked&rdquo; was measured once, at '+esc(dtg(SEEN_STOPPED_AT))
+      +'; it is not a running clock. &ldquo;last intent&rdquo; is the goal it was '
+      +'holding when it stopped, not current work.</p>';
+  }
+  const side=[
+    (LIVE?livechip(st.k,st.w):chip(st.k,st.w,'stopped at '+dtg(beat))),
+    (paused?chip('warn','PAUSED','steer.pause is true'):chip('idle','NOT PAUSED')),
+    chip(String(d.localai||'').toLowerCase()==='ok'?'ok':'fail',
+         'LOCALAI '+String(d.localai||'?').toUpperCase())
+  ].join('');
+
+  document.getElementById('banner').innerHTML=
+    '<div class="banner b-'+st.k+'">'
+    +'<div class=bmain><div class=bhead>'+esc(head)+'</div>'+kv(rows)+warn+'</div>'
+    +'<div class=bside>'+side+'</div></div>';
+
+  /* The refresh indicator is itself a liveness signal: it animates only while
+     the worker does, and otherwise states a DTG for the last actual change. */
+  document.getElementById('hdr').innerHTML= LIVE
+    ? '<span class=faint>console</span>'
+      +livechip('run','POLLING','re-reads /api/status every 2 s')
+      +'<span class=faint>updated '+esc(dtg(SRV_NOW))+'</span>'
+    : '<span class=faint>console</span>'+chip('idle','POLLING')
+      +'<span class=faint>worker unchanged since '
+      +esc(dtg(LAST_WORKER_CHANGE==null?SRV_NOW:LAST_WORKER_CHANGE))+'</span>';
+}
+
+/* --- GPUs tab ------------------------------------------------------------ */
+function hostCard(title,node,opts){
+  opts=opts||{};
+  const th=node.thinking||{};
+  const bits=splitThink(th.text||th.prompt||'');
+  const pb=splitThink(th.prompt||'');
+  const think=bits.think||pb.think;
+  const prompt=pb.out||th.prompt||'';
+  const phase=String(th.phase||'');
+  const claimsLive=(phase==='in-flight'||phase==='queued');
+  const lying=opts.followsWorker&&claimsLive&&!LIVE;
+  const head='<h2>'+esc(title)
+    +(lying?chip('stale','STALE '+phase.toUpperCase())
+           :(claimsLive?chip('run',phase.toUpperCase()):chip('idle',(phase||'idle').toUpperCase())))
+    +'</h2>';
+  let body=kv([['gpu',node.gpu],['role',node.role]]);
+  body+=vram(node.smi);
+  if(node.lock!=null||node.comfy!=null){
+    body+='<h3>host-gpu-b state</h3>'+kv([
+      ['lock',(String(node.lock||'').toLowerCase()==='idle'
+        ?chip('idle','IDLE'):chip('run',String(node.lock||'unknown').toUpperCase())),'html'],
+      ['comfy',chip(String(node.comfy)==='wrapped'?'ok':'warn',
+        String(node.comfy||'unknown').toUpperCase()),'html']
+    ]);
+  }
+  body+='<h3>loaded</h3>'+aliases(node.loaded);
+  let act='';
+  if(lying){
+    act+='<p class=warnline>'+chip('stale','STALE')
+      +' the router still records this job as <code>'+esc(phase)+'</code>, but the '
+      +'worker stopped. This is the prompt it died holding, not current work.</p>';
+  }
+  const CAP=420;
+  if(think) act+=block('thinking',think,CAP);
+  if(phase==='in-flight'&&prompt) act+=block('in-flight',prompt,CAP);
+  else if(bits.out) act+=block(phase||'activity',bits.out,CAP);
+  else if(prompt) act+=block('in-flight',prompt,CAP);
+  else act+=empty('idle');
+  const lat=node.latent||{};
+  return head+body+act
+    +'<h3>latent</h3><p class=note><b>'+esc(lat.kind||DASH)+'</b> &mdash; '+esc(lat.note||'')+'</p>'
+    +(opts.extra||'')
+    +raw(title,node);
+}
+
+/* --- Autodev tab --------------------------------------------------------- */
+function queueTable(live,done){
+  const rows=[].concat((live||[]).map(r=>Object.assign({_live:true},r)),
+                       (done||[]).map(r=>Object.assign({_live:false},r)));
+  if(!rows.length) return empty('queue is empty');
+  const head='<div class=scroll><table class=board><thead><tr>'
+    +'<th>status</th><th>id</th><th>kind</th><th>alias</th><th>prio</th><th>prompt</th>'
+    +'</tr></thead><tbody>';
+  const body=rows.map(r=>{
+    const stale=r._live&&!LIVE;
+    const p=String(r.prompt||'');
+    return '<tr>'
+      +'<td class=chips>'+statusChip(r.status)+(stale?chip('stale','STALE'):'')+'</td>'
+      +'<td class=mono>'+esc(r.id)+'</td>'
+      +'<td class=mono>'+esc(r.kind||DASH)+'</td>'
+      +'<td class=mono>'+esc(r.alias||DASH)+'</td>'
+      +'<td class=mono>'+(r.prio==null?DASH:esc(r.prio))+'</td>'
+      +'<td class=wrap><span class=note>'
+        +esc(p.slice(0,120)+(p.length>120?'\u2026':''))+'</span></td>'
+      +'</tr>';
+  }).join('');
+  return head+body+'</tbody></table></div>';
+}
+function ticksTable(ticks){
+  if(!ticks||!ticks.length) return empty('no ticks on record');
+  const head='<div class=scroll><table class=board><thead><tr>'
+    +'<th>dtg (utc)</th><th>result</th><th>goal</th><th>rc</th><th>pytest</th><th>files</th>'
+    +'</tr></thead><tbody>';
+  const body=ticks.map(t=>'<tr>'
+    +'<td class=mono title="'+att(dtg(t.id))+'">'+esc(dtgShort(t.id))+'</td>'
+    +'<td>'+okChip(t.ok)+'</td>'
+    +'<td class=wrap>'+esc(t.goal||DASH)+'</td>'
+    +'<td class=mono>'+(t.rc==null?DASH:esc(t.rc))+'</td>'
+    +'<td>'+rcChipReported(t.pytest_rc)+'</td>'
+    +'<td class=wrap>'+((t.files||[]).length
+      ?(t.files||[]).map(f=>path(f)).join('<br>'):DASH)+'</td>'
+    +'</tr>').join('');
+  const sp=tickSpan(ticks);
+  const foot=sp?'<p class=note>'+esc(sp.n+' ticks, '+dtg(sp.first)+' \u2192 '+dtg(sp.last)
+    +' \u00b7 '+fmtDur(sp.span)+' elapsed, ~'+fmtDur(sp.median)+' apart')+'</p>':'';
+  return head+body+'</tbody></table></div>'+foot;
+}
+function renderAuto(a){
+  const now=a.now||{};
+  const bits=splitThink(now.text||'');
+  const ib=splitThink(now.inflight||now.prompt||'');
+  const think=bits.think||ib.think;
+  const inflight=ib.out||now.inflight||now.prompt||'';
+  const phase=String(now.phase||'');
+  const claimsLive=(phase==='in-flight'||phase==='queued');
+  const lying=claimsLive&&!LIVE;
+  let html='';
+  if(lying){
+    html+='<p class=warnline>'+chip('stale','STALE')+' phase reads <code>'+esc(phase)
+      +'</code>, but the worker is not running. This is the last prompt it held, '
+      +'not work in progress.</p>';
+  }
+  if(think) html+='<h3>thinking</h3><pre>'+esc(think)+'</pre>';
+  if(phase==='in-flight' && inflight) html+='<h3>in-flight</h3><pre>'+esc(inflight)+'</pre>';
+  else if(bits.out) html+='<h3>'+esc(phase||'last')+'</h3><pre>'+esc(bits.out)+'</pre>';
+  else if(inflight) html+='<h3>in-flight</h3><pre>'+esc(inflight)+'</pre>';
+  else html+=empty('idle');
+  const anow=document.getElementById('anow');
+  if(anow) anow.innerHTML=html+raw('now',now);
+  const ameta=document.getElementById('ameta');
+  if(ameta) ameta.innerHTML=kv([
+    ['phase',(lying?chip('stale','STALE '+phase.toUpperCase()):statusChip(phase||'idle')),'html'],
+    ['goal',now.goal||'none recorded'],
+    ['alias',now.alias,'mono'],
+    ['result',okChip(now.ok,'OK','FAILED'),'html'],
+    ['pytest rc',rcChipReported(now.pytest_rc),'html'],
+    ['files',(now.files||[]).length
+      ?'<span class=mono>'+(now.files||[]).map(f=>path(f)).join('<br>')+'</span>'
+      :'<span class=empty>none touched</span>','html'],
+    now.error?['error','<span style="color:var(--fail)">'+esc(now.error)+'</span>','html']:null
+  ]);
+  const q=document.getElementById('q');
+  if(q) q.innerHTML=queueTable(a.queue_live,a.queue_recent_done)
+    +raw('queue',{live:a.queue_live||[],recent_done:a.queue_recent_done||[]});
+  const ticks=document.getElementById('ticks');
+  if(ticks) ticks.innerHTML=ticksTable(a.ticks)+raw('ticks',a.ticks||[]);
+  const ahb=document.getElementById('ahb');
+  const hb=a.heartbeat||{};
+  const last=hb.last||{};
+  const st=workerState(num(a.worker_age_s),a.worker_live);
+  if(ahb) ahb.innerHTML=kv([
+    ['state',(LIVE?livechip('ok','LIVE'):chip(st.k,st.w)),'html'],
+    ['last beat',dtg(hb.t),'dtg'],
+    ['identity',hb.identity,'mono'],
+    ['pid',hb.pid,'mono'],
+    ['next goal',hb.next_goal],
+    ['tick result',okChip(last.ok),'html'],
+    ['tick goal',last.goal],
+    last.error?['error','<span style="color:var(--fail)">'+esc(last.error)+'</span>','html']:null
+  ])+raw('heartbeat',hb);
+}
+
+/* --- GPUs / pool render -------------------------------------------------- */
+function render(d){
+  renderBanner(d);
+  const f=d.feed||{};
+  document.getElementById('c0').innerHTML=hostCard('host-a',f.prime||{},{followsWorker:true});
+  document.getElementById('c1').innerHTML=hostCard('host-gpu-b',f.host-gpu-b||{});
+  const t=f.host_gpu_c||{};
+  document.getElementById('c2').innerHTML=hostCard('host-gpu-b-1080ti',t,{extra:
+    '<h3>guest</h3>'+kv([
+      ['reachable',(t.live?chip('ok','LIVE'):chip('fail','DOWN')),'html'],
+      ['guest ip',t.guest_ip||'none','mono'],
+      ['group',t.group,'mono'],
+      ['path',path(t.path),'html'],
+      ['rag',t.rag,'mono']
+    ])});
+  const p=f.pool||{};
+  const total=num(p.combined_mib)||0;
+  const cards=(p.cards||[]).map(c=>{
+    /* Share of the pool, not utilisation - a different quantity from the
+       "used" gauge on the GPUs tab, so it gets a different bar and label. */
+    const share=total?Math.round(100*(c.vram_mib||0)/total):0;
+    return '<div class=card><h2>'+esc(c.id)+(c.live?chip('ok','LIVE'):chip('idle','OFF'))+'</h2>'
+      +kv([['gpu',c.gpu],
+           ['vram',fmtSize(c.vram_mib)],
+           ['safeguard',fmtSize(c.safeguard_mib)]])
+      +'<div class="meter share"><i style="width:'+share+'%"></i></div>'
+      +'<p class=metric>'+(c.gib!=null?c.gib:'?')+' GiB card \u00b7 '
+      +(c.usable_gib!=null?c.usable_gib:'?')+' GiB usable \u00b7 '
+      +share+'% of the '+fmtMib(total)+' pool</p>'
+      +'</div>';
+  }).join('');
+  const klass=p.live_1080ti?'~50 GiB class with 1080 Ti':'3090+5080 without 1080 Ti';
+  document.getElementById('cpool').innerHTML=
+    '<div class=card><h2>unified pool'
+    +(p.enabled?chip('ok','RPC ENABLED'):chip('warn','STAGE A \u2014 RPC OFF'))+'</h2>'
+    +kv([['combined',fmtSize(p.combined_mib)],
+         ['usable',fmtSize(p.usable_mib)],
+         ['class',klass],
+         ['mode',p.mode],
+         ['mix',p.mix],
+         ['parked',Object.keys(p.parked||{}).length
+            ?'<span class=mono>'+esc(Object.keys(p.parked).join(' '))+'</span>'
+            :'<span class=empty>nothing parked</span>','html']])
+    +'<p class=note>'+esc(p.note||'')+'</p>'
+    +raw('pool',p)+'</div>'
+    +'<div class=cols3>'+(cards||empty('no live cards'))+'</div>';
+  const st=document.getElementById('raw');
+  if(st) st.innerHTML=kv([
+      ['pause',((d.steer||{}).pause?chip('warn','PAUSED'):chip('idle','NOT PAUSED')),'html'],
+      ['next goal',(d.steer||{}).next_goal],
+      ['autodev priority',fmtBool((d.steer||{}).autodev_priority)],
+      ['note',(d.steer||{}).note],
+      ['reasoning',(d.steer||{}).reasoning]
+    ])
+    +'<h3>links</h3>'+kv(Object.keys(d.links||{}).map(k=>
+        [k,'<a href="'+att(d.links[k])+'">'+esc(d.links[k])+'</a>','html']))
+    +raw('steer + cluster',{steer:d.steer,cluster:d.cluster,note:d.note,links:d.links});
+  renderAuto(d.app||{});
+}
+
+async function spawnNow(){
+  const alias=document.getElementById('sa').value||'local/code';
+  const r=await fetch(BASE+'/api/spawn',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({alias,why:'lab-spawn'})});
+  const d=await r.json();
+  document.getElementById('so').className='';
+  document.getElementById('so').innerHTML=
+    kv([['alias',d.alias||alias,'mono'],['result',okChip(d.ok),'html'],
+        ['host',d.host,'mono'],['note',d.note||d.error]])+raw('spawn',d);
+  refresh();
+}
+
+/* --- Goals tab ----------------------------------------------------------- */
+function todoTable(rows){
+  if(!rows||!rows.length) return empty('no todos are marked next or open');
+  const head='<div class=scroll><table class=board><thead><tr>'
+    +'<th>status</th><th>id</th><th>title</th><th>depends on</th><th>branch</th>'
+    +'<th>acceptance</th></tr></thead><tbody>';
+  const body=rows.map(r=>'<tr>'
+    +'<td>'+statusChip(r.status)+'</td>'
+    +'<td class=mono>'+esc(r.id)+'</td>'
+    +'<td class=wrap>'+esc(r.title)+'</td>'
+    +'<td class=mono>'+esc(r.depends||DASH)+'</td>'
+    +'<td class=mono>'+esc(r.branch||DASH)+'</td>'
+    +'<td class="wrap note">'+esc(r.acceptance||DASH)+'</td>'
+    +'</tr>').join('');
+  return head+body+'</tbody></table></div>';
+}
+function renderGoals(g){
+  const hb=g.heartbeat||{};
+  const st=workerState(num(hb.age_s),hb.live);
+  const stale=(st.k!=='ok');
+  const gap=stoppedGap(hb.t);
+  document.getElementById('gnext').innerHTML=
+    '<p class=big>'+esc(g.next_goal||'no goal set')+' '
+    +(stale?chip(st.k,'NOT CURRENT \u00b7 '+st.w):chip('run','CURRENT'))+'</p>'
+    +kv([
+      ['loops',((g.steer||{}).pause?chip('warn','PAUSED'):chip('idle','NOT PAUSED')),'html'],
+      ['recorded at',dtg(hb.t),'dtg'],
+      stale?['meaning','the worker last confirmed this goal at '+dtg(hb.t)
+        +(gap==null?'':' ('+fmtDur(gap)+' before it was last checked)')
+        +'; treat it as the last recorded intent, not work in progress']:null,
+      ['worktree',path(hb.wt),'html']
+    ]);
+  document.getElementById('ghb').innerHTML=kv([
+      ['state',(stale?chip(st.k,st.w):livechip('ok','LIVE')),'html'],
+      ['last beat',dtg(hb.t),'dtg'],
+      stale?['age when checked',(gap==null?DASH:fmtDur(gap))
+             +' \u2014 measured once at '+dtg(SEEN_STOPPED_AT)+', not a running clock']
+           :['since last beat',fmtDur(num(hb.age_s))],
+      ['identity',hb.identity,'mono'],
+      ['pid',hb.pid,'mono'],
+      ['worktree',path(hb.wt),'html'],
+      ['backends',((hb.cluster||{}).backends||[]).join(' ')||null,'mono'],
+      ['1080 Ti',(((hb.cluster||{})['host-gpu-b-1080ti']||{}).live
+        ?(stale?chip('idle','LIVE AS RECORDED','recorded in the heartbeat, not checked since')
+               :chip('ok','LIVE'))
+        :chip('idle','UNKNOWN')),'html'],
+      ['last tick',okChip((hb.last||{}).ok),'html'],
+      ['last goal',(hb.last||{}).goal],
+      ['applied',path(((hb.last||{}).applied||{}).path||DASH),'html'],
+      (hb.last||{}).error?['error','<span style="color:var(--fail)">'+esc((hb.last||{}).error)+'</span>','html']:null
+    ])+raw('heartbeat',hb);
+  const notes=String(g.reasoning||g.notes||'');
+  document.getElementById('gnotes').innerHTML=
+    (notes?'<p class=prose>'+esc(notes)+'</p>':empty('no steer note recorded'))
+    +((g.notes&&g.reasoning&&g.notes!==g.reasoning)
+      ?'<h3>note</h3><p class=prose>'+esc(g.notes)+'</p>':'')
+    +raw('steer',g.steer||{});
+  document.getElementById('gtodos').innerHTML=todoTable(g.todos)+raw('todos',g.todos||[]);
+  const ping=g.grok_need||{};
+  document.getElementById('gping').innerHTML=kv([
+      ['need',(ping.need?chip('warn','GROK WANTED'):chip('ok','NOT NEEDED')),'html'],
+      ['feature flag',(ping.enabled?chip('run','ENABLED'):chip('idle','DISABLED')),'html'],
+      ['question',ping.question],
+      ['goal',ping.goal],
+      ['blocker',ping.blocker],
+      ['mailbox written',dtg(ping.mtime),'dtg'],
+      ['path',path(ping.path),'html']
+    ])+raw('grok ping',ping);
+  const sl=g.scale_ladder||{}, hf=g.hf||{};
+  const rungs=(sl.rungs||[]);
+  document.getElementById('gladder').innerHTML=
+    '<h3>scale ladder</h3>'
+    +kv([['file read',okChip(sl.ok,'FOUND','MISSING'),'html'],
+         ['any green',okChip(sl.any_green,'YES','NO'),'html'],
+         ['path',path(sl.path),'html'],
+         ['doc',path(sl.doc),'html']])
+    +(rungs.length
+      ?'<div class=scroll><table class=board><thead><tr><th>rung</th><th>state</th></tr></thead><tbody>'
+        +rungs.map(r=>'<tr><td class=mono>'+esc(r.size||r.id||'?')+'</td><td>'
+          +okChip(r.green,'GREEN','NOT GREEN')+'</td></tr>').join('')
+        +'</tbody></table></div>'
+      :empty('no rungs recorded yet'))
+    +'<h3>hugging face</h3>'
+    +kv([['autodev token',okChip(hf.autodev,'MINTED','NOT MINTED'),'html'],
+         ['gap',hf.gap],
+         ['vault',path(hf.vault),'html'],
+         ['repos',(hf.repos||[]).length+' target repos']])
+    +raw('scale_ladder + hf',{scale_ladder:sl,hf:hf});
+  const rows=g.phase1||[];
+  const board=document.getElementById('gboard');
+  board.className='';
+  if(!rows.length){
+    board.innerHTML=empty('no rows parsed from '+((g.source||{}).board||'the board file')
+      +' \u2014 the file is missing or has no task rows');
+  }else{
+    board.innerHTML='<div class=scroll><table class=board><thead><tr><th>status</th>'
+      +'<th>id</th><th>title</th><th>depends on</th></tr></thead><tbody>'
+      +rows.map(r=>'<tr><td>'+statusChip(r.status)+'</td><td class=mono>'+esc(r.id)
+        +'</td><td class=wrap>'+esc(r.title)+'</td><td class=mono>'+esc(r.depends)
+        +'</td></tr>').join('')
+      +'</tbody></table></div>';
+  }
+  const src=g.source||{};
+  document.getElementById('gsrc').innerHTML=kv(
+    Object.keys(src).map(k=>[k,path(src[k]),'html']))+raw('goals response',g);
+}
+async function loadGoals(){
+  const r=await fetch(BASE+'/api/goals');
+  renderGoals(await r.json());
+}
+
+/* --- History ------------------------------------------------------------- */
+async function loadHist(){
+  const r=await fetch(BASE+'/api/sessions'); const d=await r.json();
+  const rows=d.sessions||[];
+  const el=document.getElementById('hlist');
+  if(!rows.length){el.className='empty';el.textContent='no sessions yet';return;}
+  el.className='';
+  el.innerHTML='<div class=scroll><table class=board><thead><tr><th>dtg (utc)</th>'
+    +'<th>kind</th><th>title</th><th>n</th><th></th></tr></thead><tbody>'
+    +rows.map(s=>'<tr>'
+      +'<td class=mono title="'+att(dtg(s.t))+'">'+esc(dtgShort(s.t))+'</td>'
+      +'<td>'+statusChip(s.kind)+'</td>'
+      +'<td class=wrap>'+esc((s.title||'').slice(0,80))+'</td>'
+      +'<td class=mono>'+esc(s.n)+'</td>'
+      +'<td><button class="btn link" data-sess="'+att(s.id)+'">open</button></td>'
+      +'</tr>').join('')
+    +'</tbody></table></div>';
+  el.querySelectorAll('button[data-sess]').forEach(b=>{
+    b.onclick=()=>openSess(b.getAttribute('data-sess'));
+  });
+}
+async function openSess(id){
+  const r=await fetch(BASE+'/api/sessions?id='+encodeURIComponent(id));
+  const d=await r.json();
+  const turns=d.turns||d.messages||[];
+  const el=document.getElementById('hview');
+  el.className='';
+  el.innerHTML=kv([['id',d.id||id,'mono'],['kind',d.kind],
+      ['dtg',dtg(d.t),'dtg'],['turns',turns.length||d.n]])
+    +raw('session',d);
+}
+
+/* --- polling -------------------------------------------------------------
+   The interval stays, because a restart has to be noticed. What stops is the
+   work: once the worker is not running and the payload has not changed, the
+   page re-renders nothing, so no counter advances and no arithmetic is done
+   per row, per poll, per stopped run. */
+/* Two fingerprints. The wide one decides whether to re-render at all - GPU
+   telemetry moves on its own and the host cards should follow it. The narrow
+   one is the worker alone, so the header's "unchanged since" DTG does not
+   creep forward on nvidia-smi noise while the worker is dead. Ages are
+   excluded from both: they move every poll by construction. */
+function fingerprint(d){
+  return JSON.stringify(d,(k,v)=>(k==='worker_age_s'||k==='age_s')?undefined:v);
+}
+function workerFingerprint(d){
+  return fingerprint({app:d.app,steer:d.steer});
+}
+async function refresh(){
+  const r=await fetch(BASE+'/api/status'); const d=await r.json();
+  const now=(()=>{
+    const hb=(d.app||{}).heartbeat||{};
+    return (hb.t!=null&&d.app&&d.app.worker_age_s!=null)
+      ?hb.t+d.app.worker_age_s:Date.now()/1000;
+  })();
+  const wkey=workerFingerprint(d);
+  if(wkey!==LAST_WORKER_KEY){LAST_WORKER_KEY=wkey;LAST_WORKER_CHANGE=now;}
+  const key=fingerprint(d);
+  const changed=(key!==LAST_KEY);
+  if(changed) LAST_KEY=key;
+  if(!changed&&!LIVE) return;   /* stopped and unchanged: render nothing */
+  render(d);
+  if(document.getElementById('todos') && document.getElementById('todos').classList.contains('on')) loadGoals();
+}
+async function steer(body){
+  await fetch(BASE+'/api/steer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  refresh();
+}
+async function go(){
+  const prompt=document.getElementById('p').value;
+  const r=await fetch(BASE+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});
+  const d=await r.json();
+  document.getElementById('c').textContent=d.content||JSON.stringify(d);
+}
+function tab(id){
+  document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on', p.id===id));
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on', b.dataset.tab===id));
+}
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{tab(b.dataset.tab); if(b.dataset.tab==='hist') loadHist(); if(b.dataset.tab==='todos') loadGoals(); if(b.dataset.tab==='auto') refresh();});
+if(location.hash==='#todos'||location.hash==='#goals'||location.pathname.indexOf('goals')>=0||location.pathname.indexOf('todos')>=0) tab('todos'); refresh(); if(document.getElementById('todos')&&document.getElementById('todos').classList.contains('on')) loadGoals(); setInterval(refresh,2000);
+</script>

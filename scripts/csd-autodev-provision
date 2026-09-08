@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Provision Forgejo identity ``autodev`` into autodev's OWN vault.
+
+Creates a restricted, non-admin user; a repo-limited token
+(write:repository + write:issue on tzervas/CogSynDelta and
+tzervas/memory-gate only); write collaborator (not admin). Token is
+written to ``git/autodev`` in autodev's dedicated vault (own age
+recipient, per the ratified identity/sandbox design — not the shared
+CSD vault, and not the operator's ``~/.secrets``). Never prints the
+token. Never copies ``git/cabal-forgejo-admin``.
+
+Run as operator::
+
+    secret exec TOKEN=git/cabal-forgejo-admin -- ./scripts/csd-autodev-provision
+
+Historical note: before the design was ratified (2026-09-03) an earlier run of
+this script stored ``git/autodev`` in the shared CSD vault
+(``/fleet-data/cabal/csd-vault``). That entry is left untouched — this script
+no longer reads or writes it by default. Point ``AUTODEV_VAULT`` at it
+explicitly if you need to reproduce the old behaviour.
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        The first version of this fallback returned the caller's default, which
+        was None -- so a script run outside the unit crashed on `None + str`
+        instead of using the committed defaults. A fallback that cannot do the
+        job is not a fallback; it is a delayed failure.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import json
+import os
+import secrets
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+FJ = FLEET.get("forge.api")
+USER = "autodev"
+EMAIL = "autodev@example.com"
+REPOS = (
+    {"owner": "tzervas", "name": "CogSynDelta"},
+    {"owner": "tzervas", "name": "memory-gate"},
+)
+# Repo-limited tokens may only use issue + repository scopes (Forgejo 16).
+SCOPES = ["write:issue", "write:repository"]
+VAULT = Path(os.environ.get("AUTODEV_VAULT", "/fleet-data/autodev/vault"))
+AGE = Path(os.environ.get("SOPS_AGE_KEY_FILE_AUTODEV", VAULT / "age.txt"))
+SECRET_BIN = Path(os.environ.get("CSD_SECRET_BIN", Path.home() / ".local/bin/secret"))
+# Token name is configurable so re-provisioning into a fresh vault never
+# collides with a token of the same name already minted for this user.
+TOKEN_NAME = os.environ.get("AUTODEV_TOKEN_NAME", "program")
+
+
+def _admin() -> str:
+    token = os.environ.get("TOKEN") or ""
+    if not token:
+        print("need TOKEN=git/cabal-forgejo-admin via secret exec", file=sys.stderr)
+        sys.exit(2)
+    return token
+
+
+def api(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    token: str | None = None,
+) -> tuple[int, object]:
+    """Call Forgejo API. Response bodies are never logged here."""
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(
+        FJ + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"token {token or _admin()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode()
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode()[:400]
+
+
+def _secret_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["SECRET_VAULT"] = str(VAULT)
+    env["SOPS_AGE_KEY_FILE"] = str(AGE)
+    return env
+
+
+def vault_has(name: str) -> bool:
+    proc = subprocess.run(
+        [str(SECRET_BIN), "ls"],
+        env=_secret_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return name in (proc.stdout or "")
+
+
+def vault_set(name: str, value: str) -> None:
+    """Store one secret. Value is stdin, never argv."""
+    proc = subprocess.run(
+        [str(SECRET_BIN), "set", name],
+        env=_secret_env(),
+        input=value,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        print(
+            f"vault set {name} failed: {(proc.stderr or proc.stdout)[:200]}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def ensure_user() -> None:
+    code, body = api("GET", f"/users/{USER}")
+    if code == 200:
+        print(f"user {USER} exists", file=sys.stderr)
+    elif code == 404:
+        password = secrets.token_urlsafe(32)
+        code, body = api(
+            "POST",
+            "/admin/users",
+            {
+                "username": USER,
+                "login_name": USER,
+                "email": EMAIL,
+                "full_name": USER,
+                "password": password,
+                "must_change_password": False,
+                "restricted": True,
+                "send_notify": False,
+                "visibility": "public",
+            },
+        )
+        if code not in {201, 200}:
+            print(f"create user failed {code} {body}", file=sys.stderr)
+            sys.exit(1)
+        print(f"created restricted user {USER}", file=sys.stderr)
+    else:
+        print(f"get user failed {code} {body}", file=sys.stderr)
+        sys.exit(1)
+    code, body = api(
+        "PATCH",
+        f"/admin/users/{USER}",
+        {
+            "login_name": USER,
+            "source_id": 0,
+            "admin": False,
+            "restricted": True,
+            "allow_create_organization": False,
+            "allow_git_hook": False,
+            "max_repo_creation": 0,
+            "must_change_password": False,
+            # prohibit_login also blocks API tokens on Forgejo 16.0.2.
+            # Password is random and discarded; no web login in practice.
+            "prohibit_login": False,
+            "visibility": "public",
+            "full_name": USER,
+        },
+    )
+    if code != 200:
+        print(f"lock down user failed {code} {body}", file=sys.stderr)
+        sys.exit(1)
+    print("user locked: restricted, no admin, no org, no extra repos", file=sys.stderr)
+
+
+def ensure_collab() -> None:
+    for rec in REPOS:
+        path = f"/repos/{rec['owner']}/{rec['name']}/collaborators/{USER}"
+        code, body = api("PUT", path, {"permission": "write"})
+        if code not in {204, 200}:
+            print(f"collab {rec['name']} failed {code} {body}", file=sys.stderr)
+            sys.exit(1)
+        print(f"collaborator write on {rec['owner']}/{rec['name']}", file=sys.stderr)
+
+
+def ensure_token() -> str:
+    if vault_has("git/autodev"):
+        print(
+            "CSD vault already has git/autodev; not minting a second token",
+            file=sys.stderr,
+        )
+        proc = subprocess.run(
+            [str(SECRET_BIN), "get", "git/autodev"],
+            env=_secret_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 or not (proc.stdout or "").strip():
+            print("vault get git/autodev failed", file=sys.stderr)
+            sys.exit(1)
+        return proc.stdout.strip()
+    code, body = api(
+        "POST",
+        f"/admin/users/{USER}/tokens",
+        {
+            "name": TOKEN_NAME,
+            "scopes": SCOPES,
+            "repositories": list(REPOS),
+        },
+    )
+    if code not in {201, 200} or not isinstance(body, dict) or not body.get("sha1"):
+        print(f"create token failed {code} {str(body)[:200]}", file=sys.stderr)
+        sys.exit(1)
+    token = str(body["sha1"])
+    last = str(body.get("token_last_eight") or token[-8:])
+    print(
+        f"token {TOKEN_NAME} last8={last} scopes={body.get('scopes')} "
+        "repos=CogSynDelta,memory-gate",
+        file=sys.stderr,
+    )
+    vault_set("git/autodev", token)
+    return token
+
+
+def verify(bot_token: str) -> None:
+    """Prove min-priv: self works, admin does not, extra repo does not."""
+    code, body = api("GET", "/user", token=bot_token)
+    login = body.get("login") if isinstance(body, dict) else None
+    print(f"bot /user {code} login={login}", file=sys.stderr)
+    code, _ = api("GET", "/admin/users", token=bot_token)
+    if code not in {401, 403, 404}:
+        print(f"bot must not hit /admin/users (got {code})", file=sys.stderr)
+        sys.exit(1)
+    for rec in REPOS:
+        code, _ = api("GET", f"/repos/{rec['owner']}/{rec['name']}", token=bot_token)
+        if code != 200:
+            print(f"bot cannot read {rec['name']} ({code})", file=sys.stderr)
+            sys.exit(1)
+    code, _ = api("GET", "/repos/tzervas/memory-gate-rs", token=bot_token)
+    if code == 200:
+        print("bot can read memory-gate-rs; token/collab too wide", file=sys.stderr)
+        sys.exit(1)
+    print(
+        "verify ok: autodev can CogSynDelta+memory-gate; cannot admin or memory-gate-rs",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
+    if not SECRET_BIN.is_file():
+        print(f"missing secret cli {SECRET_BIN}", file=sys.stderr)
+        return 2
+    if not AGE.is_file():
+        print(f"missing CSD age key {AGE}; run scripts/csd-vault-setup", file=sys.stderr)
+        return 2
+    code, me = api("GET", "/user")
+    if code != 200 or not isinstance(me, dict) or me.get("login") != "tzervas":
+        print("admin token is not tzervas; abort", file=sys.stderr)
+        return 2
+    ensure_user()
+    ensure_collab()
+    bot = ensure_token()
+    verify(bot)
+    print(
+        f"identity autodev is live; token only in {VAULT}:git/autodev",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

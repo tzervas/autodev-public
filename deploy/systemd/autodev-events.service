@@ -1,0 +1,75 @@
+[Unit]
+Description=Receive Forgejo webhooks and write autodev wake sentinels
+Documentation=file:///home/svc-autodev/autodev/scripts/csd-forge-events
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Long-lived, unlike the tick. It holds no state beyond the sentinel directory,
+# so a restart loses at most the delivery in flight -- and the reconcile timer
+# below is what makes a lost delivery non-fatal.
+Type=simple
+User=svc-autodev
+Group=svc-autodev
+Environment=AUTODEV_EVENT_DIR=/home/svc-autodev/events
+Environment=AUTODEV_EVENT_BIND=203.0.113.10
+Environment=SECRET_VAULT=/home/svc-autodev/.secrets
+ExecStart=/usr/local/bin/secret exec FORGE_WEBHOOK_SECRET=forgejo/webhook-secret -- \
+    /usr/bin/python3 /home/svc-autodev/autodev/scripts/csd-forge-events serve \
+    --port 9119 --targets cabal-collective/abliterate-harness
+Restart=always
+RestartSec=5s
+
+# ONLY THE FORGE MAY REACH THIS PORT.
+#
+# Forgejo signs the request BODY only, over plaintext HTTP, with no timestamp or
+# nonce. So one captured delivery is a permanent trigger primitive: anything on
+# the LAN that can record a single request can replay it forever, and each replay
+# starts an agent that commits, pushes and merges. Worse, the signature does not
+# cover headers, so a replayer also chooses X-Forgejo-Event -- relabelling any
+# captured body as `push` makes it actionable.
+#
+# No cryptographic freshness is available on this side, so the control is network
+# identity, enforced by the kernel rather than by this process. It is a cgroup
+# BPF filter: the attacked program cannot bypass it, and it fails CLOSED -- a
+# wrong address means deliveries stop, which the hourly reconcile timer turns
+# into latency rather than an outage. It also blocks egress, so a defect in the
+# parser cannot phone home.
+IPAddressDeny=any
+IPAddressAllow=203.0.113.20/32
+
+# It parses hostile input for a living, so it gets less of the host than the
+# tick does: no writes anywhere but its own event directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# tmpfs, not read-only: the one process on this host whose job is parsing
+# attacker-controlled bytes had /home/operator readable, which is the operator's
+# vault, SSH keys and forge tokens. A path that is not bound does not exist.
+ProtectHome=tmpfs
+BindReadOnlyPaths=/home/svc-autodev/.secrets /home/svc-autodev/autodev
+BindPaths=/home/svc-autodev/events
+ReadWritePaths=/home/svc-autodev/events
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET
+MemoryMax=256M
+# Unbounded threads were reachable pre-auth: ThreadingHTTPServer with no handler
+# timeout blocks on rfile.read() for the DECLARED Content-Length, so open
+# connections that declare 1 MiB and send nothing cost a thread each.
+TasksMax=64
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+ProtectControlGroups=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

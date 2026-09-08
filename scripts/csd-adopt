@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""The adoption workflow, as autodev's own process rather than an operator's.
+
+WHY THIS EXISTS. I onboarded this repo to the house standard by hand: declared
+the config, watched it go red with sixteen findings, ran the auto-fixes, fixed
+eleven by hand, applied the formatter, wrapped two lines. It worked, and it was
+the wrong hands doing it. Every step is mechanical or is a goal, and a process
+that only an operator can run is a process that happens once.
+
+THE ORDER MATTERS, and it is the cheap-and-safe-first rule:
+
+  1. SAFE FIXES FIRST. A formatter and a linter's own --fix are deterministic and
+     semantics-preserving. Applying them costs nothing and removes most findings
+     before anything has to think. Doing this LAST would mean an implementer
+     hand-fixing things a tool would have fixed for free.
+  2. SECURITY BEFORE STYLE. A critical finding outranks a lint warning, always.
+  3. THEN ONE FINDING AT A TIME. Whatever fails first becomes a goal. A batch of
+     sixteen produces a diff nobody can review; one produces a PR a reviewer can
+     actually judge, which is the only kind that can pass the gate.
+
+WHAT IT DOES NOT DO. It does not fix anything a tool cannot fix mechanically. The
+remainder becomes a GOAL, and the goal goes through the normal pipeline --
+implementer, gate, CI, independent review -- like all other work. Adoption is not
+a licence to bypass the gates that adoption exists to establish.
+
+FAIL FAST IS THE POINT. Expect red. Configuring a linter properly surfaces real
+findings; that is the outcome, not a regression. The repo goes green by
+induction, and then stays green because the config is declared rather than
+remembered.
+
+Usage:
+    csd-adopt <repo> [--goals GOALS.md] [--apply] [--release] [--json]
+      --apply    run the mechanical fixes (default is to report them)
+      --release  apply the release security gate, not the merge gate
+Exit: 0 adopted and clean · 1 work remains (a goal was queued if --goals) · 2 usage
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RULES = ROOT / "config" / "house-rules.json"
+ONBOARD = ROOT / "scripts" / "csd-repo-onboard"
+SECSCAN = ROOT / "scripts" / "csd-security-scan"
+STUBS = ROOT / "scripts" / "csd-stub-audit"
+STYLE = ROOT / "scripts" / "csd-style-repair"
+INTAKE = ROOT / "scripts" / "csd-autodev-intake"
+SURVEY = ROOT / "scripts" / "csd-repo-survey"
+
+
+def run(argv: list[str], cwd: Path | None = None, timeout: int = 900):
+    try:
+        p = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, "not found"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+
+
+def languages(repo: Path, rules: dict) -> list[str]:
+    rc, out = run(["git", "ls-files"], repo, timeout=60)
+    files = [f for f in out.split() if f] if rc == 0 else []
+    found = []
+    for lang, spec in rules["languages"].items():
+        for pat in spec["detect"]:
+            if (
+                "*" in pat and any(f.endswith(pat.lstrip("*")) for f in files)
+            ) or pat in files:
+                found.append(lang)
+                break
+    return found
+
+
+def safe_fixes(repo: Path, rules: dict, langs: list[str], apply: bool) -> list[dict]:
+    """Deterministic, semantics-preserving repairs. Cheapest thing that works.
+
+    Run before anything has to reason, because a finding a tool can fix for free
+    should never reach an implementer -- that is a model call and a review cycle
+    spent on a keystroke.
+    """
+    done: list[dict] = []
+    for lang in langs:
+        spec = rules["languages"][lang]
+        for kind in ("format", "lint"):
+            s = spec.get(kind) or {}
+            cmd = s.get("fix_command")
+            if not cmd or not shutil.which(cmd[0]):
+                continue
+            if not apply:
+                done.append({"lang": lang, "kind": kind, "would_run": " ".join(cmd)})
+                continue
+            rc, out = run(cmd, repo)
+            done.append(
+                {
+                    "lang": lang,
+                    "kind": kind,
+                    "ran": " ".join(cmd),
+                    "rc": rc,
+                    "out": out.strip()[-400:],
+                }
+            )
+    return done
+
+
+def read_intent(repo: Path) -> str:
+    """What this project says it is FOR, in its own words.
+
+    The pipeline consumes stated intent; a repo that does not state any cannot be
+    finished by it, and saying so is more useful than generating plausible work.
+    Read in the order a person would: the README first, then a design or
+    architecture document, then a roadmap.
+    """
+    out: list[str] = []
+    for rel in (
+        "README.md",
+        "README.rst",
+        "README",
+        "docs/DESIGN.md",
+        "docs/ARCHITECTURE.md",
+        "docs/design.md",
+        "ROADMAP.md",
+        "docs/ROADMAP.md",
+        "AGENTS.md",
+    ):
+        f = repo / rel
+        if not f.is_file():
+            continue
+        try:
+            body = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        out.append(f"--- {rel} ---\n{body[:3000]}")
+        if len(" ".join(out)) > 5000:
+            break
+    return "\n\n".join(out)
+
+
+def stage(name: str, argv: list[str], repo: Path) -> dict:
+    rc, out = run(argv, repo)
+    return {
+        "stage": name,
+        "rc": rc,
+        "clean": rc == 0,
+        "absent": rc == 127,
+        "output": out.strip()[-2500:],
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("repo")
+    ap.add_argument("--goals", default="")
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--release", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    repo = Path(a.repo).resolve()
+    if not repo.is_dir():
+        print(json.dumps({"ok": False, "error": f"no repo at {repo}"}))
+        return 2
+    rules = json.loads(RULES.read_text())
+    langs = languages(repo, rules)
+
+    # 1. Safe fixes, before anything has to think.
+    fixes = safe_fixes(repo, rules, langs, a.apply)
+
+    # 2. Security outranks style. A critical finding is not a formatting
+    #    preference, and ordering them the other way would mean fixing indentation
+    #    while a committed credential sits in the tree.
+    stages = []
+    if SECSCAN.is_file():
+        argv = [sys.executable, str(SECSCAN), str(repo)]
+        if a.release:
+            argv.append("--release")
+        stages.append(stage("security", argv, repo))
+    if STUBS.is_file():
+        stages.append(stage("stubs", [sys.executable, str(STUBS), str(repo)], repo))
+    if ONBOARD.is_file():
+        stages.append(
+            stage("house-standard", [sys.executable, str(ONBOARD), str(repo)], repo)
+        )
+
+    blocking = [s for s in stages if not s["clean"] and not s["absent"]]
+    absent = [s for s in stages if s["absent"]]
+
+    out = {
+        "repo": repo.name,
+        "languages": langs,
+        "safe_fixes": fixes,
+        "stages": stages,
+        "absent_tools": [s["stage"] for s in absent],
+        "adopted": not blocking,
+        "next": blocking[0]["stage"] if blocking else None,
+    }
+
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"  {repo.name}: {', '.join(langs) or 'no known language'}")
+        for f in fixes:
+            verb = f.get("ran") or f"would run {f.get('would_run')}"
+            print(f"    safe-fix  {f['lang']}/{f['kind']}: {verb}")
+        for s in stages:
+            mark = "ABSENT" if s["absent"] else ("clean" if s["clean"] else "BLOCKS")
+            print(f"    {mark:<7} {s['stage']}")
+        if absent:
+            print(
+                "\n  NOT PROVEN CLEAN — these tools are missing, which is not "
+                "the same as nothing being wrong:"
+            )
+            for s in absent:
+                print(f"    {s['stage']}")
+        if blocking:
+            b = blocking[0]
+            print(f"\n  FIX THIS FIRST — [{b['stage']}]")
+            for ln in b["output"].splitlines()[:14]:
+                print(f"    {ln}")
+            if len(blocking) > 1:
+                print(f"\n  ({len(blocking) - 1} more stage(s) behind it.)")
+        else:
+            print("\n  ADOPTED — nothing blocks.")
+
+    # 3b. NOTHING BLOCKS, BUT THE REPO IS NOT FINISHED. Adoption checks the
+    #     TOOLING; it says nothing about whether the software does what the
+    #     project set out to do. With the standard met and the queue empty the
+    #     loop would idle forever on a half-built repository -- which looks
+    #     exactly like success.
+    #
+    #     So the next goals come from the repo's own stated INTENT: its README,
+    #     its docs, its design notes, measured against what the code actually
+    #     does. This is the only stage that can say "the tooling is perfect and
+    #     the thing still is not built".
+    if a.goals and not blocking and SURVEY.is_file() and INTAKE.is_file():
+        rc, survey = run([sys.executable, str(SURVEY), str(repo)], timeout=300)
+        intent = read_intent(repo)
+        if intent:
+            finding = (
+                f"{repo.name} meets the house standard and has no open goals, but "
+                "the project is not finished. Its stated intent is:\n"
+                f"{intent[:2500]}\n\n"
+                "What the code currently provides:\n"
+                f"{survey[:2000]}\n\n"
+                "Name ONE gap between that intent and the code -- something the "
+                "project says it does, or clearly means to do, that is missing, "
+                "incomplete, or unproven. Not a tooling or style issue: those are "
+                "already handled."
+            )
+            rc2, o2 = run(
+                [
+                    sys.executable,
+                    str(INTAKE),
+                    "--repo",
+                    str(repo),
+                    "--goals",
+                    a.goals,
+                    "--finding",
+                    finding,
+                ],
+                timeout=420,
+            )
+            print("\n  intent gap queued:" if rc2 == 0 else "\n  no intent gap queued:")
+            print("   ", o2.strip()[:400])
+            return 1 if rc2 == 0 else 0
+
+    # 3. Queue the first blocker as a goal. The implementer does the work through
+    #    the normal pipeline; adoption does not get to bypass the gates it exists
+    #    to put in place.
+    if a.goals and blocking and INTAKE.is_file():
+        b = blocking[0]
+        finding = (
+            f"Adoption of the house standard in {repo.name} is blocked at "
+            f"the {b['stage']} stage. The tool reported:\n"
+            f"{b['output'][:1200]}\n"
+            "Fix the FIRST failure only; the rest are separate goals."
+        )
+        rc, o = run(
+            [
+                sys.executable,
+                str(INTAKE),
+                "--repo",
+                str(repo),
+                "--goals",
+                a.goals,
+                "--finding",
+                finding,
+            ],
+            timeout=420,
+        )
+        print("\n  queued as a goal:" if rc == 0 else "\n  could not queue:")
+        print("   ", o.strip()[:400])
+
+    return 0 if not blocking else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

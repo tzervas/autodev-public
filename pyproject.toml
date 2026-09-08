@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "csd-autodev"
+version = "0.1.0"
+description = "Self-hosted autodev harness (loop, lab, Forgejo). Not CogSynDelta."
+requires-python = ">=3.12,<3.14"
+license = {text = "MIT"}
+dependencies = [
+    "textual>=8.2.8",
+]
+
+# OPTIONAL, and function-local on purpose. `csd-autodev-rag-curate embed` imports
+# these inside the subcommand so the other twenty scripts run on a box with no
+# GPU stack installed. They were undeclared until 2026-09-08, which made them
+# invisible to anyone cloning this -- and made docs/LICENSING.md wrong by
+# omission until a script checked the claim instead of restating it.
+[project.optional-dependencies]
+rag = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "qdrant-client>=1.9",
+]
+
+[project.scripts]
+csd = "csd_client.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5,<9",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/csd_client", "src/csd_autodev"]
+
+# DECLARED so the style role can act on this repo. ruff has been the de-facto
+# gate all along -- run by hand, with default settings, which meant
+# csd-style-repair correctly reported "not configured by this repo" and skipped
+# it. An undeclared tool is a convention living in someone's shell history: the
+# style agent cannot repair what the repo does not ask for, and it must not
+# impose a formatter nobody opted into.
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+# EVERY SCRIPT HERE IS EXTENSIONLESS, and ruff only walks *.py by default. Without
+# this, `ruff check .` skipped all 18 of them and reported the repo clean -- the
+# same blind spot csd-stub-audit was built to avoid, sitting in the lint config
+# that was supposed to be the gate. "Adopted, 0 findings" covered src/ and tests/
+# only, and I said it about the whole repo.
+# Listed by SHEBANG, not by glob: `scripts/*` also pulls in the shell
+# scripts, and ruff parses them as Python -- 834 "errors" that were
+# semicolons in bash. csd-stub-audit reads shebangs for the same reason.
+extend-include = [
+    "scripts/autodev",
+    "scripts/csd",
+    "scripts/csd-adopt",
+    "scripts/csd-agent-mail",
+    "scripts/csd-autodev-forgejo",
+    "scripts/csd-autodev-intake",
+    "scripts/csd-autodev-loop",
+    "scripts/csd-autodev-provision",
+    "scripts/csd-autodev-rag-curate",
+    "scripts/csd-autodev-rag-gateway",
+    "scripts/csd-autodev-review",
+    "scripts/csd-ci-scrutiny",
+    "scripts/csd-forge-events",
+    "scripts/csd-gateway-complete",
+    "scripts/csd-gpu-plan",
+    "scripts/csd-lab-console",
+    "scripts/csd-model-router",
+    "scripts/csd-repo-onboard",
+    "scripts/csd-repo-survey",
+    "scripts/csd-stub-audit",
+    "scripts/csd-style-repair",
+]
+
+[tool.ruff.format]
+# Declared, so the style role may run it. Adopting this WILL
+# reformat files -- that is adoption, not a regression, and it
+# happens once.
+
+[tool.ruff.lint]
+# The set already enforced by hand this session, written down.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# Nothing is ignored at adoption. A rule waived before a single finding is
+# read is a rule nobody agreed to -- if one of these turns out to be wrong for
+# this repo, it gets waived WITH the finding that proved it.
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on internals and shell out on purpose.
+"tests/*" = ["S101", "PLR2004", "S603", "S607"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Collect EVERY test file. This was an explicit allow-list, and a new file was
+# therefore invisible by default: tests/test_event_driven.py passed when named
+# directly and was silently absent from the suite, so the suite reported green
+# for code it had never executed. That is the same defect as a CI job reporting
+# `skipped` -- something that is not running, that looks like it is.
+# A file that cannot run now says so, loudly, with a reason.
+python_files = ["test_*.py"]
+pythonpath = ["src", "."]
+addopts = ["--import-mode=importlib"]
+asyncio_mode = "auto"

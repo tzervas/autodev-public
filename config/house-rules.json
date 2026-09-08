@@ -1,0 +1,355 @@
+{
+  "_comment": [
+    "THE HOUSE STANDARD. What every repository is expected to declare, per language.",
+    "",
+    "WHY THIS EXISTS. Tooling lived in shell history. ruff has been the gate all",
+    "session -- run by hand, with default settings -- so csd-style-repair correctly",
+    "reported 'not configured by this repo' and skipped it. nl-router's CI runs",
+    "`uv run pytest` while our gate ran bare pytest, so a correct change was refused",
+    "three times with ModuleNotFoundError. An undeclared convention is one that only",
+    "exists while someone remembers it.",
+    "",
+    "ADOPTION IS EXPECTED TO GO RED. Configuring a linter properly surfaces real",
+    "findings; that is the point, not a regression. Those are not the same as a gate",
+    "that fires on things which are not defects -- CI scrutiny demanding a run from a",
+    "workflow_dispatch-only workflow was a false positive, and 86 ruff findings are",
+    "86 real ones. Adopt, go red, fix the FIRST failure, re-run, repeat. After that",
+    "it stays green and stays enforced.",
+    "",
+    "`required` blocks adoption from completing. `recommended` is reported and",
+    "queued as goals but does not block."
+  ],
+  "version": 1,
+  "adoption": {
+    "strategy": "fail-fast",
+    "_comment": "One issue at a time, whatever fails first. A batch of 86 findings handed to an implementer produces a 3000-line diff nobody can review; one finding produces a PR a reviewer can actually judge.",
+    "order": [
+      "toolchain-config",
+      "ci-workflow",
+      "gate-parity",
+      "lint-clean",
+      "format-clean",
+      "type-clean",
+      "test-present",
+      "stub-contract",
+      "docs-present"
+    ],
+    "one_finding_per_pr": true
+  },
+  "languages": {
+    "python": {
+      "detect": [
+        "pyproject.toml",
+        "setup.py",
+        "*.py"
+      ],
+      "package_manager": {
+        "tool": "uv",
+        "required_files": [
+          "pyproject.toml",
+          "uv.lock"
+        ],
+        "why": "uv is the house manager. nl-router's CI runs `uv run pytest`, which installs the src-layout package first; a bare pytest cannot import it at all."
+      },
+      "lint": {
+        "tool": "ruff",
+        "config_section": "[tool.ruff.lint]",
+        "required_select": [
+          "E",
+          "F",
+          "W",
+          "I",
+          "UP",
+          "B",
+          "SIM",
+          "RUF"
+        ],
+        "command": [
+          "uv",
+          "run",
+          "ruff",
+          "check",
+          "."
+        ],
+        "fix_command": [
+          "uv",
+          "run",
+          "ruff",
+          "check",
+          "--fix",
+          "."
+        ]
+      },
+      "format": {
+        "tool": "ruff-format",
+        "config_section": "[tool.ruff.format]",
+        "command": [
+          "uv",
+          "run",
+          "ruff",
+          "format",
+          "--check",
+          "."
+        ],
+        "fix_command": [
+          "uv",
+          "run",
+          "ruff",
+          "format",
+          "."
+        ]
+      },
+      "types": {
+        "tool": "mypy",
+        "config_section": "[tool.mypy]",
+        "command": [
+          "uv",
+          "run",
+          "mypy",
+          "."
+        ],
+        "required": false,
+        "why": "recommended: a repo with no annotations gains nothing from it on day one, but it is the third gate once lint and format are clean."
+      },
+      "test": {
+        "tool": "pytest",
+        "config_section": "[tool.pytest.ini_options]",
+        "command": [
+          "uv",
+          "run",
+          "pytest",
+          "-q"
+        ],
+        "require_collect_all": true,
+        "why": "python_files as an ALLOW-LIST silently excluded 50 tests here, and the suite reported green for code it had never executed. Collect test_*.py and skip with a stated reason, never by omission."
+      },
+      "_toolchain": "ruff is THE Python toolchain: it lints and formats, and its S rules are flake8-bandit. black, isort and flake8 are not listed because ruff already does their jobs -- five tools per language is five configs to drift."
+    },
+    "rust": {
+      "detect": [
+        "Cargo.toml"
+      ],
+      "package_manager": {
+        "tool": "cargo",
+        "required_files": [
+          "Cargo.toml",
+          "Cargo.lock"
+        ],
+        "why": "a committed lock file is what makes CI reproduce the local build"
+      },
+      "lint": {
+        "tool": "clippy",
+        "config_section": "[lints.clippy]",
+        "command": [
+          "cargo",
+          "clippy",
+          "--all-targets",
+          "--all-features",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "fix_command": [
+          "cargo",
+          "clippy",
+          "--fix",
+          "--allow-dirty",
+          "--all-targets"
+        ]
+      },
+      "format": {
+        "tool": "rustfmt",
+        "required_files": [
+          "rustfmt.toml"
+        ],
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "fix_command": [
+          "cargo",
+          "fmt",
+          "--all"
+        ]
+      },
+      "test": {
+        "tool": "cargo-test",
+        "command": [
+          "cargo",
+          "test",
+          "--all-features"
+        ]
+      },
+      "toolchain_pin": {
+        "required_files": [
+          "rust-toolchain.toml"
+        ],
+        "why": "an unpinned toolchain means CI and the developer compile with different compilers, which is the Rust form of two definitions of correctness"
+      },
+      "_toolchain": "the built-in Rust toolchain and nothing else: cargo, clippy, rustfmt."
+    },
+    "shell": {
+      "detect": [
+        "*.sh",
+        "*.bash"
+      ],
+      "lint": {
+        "tool": "shellcheck",
+        "config_section": ".shellcheckrc",
+        "command": [
+          "shellcheck",
+          "--severity=warning"
+        ],
+        "fix_command": null,
+        "why": "shellcheck has no fix mode; findings go to the implementer as tasks"
+      },
+      "format": {
+        "tool": "shfmt",
+        "command": [
+          "shfmt",
+          "-d",
+          "-i",
+          "2",
+          "."
+        ],
+        "fix_command": [
+          "shfmt",
+          "-w",
+          "-i",
+          "2",
+          "."
+        ]
+      },
+      "test": {
+        "tool": "bats",
+        "required": false
+      },
+      "_toolchain": "shellcheck lints, shfmt formats."
+    },
+    "typescript": {
+      "detect": [
+        "package.json",
+        "tsconfig.json"
+      ],
+      "package_manager": {
+        "tool": "pnpm",
+        "required_files": [
+          "package.json",
+          "pnpm-lock.yaml"
+        ]
+      },
+      "lint": {
+        "tool": "eslint",
+        "config_section": "eslint.config.js",
+        "command": [
+          "pnpm",
+          "exec",
+          "eslint",
+          "."
+        ],
+        "fix_command": [
+          "pnpm",
+          "exec",
+          "eslint",
+          "--fix",
+          "."
+        ]
+      },
+      "format": {
+        "tool": "prettier",
+        "command": [
+          "pnpm",
+          "exec",
+          "prettier",
+          "--check",
+          "."
+        ],
+        "fix_command": [
+          "pnpm",
+          "exec",
+          "prettier",
+          "--write",
+          "."
+        ]
+      },
+      "test": {
+        "tool": "vitest",
+        "command": [
+          "pnpm",
+          "test"
+        ]
+      },
+      "_toolchain": "one per role: eslint lints, prettier formats, vitest tests."
+    }
+  },
+  "ci": {
+    "_comment": [
+      "ONE PATTERN, EVERY REPO. Divergent CI is how a repo goes green in one place",
+      "and broken in another. Three defects this session came from CI drift:",
+      "a guard on github.server_url that silently skipped every job for a week,",
+      "a hardcoded https:// URL job containers cannot reach, and a secret that was",
+      "never set so the token expanded to empty and the POST returned 401."
+    ],
+    "workflow_dir": ".github/workflows",
+    "required_workflows": [
+      "ci.yml"
+    ],
+    "runs_on": [
+      "self-hosted",
+      "linux",
+      "x64",
+      "podman",
+      "compute-cpu",
+      "host-homelab"
+    ],
+    "gpu_runs_on": [
+      "self-hosted",
+      "linux",
+      "x64",
+      "podman",
+      "gpu",
+      "5080",
+      "host-host-gpu-b"
+    ],
+    "base_image": "localhost/fleet-ci-base:1",
+    "rules": {
+      "guard_on": "github.repository_owner",
+      "never_guard_on": "github.server_url",
+      "why_never": "server_url comes from the RUNNER's registered address, not ROOT_URL. A runner registered by IP made it false and every job reported `skipped`, which reads as success.",
+      "api_url_from": "github.api_url",
+      "never_hardcode_url": true,
+      "why_never_hardcode": "job containers cannot reach the public TLS edge; the runner-supplied address is the one that works",
+      "token": "secrets.GITHUB_TOKEN",
+      "why_token": "the run's own token needs no rotation and cannot expand to empty; a managed secret that was never set returned 401 on every run",
+      "no_runtime_installs": false,
+      "why_no_installs": "Baked into the base image is PREFERRED -- a runtime install costs wall clock on every run and makes CI depend on the network and on upstream availability. It is tolerated, not forbidden: a repo blocked from adopting the standard because fleet-ci-base lacks a tool is worse than a slow job, and that is exactly where this stood -- the rule forbade installs while the image carried neither uv nor ruff, so no repo could satisfy it.",
+      "runtime_installs": "tolerated"
+    },
+    "parity": {
+      "required": true,
+      "why": "CI must be a near one-for-one reproduction of local validation. Two definitions of correctness is how a repo passes here and fails there -- gate_command() reads the repo's CI command for exactly this reason, but parity must be ASSERTED, not assumed."
+    }
+  },
+  "house_rules": {
+    "branch_and_pr": "never push a trunk; working branch, PR, and merge only through the gates",
+    "one_file_per_task": "apply_proposal writes exactly one file per attempt, so a task spanning two lands half and closes anyway",
+    "stubs": "annotated with GOAL/BLOCKED/UNBLOCK/SEQUENCE, or INTENTIONAL: with a reason \u2014 see docs/AGENT-ORGANISATION.md",
+    "style": "repaired by the style role, never returned as a blocking finding",
+    "secrets": "via `secret exec VAR=name -- cmd`; never in argv, a URL, or a committed file",
+    "conventional_commits": true,
+    "commit_message": "explain WHY, and name the failure that motivated the change",
+    "file_extensions": "every file carries the extension appropriate to its content, and a shebang that disagrees with the extension is a defect to fix, not to tolerate. Tooling keys off extensions: ruff walks *.py, so twenty extensionless Python scripts here were never linted and the repo reported clean."
+  },
+  "extensions": {
+    "_comment": "shebang -> required extension. A mismatch is scrutinised and fixed rather than worked around with an include list -- the include list is a patch over the real problem.",
+    "python": ".py",
+    "bash": ".sh",
+    "sh": ".sh",
+    "zsh": ".sh",
+    "node": ".js",
+    "ruby": ".rb",
+    "_executables": "a CLI that must be invoked without an extension gets a symlink or a console_scripts entry point, not a bare extensionless file"
+  }
+}

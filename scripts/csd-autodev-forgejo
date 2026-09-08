@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""Forgejo API as identity ``autodev``. Token from CSD vault only.
+
+Allowlisted repos: tzervas/CogSynDelta, tzervas/memory-gate,
+tzervas/csd-autodev, tzervas/csd-serve, cabal-collective/abliterate-harness.
+The list is a blast-radius
+control: the autodev token must not open PRs or merge on arbitrary
+repos. Never prints TOKEN. Never GitHub.
+
+  export S='secret exec TOKEN=forgejo/token --'
+  $S ./scripts/csd-autodev-forgejo prs memory-gate
+  $S ./scripts/csd-autodev-forgejo status CogSynDelta <sha>
+  $S ./scripts/csd-autodev-forgejo merge-gate CogSynDelta <sha> 1
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        The first version of this fallback returned the caller's default, which
+        was None -- so a script run outside the unit crashed on `None + str`
+        instead of using the committed defaults. A fallback that cannot do the
+        job is not a fallback; it is a delayed failure.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+FJ = FLEET.get("forge.api")
+ALLOW = frozenset(
+    {
+        "tzervas/CogSynDelta",
+        "tzervas/memory-gate",
+        "tzervas/csd-autodev",
+        "tzervas/csd-serve",
+        # Trust ladder, added one at a time as the sequence reaches each repo --
+        # the point of this list is that widening it is a deliberate, reviewed
+        # act, so it is not made configurable from the environment. It did its
+        # job on 2026-09-08: rung 1 pushed a branch and then could not open a PR
+        # until this line was added by hand.
+        "cabal-collective/abliterate-harness",  # rung 0 — complete, 11->26 tests
+        "cabal-collective/nl-router",  # rung 1 — goals in docs/goals/
+        "cabal-collective/mcp-vacuum",  # rung 2
+        "cabal-collective/tg-agent-relay",  # rung 3
+        "cabal-collective/homelab-hosts",  # rung 4 — blocked on the shellcheck gate
+        # Autodev's own source, in the collective org where it is allowed to
+        # develop. It is git-denied on tzervas/* by design, so this copy is how
+        # it works on itself at all.
+        "cabal-collective/autodev",
+        # The remaining rungs, admitted together on 2026-09-08 with their
+        # collaborators, webhooks and runners provisioned at the same time --
+        # the one-at-a-time drip was itself the hiccup it was meant to prevent,
+        # since the loop reached a repo and stopped for want of a line here.
+        # Widening is still a deliberate act: this list is code, not config.
+        "cabal-collective/mycelium",  # the language; the bleeding-edge test
+        "cabal-collective/embeddenator",  # embeddings, ahead of Mycelium's ML work
+        "cabal-collective/context-mcp",
+        "cabal-collective/nl-router-rs",
+        "cabal-collective/nl-router-ts",
+        "cabal-collective/peft-rs",
+        "cabal-collective/py2rust",
+    }
+)
+USER = "autodev"
+SKIP_MARKERS = (
+    "skip",
+    "skipped",
+    "|| true",
+    "missing runner",
+    "not run",
+    "no runner",
+)
+DENIED_HEADS = frozenset({"main", "staging", "develop", "dev", "operator-main-wip"})
+DENIED_USERS = ("jules", "copilot", "github-actions", "dependabot")
+
+
+def token() -> str:
+    tok = os.environ.get("TOKEN") or os.environ.get("FORGEJO_TOKEN") or ""
+    if not tok:
+        print("need TOKEN=forgejo/token via secret exec", file=sys.stderr)
+        sys.exit(2)
+    return tok
+
+
+def repo_id(raw: str) -> str:
+    """Resolve a repo to owner/name, refusing anything not allowlisted.
+
+    A bare name used to be assumed to live under `tzervas/`. That was safe while
+    every target did; it silently points at the wrong owner now that a ladder repo
+    lives under an org. A bare name is resolved against the allowlist instead, and
+    an ambiguous one is refused rather than guessed.
+    """
+    raw = (raw or "").strip()
+    if "/" in raw:
+        name = raw
+    else:
+        matches = sorted(r for r in ALLOW if r.split("/", 1)[1] == raw)
+        if len(matches) > 1:
+            print(
+                f"ambiguous repo {raw!r}: matches {', '.join(matches)}. "
+                "Qualify it as owner/name.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        name = matches[0] if matches else f"tzervas/{raw}"
+    if name not in ALLOW:
+        print(f"repo not allowlisted: {name}", file=sys.stderr)
+        sys.exit(2)
+    return name
+
+
+def api(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(
+        FJ + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"token {token()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw = resp.read().decode()
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode()[:400]
+
+
+def cmd_whoami(_: argparse.Namespace) -> int:
+    """Repo-limited tokens have no read:user; 403 on /user is expected."""
+    code, body = api("GET", "/user")
+    login = body.get("login") if isinstance(body, dict) else None
+    code2, _ = api("GET", "/repos/tzervas/memory-gate")
+    print(json.dumps({"http": code, "login": login, "memory_gate": code2}))
+    return 0 if code2 == 200 else 1
+
+
+def cmd_pr(ns: argparse.Namespace) -> int:
+    """Live PR head/base SHAs. Autodev must not glue to a heartbeat SHA."""
+    repo = repo_id(ns.repo)
+    code, body = api("GET", f"/repos/{repo}/pulls/{int(ns.number)}")
+    if not isinstance(body, dict) or code != 200:
+        print(json.dumps({"http": code, "error": body}))
+        return 1
+    head = body.get("head") if isinstance(body.get("head"), dict) else {}
+    base = body.get("base") if isinstance(body.get("base"), dict) else {}
+    print(
+        json.dumps(
+            {
+                "http": code,
+                "number": body.get("number"),
+                "head": head.get("ref"),
+                "sha": head.get("sha"),
+                "base": base.get("ref"),
+                "base_sha": base.get("sha"),
+                "mergeable": body.get("mergeable"),
+                "mergeable_state": body.get("mergeable_state"),
+                "merged": bool(body.get("merged")),
+                "state": body.get("state"),
+            }
+        )
+    )
+    return 0
+
+
+def cmd_compare(ns: argparse.Namespace) -> int:
+    """Ahead/behind vs merge target. Feature may be behind after main moved."""
+    repo = repo_id(ns.repo)
+    spec = f"{ns.base}...{ns.head}"
+    quoted = urllib.parse.quote(spec, safe=".")
+    code, body = api("GET", f"/repos/{repo}/compare/{quoted}")
+    if not isinstance(body, dict) or code != 200:
+        print(json.dumps({"http": code, "error": body, "base": ns.base, "head": ns.head}))
+        return 1
+    behind = body.get("behind_by")
+    if behind is None:
+        behind = body.get("behind")
+    ahead = body.get("ahead_by")
+    if ahead is None:
+        ahead = body.get("ahead")
+    print(
+        json.dumps(
+            {
+                "http": code,
+                "base": ns.base,
+                "head": ns.head,
+                "ahead": int(ahead or 0),
+                "behind": int(behind or 0),
+                "status": body.get("status"),
+            }
+        )
+    )
+    return 0
+
+
+def cmd_prs(ns: argparse.Namespace) -> int:
+    repo = repo_id(ns.repo)
+    q = urllib.parse.urlencode({"state": ns.state, "limit": str(ns.limit)})
+    code, body = api("GET", f"/repos/{repo}/pulls?{q}")
+    if not isinstance(body, list):
+        print(json.dumps({"http": code, "error": body}))
+        return 1
+    rows = [
+        {
+            "number": p.get("number"),
+            "title": p.get("title"),
+            "state": p.get("state"),
+            # `state` is open/closed only: a merged PR and a rejected one are
+            # both "closed", and the caller deciding whether work LANDED needs
+            # to tell them apart.
+            "merged": bool(p.get("merged") or p.get("merged_at")),
+            "head": (p.get("head") or {}).get("ref"),
+            "mergeable": p.get("mergeable"),
+            "user": (p.get("user") or {}).get("login"),
+        }
+        for p in body
+    ]
+    print(json.dumps({"http": code, "repo": repo, "pulls": rows}, indent=2))
+    return 0
+
+
+def cmd_pr_create(ns: argparse.Namespace) -> int:
+    repo = repo_id(ns.repo)
+    code, body = api(
+        "POST",
+        f"/repos/{repo}/pulls",
+        {
+            "title": ns.title,
+            "body": ns.body or "",
+            "head": ns.head,
+            "base": ns.base,
+        },
+    )
+    if not isinstance(body, dict) or code not in {201, 200}:
+        print(json.dumps({"http": code, "error": body}))
+        return 1
+    print(
+        json.dumps(
+            {
+                "http": code,
+                "number": body.get("number"),
+                "url": body.get("html_url") or body.get("url"),
+                "user": (body.get("user") or {}).get("login"),
+            }
+        )
+    )
+    return 0
+
+
+def cmd_status(ns: argparse.Namespace) -> int:
+    repo = repo_id(ns.repo)
+    code, body = api("GET", f"/repos/{repo}/commits/{ns.sha}/status")
+    if not isinstance(body, dict):
+        print(json.dumps({"http": code, "error": body}))
+        return 1
+    checks = [
+        {
+            "context": s.get("context"),
+            "state": s.get("status") or s.get("state"),
+        }
+        for s in (body.get("statuses") or [])
+    ]
+    print(
+        json.dumps({"http": code, "state": body.get("state"), "checks": checks}, indent=2)
+    )
+    return 0 if code == 200 else 1
+
+
+def cmd_comment(ns: argparse.Namespace) -> int:
+    repo = repo_id(ns.repo)
+    code, _body = api(
+        "POST",
+        f"/repos/{repo}/issues/{ns.number}/comments",
+        {"body": ns.body},
+    )
+    ok = code in {201, 200}
+    print(json.dumps({"http": code, "ok": ok}))
+    return 0 if ok else 1
+
+
+def cmd_wait(ns: argparse.Namespace) -> int:
+    """Poll combined status. Does not merge. Honest red stays red."""
+    repo = repo_id(ns.repo)
+    deadline = time.time() + ns.timeout
+    last = ""
+    while time.time() < deadline:
+        code, body = api("GET", f"/repos/{repo}/commits/{ns.sha}/status")
+        state = body.get("state") if isinstance(body, dict) else "error"
+        if state != last:
+            print(json.dumps({"http": code, "state": state}), flush=True)
+            last = str(state)
+        if state in {"success", "failure", "error"}:
+            return 0 if state == "success" else 1
+        time.sleep(ns.poll)
+    print(json.dumps({"http": 0, "state": "timeout"}))
+    return 2
+
+
+def check_state(check: dict) -> str:
+    return str(check.get("state") or check.get("status") or "").lower()
+
+
+def skip_theatre(check: dict) -> bool:
+    """True when a check did not actually run (skip / || true / missing)."""
+    state = check_state(check)
+    if state in {"skipped", "skip", "neutral", "unknown"}:
+        return True
+    desc = str(check.get("description") or "").lower()
+    ctx = str(check.get("context") or "").lower()
+    blob = f"{state} {desc} {ctx}"
+    return any(marker in blob for marker in SKIP_MARKERS)
+
+
+def evaluate_gate(
+    state: str,
+    checks: list[object],
+    required: list[str] | None = None,
+) -> dict:
+    """Decide required_ran / required_succeeded.
+
+    Why: skip, ``|| true``, empty checks, or a missing runner is not green.
+    Combined ``success`` with no statuses is skip theatre.
+    """
+    rows: list[dict] = [c for c in checks if isinstance(c, dict)]
+    by_ctx: dict[str, dict] = {}
+    for row in rows:
+        ctx = str(row.get("context") or "")
+        if ctx:
+            by_ctx[ctx] = row
+    if required:
+        missing = [name for name in required if name not in by_ctx]
+        if missing:
+            return {
+                "required_ran": False,
+                "required_succeeded": False,
+                "notes": "missing required checks: " + ",".join(missing),
+            }
+        rows = [by_ctx[name] for name in required]
+    elif not rows:
+        return {
+            "required_ran": False,
+            "required_succeeded": False,
+            "notes": "no checks posted (missing runner is not green)",
+        }
+    if any(skip_theatre(row) for row in rows):
+        return {
+            "required_ran": False,
+            "required_succeeded": False,
+            "notes": "skip theatre is not green",
+        }
+    states = [check_state(row) for row in rows]
+    required_ran = all(s not in {"", "pending", "missing", "running"} for s in states)
+    required_succeeded = (
+        required_ran
+        and all(s == "success" for s in states)
+        and str(state).lower() == "success"
+    )
+    notes = (
+        "required checks ran and succeeded" if required_succeeded else f"combined={state}"
+    )
+    return {
+        "required_ran": required_ran,
+        "required_succeeded": required_succeeded,
+        "notes": notes,
+    }
+
+
+def required_contexts(repo: str, branch: str) -> list[str]:
+    """Branch-protection status contexts; empty means all posted checks."""
+    _code, body = api("GET", f"/repos/{repo}/branch_protections")
+    if not isinstance(body, list):
+        return []
+    for bp in body:
+        if not isinstance(bp, dict):
+            continue
+        name = str(bp.get("branch_name") or bp.get("rule_name") or "")
+        enabled = bp.get("enable_status_check")
+        ctx = bp.get("status_check_contexts") or bp.get("contexts") or []
+        if not isinstance(ctx, list) or enabled is False:
+            continue
+        match = (
+            name == branch
+            or name in {"*", "**"}
+            or (name.endswith("*") and branch.startswith(name[:-1]))
+        )
+        if match and ctx:
+            return [str(c) for c in ctx]
+    return []
+
+
+def _gate_rec(
+    *,
+    ok: bool,
+    state: str,
+    merged: bool,
+    required_ran: bool,
+    required_succeeded: bool,
+    notes: str,
+    http: int = 0,
+) -> dict:
+    return {
+        "ok": ok,
+        "state": state,
+        "merged": merged,
+        "required_ran": required_ran,
+        "required_succeeded": required_succeeded,
+        "notes": notes,
+        "http": http,
+    }
+
+
+def cmd_merge_gate(ns: argparse.Namespace) -> int:
+    """Merge only when required checks ran and succeeded. Skip is not green."""
+    repo = repo_id(ns.repo)
+    sha = str(ns.sha)
+    number = int(ns.number)
+    pcode, pr = api("GET", f"/repos/{repo}/pulls/{number}")
+    if not isinstance(pr, dict) or pcode != 200:
+        rec = _gate_rec(
+            ok=False,
+            state="error",
+            merged=False,
+            required_ran=False,
+            required_succeeded=False,
+            notes=f"pr fetch http={pcode}",
+            http=pcode,
+        )
+        print(json.dumps(rec))
+        return 1
+    head_ref = str((pr.get("head") or {}).get("ref") or "")
+    base_ref = str((pr.get("base") or {}).get("ref") or "")
+    user = str((pr.get("user") or {}).get("login") or "").lower()
+    head_sha = str((pr.get("head") or {}).get("sha") or "")
+    already = bool(pr.get("merged"))
+    extra = []
+    if repo.endswith("CogSynDelta") and number == 1:
+        extra.append("CogSynDelta PR 1 waits for required checks ran and succeeded")
+    if head_ref in DENIED_HEADS or head_ref.startswith("jules/") or "copilot" in head_ref:
+        rec = _gate_rec(
+            ok=False,
+            state="blocked",
+            merged=False,
+            required_ran=False,
+            required_succeeded=False,
+            notes=f"refusing head {head_ref}",
+            http=pcode,
+        )
+        print(json.dumps(rec))
+        return 1
+    if base_ref in {"develop", "staging", "dev"}:
+        rec = _gate_rec(
+            ok=False,
+            state="blocked",
+            merged=False,
+            required_ran=False,
+            required_succeeded=False,
+            notes=f"refusing base {base_ref}",
+            http=pcode,
+        )
+        print(json.dumps(rec))
+        return 1
+    if any(name in user for name in DENIED_USERS):
+        rec = _gate_rec(
+            ok=False,
+            state="blocked",
+            merged=False,
+            required_ran=False,
+            required_succeeded=False,
+            notes=f"refusing user {user}",
+            http=pcode,
+        )
+        print(json.dumps(rec))
+        return 1
+    scode, body = api("GET", f"/repos/{repo}/commits/{sha}/status")
+    if not isinstance(body, dict):
+        rec = _gate_rec(
+            ok=False,
+            state="error",
+            merged=False,
+            required_ran=False,
+            required_succeeded=False,
+            notes=f"status http={scode}",
+            http=scode,
+        )
+        print(json.dumps(rec))
+        return 1
+    combined = str(body.get("state") or "unknown")
+    checks = [
+        {
+            "context": s.get("context"),
+            "state": s.get("status") or s.get("state"),
+            "description": s.get("description") or "",
+        }
+        for s in (body.get("statuses") or [])
+        if isinstance(s, dict)
+    ]
+    req = required_contexts(repo, base_ref)
+    gate = evaluate_gate(combined, checks, req or None)
+    rec = _gate_rec(
+        ok=False,
+        state=combined,
+        merged=already,
+        required_ran=bool(gate["required_ran"]),
+        required_succeeded=bool(gate["required_succeeded"]),
+        notes="; ".join([str(gate["notes"]), *extra]),
+        http=scode,
+    )
+    if already:
+        rec["ok"] = bool(gate["required_succeeded"])
+        rec["notes"] = "already merged; " + rec["notes"]
+        print(json.dumps(rec))
+        return 0 if rec["ok"] else 1
+    if not gate["required_succeeded"]:
+        print(json.dumps(rec))
+        return 1
+    if str(pr.get("state") or "").lower() == "closed":
+        # Terminal, not a retry: merging a closed PR returns 404 and the caller
+        # cannot tell that apart from a transient forge error.
+        rec["closed"] = True
+        rec["notes"] = f"PR is closed; nothing to merge; {rec['notes']}"
+        print(json.dumps(rec))
+        return 1
+    if pr.get("mergeable") is not True:
+        rec["notes"] = f"not mergeable; {rec['notes']}"
+        print(json.dumps(rec))
+        return 1
+    if head_sha and sha and not (head_sha.startswith(sha) or sha.startswith(head_sha)):
+        rec["notes"] = f"sha mismatch pr head; {rec['notes']}"
+        print(json.dumps(rec))
+        return 1
+    delete = head_ref != "main" and not head_ref.startswith("release/")
+    mcode, mbody = api(
+        "POST",
+        f"/repos/{repo}/pulls/{number}/merge",
+        {
+            "Do": "merge",
+            "delete_branch_after_merge": delete,
+            "MergeCommitID": head_sha or sha,
+        },
+    )
+    merged = mcode in {200, 201}
+    if isinstance(mbody, dict) and mbody.get("merged") is False:
+        merged = False
+    if isinstance(mbody, str):
+        merged = False
+    rec["merged"] = bool(merged)
+    rec["ok"] = bool(merged)
+    rec["http"] = mcode
+    if not merged:
+        rec["notes"] = f"merge http={mcode}; {rec['notes']}"
+    print(json.dumps(rec))
+    return 0 if merged else 1
+
+
+def cmd_workflow_dispatch(ns: argparse.Namespace) -> int:
+    """Dispatch a Forgejo Actions workflow. Never hosted Grok. Never GitHub."""
+    repo = repo_id(ns.repo)
+    wf = str(ns.workflow or "")
+    low = wf.lower()
+    if "github.com" in low or low.endswith(".rhai") or "grok" in low:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "http": 400,
+                    "error": "refusing hosted grok or GitHub workflow",
+                    "hosted_grok": False,
+                }
+            )
+        )
+        return 2
+    inputs: dict[str, str] = {}
+    for item in ns.inputs or []:
+        if "=" not in str(item):
+            continue
+        key, val = str(item).split("=", 1)
+        inputs[key] = val
+    quoted = urllib.parse.quote(wf, safe="._-")
+    path = f"/repos/{repo}/actions/workflows/{quoted}/dispatches"
+    code, body = api("POST", path, {"ref": ns.ref, "inputs": inputs})
+    ok = code in {200, 201, 204}
+    rec: dict = {
+        "http": code,
+        "ok": ok,
+        "workflow": wf,
+        "ref": ns.ref,
+        "hosted_grok": False,
+    }
+    if not ok:
+        rec["error"] = body if isinstance(body, (str, dict, list)) else str(body)
+    print(json.dumps(rec))
+    return 0 if ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("whoami")
+    p_one = sub.add_parser("pr")
+    p_one.add_argument("repo")
+    p_one.add_argument("number", type=int)
+    p_cmp = sub.add_parser("compare")
+    p_cmp.add_argument("repo")
+    p_cmp.add_argument("base")
+    p_cmp.add_argument("head")
+    p_list = sub.add_parser("prs")
+    p_list.add_argument("repo")
+    p_list.add_argument("--state", default="open")
+    p_list.add_argument("--limit", type=int, default=20)
+    p_new = sub.add_parser("pr-create")
+    p_new.add_argument("repo")
+    p_new.add_argument("title")
+    p_new.add_argument("head")
+    p_new.add_argument("--base", default="main")
+    p_new.add_argument("--body", default="")
+    p_st = sub.add_parser("status")
+    p_st.add_argument("repo")
+    p_st.add_argument("sha")
+    p_c = sub.add_parser("comment")
+    p_c.add_argument("repo")
+    p_c.add_argument("number", type=int)
+    p_c.add_argument("body")
+    p_w = sub.add_parser("wait")
+    p_w.add_argument("repo")
+    p_w.add_argument("sha")
+    p_w.add_argument("--timeout", type=int, default=1800)
+    p_w.add_argument("--poll", type=int, default=30)
+    p_mg = sub.add_parser("merge-gate")
+    p_mg.add_argument("repo")
+    p_mg.add_argument("sha")
+    p_mg.add_argument("number", type=int)
+    p_wd = sub.add_parser("workflow-dispatch")
+    p_wd.add_argument("repo")
+    p_wd.add_argument("workflow")
+    p_wd.add_argument("--ref", default="feat/agent-harness")
+    p_wd.add_argument("--input", action="append", default=[], dest="inputs")
+    ns = ap.parse_args()
+    dispatch = {
+        "whoami": cmd_whoami,
+        "pr": cmd_pr,
+        "compare": cmd_compare,
+        "prs": cmd_prs,
+        "pr-create": cmd_pr_create,
+        "status": cmd_status,
+        "comment": cmd_comment,
+        "wait": cmd_wait,
+        "merge-gate": cmd_merge_gate,
+        "workflow-dispatch": cmd_workflow_dispatch,
+    }
+    return dispatch[ns.cmd](ns)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

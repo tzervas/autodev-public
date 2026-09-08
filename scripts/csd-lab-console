@@ -1,0 +1,2381 @@
+#!/usr/bin/env python3
+"""Monitor and steer lab GPUs + LocalAI from this machine.
+
+Usage:
+  ./scripts/csd-lab-console --http 9118  # service + dashboard (LAN bind only)
+  ./scripts/csd                    # thin HTTP client (status/steer/runs/…)
+  ./scripts/csd-lab-console --steer pause   # legacy flags → HTTP client
+
+Operator CLI paths talk HTTP only (R1). --http is the service process.
+Never pauses LocalAI. Never dual 14B. Never 0.0.0.0.
+Never widen apply allowlist. Never wrap csd-autodev-provision.
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        The first version of this fallback returned the caller's default, which
+        was None -- so a script run outside the unit crashed on `None + str`
+        instead of using the committed defaults. A fallback that cannot do the
+        job is not a fallback; it is a delayed failure.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import argparse
+import hmac
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+# Make src/ importable when run as a script without an editable install.
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+STEER = Path(os.environ.get("CSD_STEER", "/fleet-data/cabal/csd-steer.json"))
+LOCALAI = os.environ.get("LOCALAI_URL", "http://127.0.0.1:8080")
+HOST_GPU_B = os.environ.get("HOST_GPU_B_SSH", "host-gpu-b")
+GUEST_SSH = os.environ.get("CSD_INDEX_SSH", "host-gpu-b-1080ti")
+GUEST_IP = os.environ.get("CSD_INDEX_IP", "203.0.113.12")
+ROUTER_STATE = Path(
+    os.environ.get("CSD_ROUTER_STATE", "/fleet-data/cabal/model-router-state.json")
+)
+QUEUE_DIR = Path(os.environ.get("CSD_LOCALAI_QUEUE", "/fleet-data/cabal/localai-queue"))
+AUTODEV_OUT = Path(os.environ.get("CSD_AUTODEV_OUT", "/fleet-data/cabal/autodev-out"))
+GPU_PLAN = Path(os.environ.get("CSD_GPU_PLAN", "/fleet-data/cabal/gpu-plan.json"))
+SESS_DIR = Path(os.environ.get("CSD_LAB_SESSIONS", "/fleet-data/cabal/lab-sessions"))
+UPSTREAM = os.environ.get("CSD_UPSTREAM", "").rstrip("/")
+APPLY_TOKEN_FILE = Path(
+    os.environ.get("CSD_APPLY_TOKEN_FILE", "/fleet-data/cabal/csd-apply.token")
+)
+WORKTREES = {
+    "p1-08": Path("/home/operator/code/personal/tzervas/python-ai/memory-gate-wt-p1-08"),
+    "p1-07": Path("/home/operator/code/personal/tzervas/python-ai/memory-gate-wt-p1-07"),
+    "p1-09": Path("/home/operator/code/personal/tzervas/python-ai/memory-gate-wt-p1-09"),
+}
+PROTECTED_WT = Path("/home/operator/code/personal/tzervas/python-ai/memory-gate")
+ALLOW_PREFIXES = ("src/", "tests/", "docs/")
+ROOT = Path(__file__).resolve().parents[1]
+WORKTREES["region-pretrain"] = ROOT
+WORKTREES["agent-harness"] = ROOT
+GOALS = ROOT / "docs/program/GOALS.md"
+PHASE1 = Path(
+    os.environ.get("CSD_PHASE1_BOARD", str(ROOT / "docs/program/PHASE-1-TASK-BOARD.md"))
+)
+ROUTER_JSON = ROOT / "config/model-router.json"
+SCRIPTS = ROOT / "scripts"
+SECRET_BIN = os.environ.get("CSD_SECRET_BIN", "/usr/local/bin/secret")
+HEARTBEAT = Path(
+    os.environ.get("CSD_AUTODEV_HEARTBEAT", "/fleet-data/cabal/autodev-heartbeat.json")
+)
+GROK_NEED = Path(os.environ.get("CSD_GROK_NEED", "/fleet-data/cabal/csd-need-grok.json"))
+PING_MAX = 2048
+
+
+def need_grok_enabled() -> bool:
+    """Feature flag. Default off so autodev does not wake hosted Grok."""
+    raw = os.environ.get("CSD_NEED_GROK", os.environ.get("CSD_NEED_GROK_ENABLED", "0"))
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+PING_DROP = frozenset(
+    {
+        "text",
+        "transcript",
+        "stdout",
+        "stderr",
+        "journal",
+        "log",
+        "autodev-out",
+        "reply",
+    }
+)
+SCALE_LADDER = Path(
+    os.environ.get(
+        "CSD_SCALE_LADDER",
+        str(ROOT / "benchmark_results" / "scale_ladder.json"),
+    )
+)
+OPERATOR_SECRETS = Path.home() / ".secrets"
+HF_MINT = (
+    "huggingface.co/settings/tokens → fine-grained write on "
+    "tzervas/cogsyndelta* only → printf '%s' 'hf_…' | "
+    "SECRET_VAULT=/fleet-data/cabal/csd-vault "
+    "SOPS_AGE_KEY_FILE=$SECRET_VAULT/age.txt secret set hf/autodev. "
+    "Never copy gpu/huggingface-token."
+)
+GIT_CLI = SCRIPTS / "csd-autodev-git"
+FORGEJO_CLI = SCRIPTS / "csd-autodev-forgejo"
+LOOP_CLI = SCRIPTS / "csd-autodev-loop"
+PRIORITY_CLI = SCRIPTS / "csd-autodev-priority"
+GPU_PLAN_CLI = SCRIPTS / "csd-gpu-plan"
+PROTECTED_REFS = frozenset({"main", "staging", "develop", "dev"})
+FORGEJO_ALLOW = frozenset({"tzervas/CogSynDelta", "tzervas/memory-gate"})
+WAN_BINDS = frozenset({"0.0.0.0", "::", "[::]"})
+PRIME_IP = FLEET.get("events.bind")
+HOST_GPU_B_IP = "203.0.113.11"
+HOMELAB_IP = "203.0.113.20"
+GUEST_IP_RE = re.compile(r"\b(192\.168\.1\.\d+)\b")
+
+
+def sh(args: list[str], timeout: int = 20) -> str:
+    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+    return (p.stdout or p.stderr or "").strip()
+
+
+def ssh_5080(cmd: str) -> str:
+    return sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", HOST_GPU_B, cmd])
+
+
+COMFY_STATUS_CMD = (
+    "systemctl is-enabled fleet-comfyui.service 2>/dev/null || echo unknown; "
+    "grep -qs fleet-comfyui-locked "
+    "/etc/systemd/system/fleet-comfyui.service.d/host-gpu-b-lock.conf "
+    "&& echo wrap-ready || echo wrap-missing"
+)
+
+
+def comfy_lab_field(enabled: str, wrap_ready: bool) -> str:
+    """Map systemd is-enabled + lock wrap to the lab comfy field.
+
+    Args:
+        enabled: ``systemctl is-enabled`` stdout (generated/enabled/masked).
+        wrap_ready: True when ExecStart drop-in is ``fleet-comfyui-locked``.
+
+    Returns:
+        ``masked``, ``wrapped``, or the raw enabled string.
+
+    Why: Quadlets report ``generated``. Mask is not the scheduler once the
+    host-gpu-b-lock wrap is live. Operator mask still wins if systemd is masked.
+    """
+    raw = (enabled or "").strip()
+    low = raw.lower()
+    if "masked" in low:
+        return "masked"
+    if wrap_ready:
+        return "wrapped"
+    return raw or "unknown"
+
+
+def parse_comfy_ssh(raw: str) -> str:
+    """Parse host-gpu-b comfy SSH blob into the lab status field.
+
+    Args:
+        raw: is-enabled line plus wrap-ready/wrap-missing.
+
+    Returns:
+        Lab comfy field (``wrapped`` / ``masked`` / raw systemd).
+    """
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+    enabled = lines[0] if lines else ""
+    wrap_ready = any("wrap-ready" in ln.lower() for ln in lines)
+    return comfy_lab_field(enabled, wrap_ready)
+
+
+def ssh_guest(cmd: str, host: str | None = None) -> str:
+    """Guest nvidia-smi when SSH works. Empty string on failure.
+
+    Why: 1080 Ti is VFIO on host-gpu-b; host smi is 5080-only. Try the live
+    guest_ip (catalog 203.0.113.12) once. Do not hang the 2s lab refresh.
+    """
+    raw = (host or GUEST_SSH or GUEST_IP or "").strip()
+    if not raw:
+        return ""
+    target = raw if not raw[0].isdigit() else f"tzervas@{raw}"
+    try:
+        p = subprocess.run(
+            [
+                "/usr/bin/ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                target,
+                cmd,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if p.returncode != 0:
+        return ""
+    return (p.stdout or "").strip()
+
+
+def localai_key() -> str:
+    return os.environ.get("LOCALAI_API_KEY") or os.environ.get("API_KEY") or ""
+
+
+def _read_json(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _latest_queue() -> dict:
+    """Running job, else newest result. Why: feed shows thinking, not catalog."""
+    if not QUEUE_DIR.is_dir():
+        return {}
+    running: dict = {}
+    newest: tuple[float, dict] | None = None
+    for path in QUEUE_DIR.glob("*.json"):
+        rec = _read_json(path)
+        if not rec:
+            continue
+        mtime = path.stat().st_mtime
+        if rec.get("status") == "running":
+            running = rec
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, rec)
+    if running:
+        return running
+    return newest[1] if newest else {}
+
+
+def _latest_autodev() -> dict:
+    if not AUTODEV_OUT.is_dir():
+        return {}
+    files = list(AUTODEV_OUT.glob("*.json"))
+    if not files:
+        return {}
+    return _read_json(max(files, key=lambda p: p.stat().st_mtime))
+
+
+def _files_touched(*recs: dict) -> list[str]:
+    """Unique applied paths from heartbeat last / autodev-out."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        applied = rec.get("applied") if isinstance(rec.get("applied"), dict) else {}
+        extra = rec.get("files") if isinstance(rec.get("files"), list) else []
+        applied_files = (
+            applied.get("files") if isinstance(applied.get("files"), list) else []
+        )
+        candidates = (
+            rec.get("path"),
+            applied.get("path"),
+            applied.get("wrote"),
+            *extra,
+            *applied_files,
+        )
+        for raw in candidates:
+            name = str(raw or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+            if len(out) >= 24:
+                return out
+    return out
+
+
+def _pytest_rc(*recs: dict) -> int | None:
+    """Forgejo/local pytest rc when present; else map required_succeeded."""
+    found: int | None = None
+    fallback: int | None = None
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        applied = rec.get("applied") if isinstance(rec.get("applied"), dict) else {}
+        pytest_rec = rec.get("pytest") if isinstance(rec.get("pytest"), dict) else {}
+        for src in (rec, applied, pytest_rec):
+            if src.get("pytest_rc") is not None:
+                found = int(src["pytest_rc"])
+                break
+            if src.get("rc") is not None and src is pytest_rec:
+                found = int(src["rc"])
+                break
+        if found is not None:
+            break
+        if rec.get("required_succeeded") is True:
+            found = 0
+            break
+        if rec.get("required_ran") is True:
+            found = 1
+            break
+        if fallback is None and rec.get("ok") is True:
+            fallback = 0
+        elif fallback is None and rec.get("ok") is False:
+            fallback = 1
+    return found if found is not None else fallback
+
+
+def _last_error(last: dict, aout: dict) -> str:
+    """Prefer last.error, then apply/git/pr/skipped."""
+    applied = last.get("applied") if isinstance(last.get("applied"), dict) else {}
+    a_applied = aout.get("applied") if isinstance(aout.get("applied"), dict) else {}
+    git = last.get("git") if isinstance(last.get("git"), dict) else {}
+    pr = last.get("pr") if isinstance(last.get("pr"), dict) else {}
+    for raw in (
+        last.get("error"),
+        applied.get("error"),
+        a_applied.get("error"),
+        git.get("error"),
+        pr.get("error"),
+        last.get("skipped"),
+        aout.get("skipped"),
+    ):
+        if raw:
+            return str(raw)[:240]
+    return ""
+
+
+def _receipt_5080(snap: dict) -> dict:
+    """5080 lock/comfy/helper receipt for the GPUs tab. Not an LLM think."""
+    plan = _read_json(GPU_PLAN)
+    gpu = plan.get("host-gpu-b") if isinstance(plan.get("host-gpu-b"), dict) else {}
+    lock = str(snap.get("host_gpu_b_lock") or gpu.get("lock") or "").strip()
+    comfy = str(snap.get("host_gpu_b_comfy") or gpu.get("comfy") or "").strip()
+    runner = str(snap.get("host_gpu_b_runner") or "").strip()
+    receipt = (
+        f"lock={lock or 'unknown'} comfy={comfy or 'unknown'} "
+        f"runner={runner or 'n/a'} helper_ok={gpu.get('helper_ok')} "
+        f"gguf={gpu.get('gguf_count')} role={gpu.get('role') or 'exclusive-cuda'}"
+    )
+    busy = bool(lock) and "idle" not in lock.lower()
+    qjob = _latest_queue()
+    kind = str(qjob.get("kind") or "")
+    hostish = str(qjob.get("alias") or "") + str(qjob.get("host") or "")
+    if qjob.get("status") in {"running", "queued"} and (
+        kind in {"cuda", "helper", "gpu-ci", "test"} or "5080" in hostish
+    ):
+        return {
+            "phase": "in-flight",
+            "alias": qjob.get("alias") or "host-gpu-b",
+            "prompt": str(qjob.get("prompt") or receipt)[:2000],
+            "text": receipt[:2000],
+            "goal": "exclusive-cuda",
+        }
+    return {
+        "phase": "in-flight" if busy else "cuda",
+        "alias": "host-gpu-b",
+        "prompt": receipt[:2000],
+        "text": receipt[:2000],
+        "goal": "exclusive-cuda",
+    }
+
+
+def _thinking_1080ti(loaded: list, ti: dict) -> dict:
+    """1080 Ti retrieve-index-light loaded/thinking. Never 5080 lock."""
+    aliases = [
+        str(x.get("alias")) for x in loaded if isinstance(x, dict) and x.get("alias")
+    ]
+    live = bool(ti.get("live"))
+    guest = str(ti.get("guest_ip") or GUEST_IP)
+    rag = str(ti.get("rag") or "retrieve-index-light")
+    if aliases:
+        body = "loaded " + " ".join(aliases) + f" rag={rag} guest={guest}"
+        return {
+            "phase": "in-flight" if live else "retrieve-index-light",
+            "alias": aliases[0],
+            "prompt": body[:2000],
+            "text": body[:2000],
+            "goal": rag,
+        }
+    body = f"guest_ip={guest} live={live} rag={rag} loaded=none"
+    return {
+        "phase": "retrieve-index-light",
+        "alias": None,
+        "prompt": body[:2000],
+        "text": body[:2000],
+        "goal": rag,
+    }
+
+
+def autodev_now() -> dict:
+    """Live Autodev pane: think text, in-flight prompt, files, pytest rc.
+
+    Why: the Autodev tab must show what local/code is doing now, not a
+    ticks JSON dump. Goals board stays on GET /api/goals.
+    """
+    qjob = _latest_queue()
+    aout = _latest_autodev()
+    hb = _read_json(HEARTBEAT)
+    last = hb.get("last") if isinstance(hb.get("last"), dict) else {}
+    inflight = ""
+    phase = "last"
+    if qjob.get("status") == "running":
+        inflight = str(qjob.get("prompt") or "")[:2000]
+        phase = "in-flight"
+    elif qjob.get("status") == "queued":
+        inflight = str(qjob.get("prompt") or "")[:2000]
+        phase = "queued"
+    text = str(aout.get("text") or qjob.get("result") or "")[:4000]
+    ok = last.get("ok")
+    if ok is None:
+        ok = aout.get("ok")
+    return {
+        "phase": phase,
+        "goal": str(last.get("goal") or aout.get("goal") or hb.get("next_goal") or "")[
+            :240
+        ],
+        "prompt": inflight,
+        "inflight": inflight,
+        "text": text,
+        "files": _files_touched(last, aout),
+        "pytest_rc": _pytest_rc(last, aout),
+        "ok": ok,
+        "error": _last_error(last, aout),
+        "alias": qjob.get("alias") or "local/code",
+    }
+
+
+def loaded_only() -> dict:
+    """Currently placed aliases from the router, expired dropped."""
+    st = _read_json(ROUTER_STATE)
+    now = time.time()
+    prime: list[dict] = []
+    gpu: list[dict] = []
+    ti: list[dict] = []
+    for alias, rec in (st.get("resident") or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        if float(rec.get("until") or 0) <= now:
+            continue
+        item = {"alias": alias, **rec}
+        host = rec.get("host")
+        if host == "host-gpu-b-1080ti":
+            ti.append(item)
+        elif host == "host-gpu-b":
+            gpu.append(item)
+        else:
+            prime.append(item)
+    return {
+        "prime": prime,
+        "host-gpu-b": gpu,
+        "host-gpu-b-1080ti": ti,
+        "parked": st.get("parked") or {},
+    }
+
+
+def _mib_to_gib(mib: int) -> float:
+    return round(mib / 1024, 1)
+
+
+def live_pool() -> dict:
+    """Sum live model-router VRAM for the pool tab.
+
+    Why: the 24+16 GiB default (39331 MiB) ignored the live 1080 Ti.
+    combined_mib is catalog vram_mib of live hosts; usable is safeguard_mib.
+
+    Returns:
+        Pool dict with combined_mib, usable_mib, cards, and GiB fields.
+    """
+    cat = _read_json(ROUTER_JSON)
+    hosts = cat.get("hosts") if isinstance(cat.get("hosts"), dict) else {}
+    cards: list[dict] = []
+    combined = 0
+    usable = 0
+    for name in ("host-a", "host-gpu-b", "host-gpu-b-1080ti"):
+        spec = hosts.get(name)
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("live") is False or spec.get("installed") is False:
+            continue
+        if name == "host-gpu-b-1080ti" and spec.get("live") is not True:
+            continue
+        vram = int(spec.get("vram_mib") or 0)
+        safeguard = int(spec.get("safeguard_mib") or vram)
+        combined += vram
+        usable += safeguard
+        cards.append(
+            {
+                "id": name,
+                "gpu": spec.get("gpu"),
+                "vram_mib": vram,
+                "safeguard_mib": safeguard,
+                "gib": _mib_to_gib(vram),
+                "usable_gib": _mib_to_gib(safeguard),
+                "live": True,
+            }
+        )
+    cat_pool = cat.get("pool") if isinstance(cat.get("pool"), dict) else {}
+    return {
+        "combined_mib": combined,
+        "usable_mib": usable,
+        "combined_gib": _mib_to_gib(combined),
+        "usable_gib": _mib_to_gib(usable),
+        "cards": cards,
+        "enabled": bool(cat_pool.get("enabled")),
+        "heterogeneous": True,
+        "not_mig": True,
+        "live_1080ti": any(c.get("id") == "host-gpu-b-1080ti" for c in cards),
+    }
+
+
+def live_feed(snap: dict) -> dict:
+    """Three-host live pane: loaded models, activity, honest latent note."""
+    loaded = loaded_only()
+    qjob = _latest_queue()
+    aout = _latest_autodev()
+    thinking = None
+    if qjob.get("status") == "running":
+        thinking = {
+            "phase": "in-flight",
+            "alias": qjob.get("alias"),
+            "prompt": str(qjob.get("prompt") or "")[:2000],
+        }
+    elif qjob.get("result") or aout.get("text"):
+        thinking = {
+            "phase": "last",
+            "alias": qjob.get("alias") or "local/code",
+            "text": str(qjob.get("result") or aout.get("text") or "")[:4000],
+            "goal": aout.get("goal"),
+        }
+    cluster = snap.get("cluster") if isinstance(snap.get("cluster"), dict) else {}
+    ti = (
+        cluster.get("host_gpu_c")
+        if isinstance(cluster.get("host_gpu_c"), dict)
+        else {}
+    )
+    pool = live_pool()
+    return {
+        "prime": {
+            "gpu": "RTX 3090 Ti Ampere sm_86",
+            "role": (cluster.get("prime") or {}).get("role") or "autodev-local-code",
+            "smi": snap.get("prime_smi"),
+            "loaded": loaded["prime"],
+            "thinking": thinking,
+            "latent": {
+                "kind": "kv-occupancy",
+                "note": (
+                    "GGUF decode has no public latent hook. VRAM used is "
+                    "weights+KV. CSD region latents are not in this console."
+                ),
+            },
+        },
+        "host-gpu-b": {
+            "gpu": "RTX 5080 Blackwell sm_120",
+            "role": (cluster.get("host-gpu-b") or {}).get("role") or "chat-comfy",
+            "smi": snap.get("host_gpu_b_smi"),
+            "lock": snap.get("host_gpu_b_lock"),
+            "comfy": snap.get("host_gpu_b_comfy"),
+            "loaded": loaded["host-gpu-b"],
+            "thinking": _receipt_5080(snap),
+            "latent": {
+                "kind": "embed-or-cuda",
+                "note": (
+                    "No LLM thinking on CUDA jobs. Embed probe appears when "
+                    "a helper is physically loaded (gguf_count>0)."
+                ),
+            },
+        },
+        "host_gpu_c": {
+            "gpu": "GTX 1080 Ti Pascal sm_61",
+            "role": ti.get("role") or "retrieve-index-light",
+            "smi": snap.get("guest_smi") or snap.get("host_gpu_c_smi"),
+            "loaded": loaded.get("host-gpu-b-1080ti") or [],
+            "thinking": _thinking_1080ti(loaded.get("host-gpu-b-1080ti") or [], ti),
+            "guest_ip": ti.get("guest_ip") or GUEST_IP,
+            "live": bool(ti.get("live", pool.get("live_1080ti"))),
+            "group": ti.get("group") or "fleet-rag",
+            "path": ti.get("path") or "lab.host-gpu-b.index.1080ti",
+            "rag": ti.get("rag") or "retrieve-index-light",
+            "latent": {
+                "kind": "retrieve-index-light",
+                "note": (
+                    "RAG/embed on Pascal. Not a 5080 substitute. No PoC CUDA, "
+                    "FP8/FP4, dual-14B, or llama.cpp RPC Stage B."
+                ),
+            },
+        },
+        "pool": {
+            **pool,
+            "parked": loaded["parked"],
+            "mode": "place-then-pool",
+            "mix": "single-or-mix when Stage B RPC is enabled",
+            "note": (
+                "Unified pool tab. Combined is live catalog VRAM "
+                "(3090+5080+1080 Ti when live), not a 24+16 default. "
+                "llama.cpp RPC is specified, not enabled."
+            ),
+        },
+        "cluster": cluster,
+    }
+
+
+def cluster_snapshot() -> dict:
+    """LAN cluster including 1080 Ti guest IP when the VFIO guest is live.
+
+    Why: lab UI and autodev must see host-gpu-b `.251` and a real guest IP (or
+    none). Do not invent `.252` or mark live without nvidia-smi / domifaddr.
+    """
+    cat = _read_json(ROUTER_JSON)
+    hosts = cat.get("hosts") or {}
+    stub = hosts.get("host-gpu-b-1080ti")
+    if not isinstance(stub, dict):
+        stub = (cat.get("future_hosts") or {}).get("host-gpu-b-1080ti")
+    if not isinstance(stub, dict):
+        stub = {}
+    raw = ssh_5080("virsh domifaddr host-gpu-b-1080ti-rag 2>/dev/null || true")
+    guest_ip = None
+    for match in GUEST_IP_RE.finditer(raw or ""):
+        ip = match.group(1)
+        if ip not in {HOST_GPU_B_IP, "203.0.113.99", "203.0.113.99"}:
+            guest_ip = ip
+            break
+    catalog_guest = stub.get("guest_ip")
+    if guest_ip is None and isinstance(catalog_guest, str) and catalog_guest.strip():
+        guest_ip = catalog_guest.strip()
+    live = bool(stub.get("live"))
+    rag = "retrieve-index-light" if live else "5080-embed-or-prime until live=true"
+    prime_spec = (
+        hosts.get("host-a") if isinstance(hosts.get("host-a"), dict) else {}
+    )
+    gpu_spec = hosts.get("host-gpu-b") if isinstance(hosts.get("host-gpu-b"), dict) else {}
+    backends = [
+        {
+            "id": "host-a",
+            "gpu": prime_spec.get("gpu") or "RTX 3090 Ti",
+            "arch": prime_spec.get("arch"),
+            "sm": prime_spec.get("sm"),
+            "vram_mib": prime_spec.get("vram_mib"),
+            "host_ip": PRIME_IP,
+            "live": True,
+            "group": "csd-autodev",
+            "role": prime_spec.get("role")
+            or (cat.get("roles") or {}).get("host-a")
+            or "autodev-local-code",
+        },
+        {
+            "id": "host-gpu-b",
+            "gpu": gpu_spec.get("gpu") or "RTX 5080",
+            "arch": gpu_spec.get("arch"),
+            "sm": gpu_spec.get("sm"),
+            "vram_mib": gpu_spec.get("vram_mib"),
+            "host_ip": HOST_GPU_B_IP,
+            "live": True,
+            "group": "csd-autodev",
+            "role": gpu_spec.get("role")
+            or (cat.get("roles") or {}).get("host-gpu-b")
+            or "chat-comfy",
+        },
+        {
+            "id": "host-gpu-b-1080ti",
+            "gpu": stub.get("gpu") or "GTX 1080 Ti",
+            "arch": stub.get("arch"),
+            "sm": stub.get("sm"),
+            "vram_mib": stub.get("vram_mib"),
+            "host_ip": HOST_GPU_B_IP,
+            "guest_ip": guest_ip,
+            "live": live,
+            "group": "fleet-rag",
+            "path": "lab.host-gpu-b.index.1080ti",
+            "role": stub.get("role") or "retrieve-index-light",
+            "rag": rag,
+        },
+    ]
+    return {
+        "backends": backends,
+        "count": len(backends),
+        "groups": ["csd-autodev", "fleet-rag"],
+        "heterogeneous": True,
+        "not_mig": True,
+        "roles": cat.get("roles")
+        or {
+            "host-a": "autodev local/code 14B Q4 32k",
+            "host-gpu-b": "chat+Comfy (CUDA exclusive-seq via lock)",
+            "host-gpu-b-1080ti": "retrieve-index-light",
+        },
+        "prime": {
+            "host": "prime",
+            "ip": PRIME_IP,
+            "role": prime_spec.get("role") or "autodev-local-code",
+        },
+        "host-gpu-b": {
+            "host": "host-gpu-b",
+            "ip": HOST_GPU_B_IP,
+            "role": gpu_spec.get("role") or "chat-comfy",
+        },
+        "homelab": {"host": "homelab", "ip": HOMELAB_IP, "role": "ui-cpu-ci"},
+        "host_gpu_c": {
+            "id": "host-gpu-b-1080ti",
+            "host": "host-gpu-b",
+            "host_ip": HOST_GPU_B_IP,
+            "guest_ip": guest_ip,
+            "live": live,
+            "pci": "06:00.0",
+            "group": "fleet-rag",
+            "path": "lab.host-gpu-b.index.1080ti",
+            "role": "retrieve-index-light",
+            "rag": rag,
+        },
+    }
+
+
+def snapshot() -> dict:
+    steer = {}
+    if STEER.is_file():
+        try:
+            steer = json.loads(STEER.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            steer = {"error": "invalid json"}
+    models: list[str] = []
+    lai = "down"
+    try:
+        req = urllib.request.Request(
+            f"{LOCALAI}/v1/models",
+            headers={"Authorization": f"Bearer {localai_key()}"} if localai_key() else {},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.load(resp)
+        models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+        lai = "ok"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        lai = "unreachable"
+    cluster = cluster_snapshot()
+    guest_ip = None
+    ti = (
+        cluster.get("host_gpu_c")
+        if isinstance(cluster.get("host_gpu_c"), dict)
+        else {}
+    )
+    guest_raw = ti.get("guest_ip")
+    if isinstance(guest_raw, str) and guest_raw.strip():
+        guest_ip = guest_raw.strip()
+    guest_smi = ""
+    if ti.get("live") and guest_ip:
+        guest_smi = ssh_guest(
+            "nvidia-smi --query-gpu=name,memory.used,memory.free,utilization.gpu "
+            "--format=csv,noheader",
+            host=guest_ip,
+        )
+    out = {
+        "prime_smi": sh(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.used,memory.free,utilization.gpu",
+                "--format=csv,noheader",
+            ]
+        ),
+        "localai": lai,
+        "models": models,
+        "localai_container": sh(
+            ["docker", "inspect", "-f", "{{.State.Status}}", "fleet-localai"]
+        ),
+        "host_gpu_b_smi": ssh_5080(
+            "nvidia-smi --format=csv,noheader "
+            "--query-gpu=name,memory.used,memory.free,utilization.gpu"
+        ),
+        "host_gpu_b_lock": ssh_5080(
+            "fuser /home/tzervas/fleet-harness/state/host-gpu-b.lock "
+            "2>/dev/null || echo idle"
+        ),
+        "host_gpu_b_runner": ssh_5080(
+            "systemctl --user is-active forgejo-runner-gpu-tzervas.service"
+        ),
+        "host_gpu_b_comfy": parse_comfy_ssh(ssh_5080(COMFY_STATUS_CMD)),
+        "guest_smi": guest_smi,
+        "host_gpu_c_smi": guest_smi,
+        "steer": steer,
+        "cluster": cluster,
+        "roles": cluster.get("roles") or {},
+        "note": "autodev webapp on code.example.com; chat on ai.example.com",
+        "links": {
+            "lab": "https://code.example.com",
+            "chat": "https://ai.example.com",
+            "forgejo": "https://git.example.com/tzervas/CogSynDelta",
+            "grafana": "https://grafana.example.com",
+            "logs": "https://loki.example.com",
+            "metrics": "https://vm.example.com",
+            "status": "https://status.example.com",
+        },
+    }
+    out["feed"] = live_feed(out)
+    out["app"] = autodev_app()
+    return out
+
+
+def autodev_app() -> dict:
+    """Queue, now-pane, ticks, and heartbeat last for the Autodev tab."""
+    queue: list[dict] = []
+    live: list[dict] = []
+    if QUEUE_DIR.is_dir():
+        files = sorted(QUEUE_DIR.glob("*.json"), key=lambda p: -p.stat().st_mtime)
+        for path in files:
+            if path.name.endswith(".result.json"):
+                continue
+            rec = _read_json(path)
+            item = {
+                "id": rec.get("id") or path.stem,
+                "status": rec.get("status"),
+                "kind": rec.get("kind"),
+                "alias": rec.get("alias"),
+                "prio": rec.get("prio"),
+            }
+            if rec.get("status") in {"queued", "running"}:
+                item["prompt"] = str(rec.get("prompt") or "")[:2000]
+            if item["status"] in {"queued", "running"}:
+                live.append(item)
+            elif len(queue) < 12:
+                queue.append(item)
+    goals = []
+    if GOALS.is_file():
+        goals = [
+            ln for ln in GOALS.read_text(encoding="utf-8").splitlines() if "| G-" in ln
+        ][:24]
+    ticks = []
+    if AUTODEV_OUT.is_dir():
+        files = sorted(AUTODEV_OUT.glob("*.json"), key=lambda p: -p.stat().st_mtime)[:8]
+        for path in files:
+            rec = _read_json(path)
+            ok = rec.get("ok")
+            if ok is None:
+                ok = rec.get("rc") == 0
+            ticks.append(
+                {
+                    "id": path.stem,
+                    "goal": str(rec.get("goal") or "")[:120],
+                    "ok": ok,
+                    "rc": rec.get("rc"),
+                    "pytest_rc": rec.get("pytest_rc"),
+                    "applied": rec.get("applied"),
+                    "files": _files_touched(rec),
+                }
+            )
+    cat = _read_json(ROUTER_JSON)
+    runtimes = {
+        name: {
+            "best_for": spec.get("best_for"),
+            "image": spec.get("image"),
+            "hosts": spec.get("hosts"),
+        }
+        for name, spec in (cat.get("runtimes") or {}).items()
+    }
+    hb = _read_json(HEARTBEAT)
+    last = hb.get("last") if isinstance(hb.get("last"), dict) else {}
+    aout = _latest_autodev()
+    age = time.time() - float(hb.get("t") or 0) if hb else None
+    heartbeat_last = {
+        "goal": str(last.get("goal") or "")[:240],
+        "ok": last.get("ok"),
+        "error": _last_error(last, aout),
+    }
+    return {
+        "queue_live": live,
+        "queue_recent_done": queue,
+        "queue": live or queue,
+        "worker_live": bool(age is not None and age < 90),
+        "worker_age_s": age,
+        "goals": goals,
+        "ticks": ticks,
+        "now": autodev_now(),
+        "heartbeat": {
+            "t": hb.get("t"),
+            "pid": hb.get("pid"),
+            "live": bool(age is not None and age < 90),
+            "identity": hb.get("identity") or "autodev",
+            "next_goal": hb.get("next_goal"),
+            "last": heartbeat_last,
+        },
+        "runtimes": runtimes,
+        "parallel": "3090 text + 5080 CUDA/helpers at once; interned GEMM later",
+    }
+
+
+def print_snap(s: dict) -> None:
+    print("=== host-a 3090 ===")
+    print(s.get("prime_smi"))
+    print("localai", s.get("localai_container"), s.get("localai"))
+    feed = s.get("feed") or {}
+    print(
+        "loaded prime",
+        [x.get("alias") for x in (feed.get("prime") or {}).get("loaded") or []],
+    )
+    print("=== host-gpu-b ===")
+    print(s.get("host_gpu_b_smi"))
+    print(
+        "lock",
+        s.get("host_gpu_b_lock"),
+        "runner",
+        s.get("host_gpu_b_runner"),
+        "comfy",
+        s.get("host_gpu_b_comfy"),
+    )
+    print(
+        "loaded 5080",
+        [x.get("alias") for x in (feed.get("host-gpu-b") or {}).get("loaded") or []],
+    )
+    print("=== host-gpu-b-1080ti ===")
+    print((feed.get("host_gpu_c") or {}).get("smi") or s.get("guest_smi"))
+    print(
+        "guest_ip",
+        (feed.get("host_gpu_c") or {}).get("guest_ip"),
+        "live",
+        (feed.get("host_gpu_c") or {}).get("live"),
+    )
+    print(
+        "loaded 1080ti",
+        [x.get("alias") for x in (feed.get("host_gpu_c") or {}).get("loaded") or []],
+    )
+    print("=== cluster ===")
+    print(json.dumps(s.get("cluster") or {}, indent=2))
+    print("=== steer ===")
+    print(json.dumps(s.get("steer") or {}, indent=2))
+    print(s.get("note"))
+
+
+def write_steer(**fields: object) -> dict:
+    cur: dict = {}
+    if STEER.is_file():
+        try:
+            cur = json.loads(STEER.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            cur = {}
+    cur.update({k: v for k, v in fields.items() if v is not None})
+    STEER.parent.mkdir(parents=True, exist_ok=True)
+    STEER.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+    return cur
+
+
+def list_sessions() -> list[dict]:
+    """Historic lab chats (daily files) plus autodev ticks."""
+    items: list[dict] = []
+    if SESS_DIR.is_dir():
+        for path in SESS_DIR.glob("chat-*.json"):
+            rec = _read_json(path)
+            turns = rec.get("turns") or []
+            title = ""
+            if turns:
+                title = str(turns[0].get("prompt") or "")[:80]
+            items.append(
+                {
+                    "id": path.stem,
+                    "kind": "chat",
+                    "t": path.stat().st_mtime,
+                    "n": len(turns),
+                    "title": title,
+                }
+            )
+    if AUTODEV_OUT.is_dir():
+        for path in AUTODEV_OUT.glob("*.json"):
+            rec = _read_json(path)
+            items.append(
+                {
+                    "id": f"autodev-{path.stem}",
+                    "kind": "autodev",
+                    "t": float(rec.get("t") or path.stat().st_mtime),
+                    "n": 1,
+                    "title": str(rec.get("goal") or path.stem)[:80],
+                }
+            )
+    items.sort(key=lambda r: -float(r.get("t") or 0))
+    return items[:200]
+
+
+def load_session(sid: str) -> dict:
+    """Load one historic session by id (chat-YYYY-MM-DD or autodev-TS)."""
+    if sid.startswith("autodev-"):
+        path = AUTODEV_OUT / f"{sid[len('autodev-') :]}.json"
+        rec = _read_json(path)
+        rec["id"] = sid
+        rec["kind"] = "autodev"
+        return rec
+    if ".." in sid or "/" in sid:
+        return {"error": "bad id"}
+    rec = _read_json(SESS_DIR / f"{sid}.json")
+    rec["id"] = sid
+    rec["kind"] = "chat"
+    return rec
+
+
+def append_chat(prompt: str, reply: str, alias: str) -> None:
+    """Append a lab chat turn to today's session file."""
+    SESS_DIR.mkdir(parents=True, exist_ok=True)
+    day = time.strftime("%Y-%m-%d")
+    path = SESS_DIR / f"chat-{day}.json"
+    rec = _read_json(path)
+    if not rec:
+        rec = {"id": f"chat-{day}", "kind": "chat", "turns": []}
+    rec.setdefault("turns", []).append(
+        {
+            "t": time.time(),
+            "alias": alias,
+            "prompt": prompt,
+            "reply": reply,
+        }
+    )
+    path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+
+
+def apply_token() -> str:
+    if os.environ.get("CSD_APPLY_TOKEN"):
+        return os.environ["CSD_APPLY_TOKEN"].strip()
+    if APPLY_TOKEN_FILE.is_file():
+        return APPLY_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def check_apply_auth(header: str) -> bool:
+    """Bearer token compare. Why: worktree writes without SSH."""
+    want = apply_token()
+    if not want:
+        return False
+    got = header or ""
+    if got.lower().startswith("bearer "):
+        got = got[7:].strip()
+    return hmac.compare_digest(got, want)
+
+
+def http_apply(worktree: str, rel: str, content: str) -> dict:
+    """Allowlisted worktree write. Never operator-main-wip."""
+    dest = WORKTREES.get(worktree)
+    if dest is None or not dest.is_dir():
+        return {"ok": False, "error": f"unknown worktree {worktree}"}
+    if dest.resolve() == PROTECTED_WT.resolve():
+        return {"ok": False, "error": "refusing operator-main-wip"}
+    rel = rel.lstrip("/")
+    if ".." in Path(rel).parts or not rel.startswith(ALLOW_PREFIXES):
+        return {"ok": False, "error": f"path not allowed: {rel}"}
+    if len(content) > 400_000:
+        return {"ok": False, "error": "content too large"}
+    target = (dest / rel).resolve()
+    if dest.resolve() not in target.parents:
+        return {"ok": False, "error": "escaped worktree"}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return {"ok": True, "wrote": str(target)}
+
+
+def _scrub(text: str) -> str:
+    """Strip token-like assignments from CLI text. Never print secrets."""
+    return re.sub(
+        r"(?i)(token|bearer|authorization|api[_-]?key)\s*[:=]\s*\S+",
+        r"\1=<redacted>",
+        text,
+    )
+
+
+def _parse_last_json(text: str) -> dict:
+    """Parse the last JSON object from CLI stdout."""
+    blob = (text or "").strip()
+    if not blob:
+        return {}
+    start = blob.rfind("{")
+    if start >= 0:
+        try:
+            data = json.loads(blob[start:])
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    for line in reversed(blob.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _run_cli(argv: list[str], timeout: int = 90) -> tuple[int, str]:
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    out = _scrub((p.stdout or "").strip())
+    err = _scrub((p.stderr or "").strip())
+    text = out if out else err
+    return p.returncode, text[:8000]
+
+
+def _forgejo_argv(rest: list[str]) -> list[str]:
+    """autodev Forgejo CLI; TOKEN from env or CSD vault. Never operator admin."""
+    cli = str(FORGEJO_CLI)
+    if os.environ.get("TOKEN") or os.environ.get("FORGEJO_TOKEN"):
+        return [cli, *rest]
+    return [SECRET_BIN, "exec", "TOKEN=git/autodev", "--", cli, *rest]
+
+
+def _repo_ok(raw: str) -> str | None:
+    name = raw if "/" in raw else f"tzervas/{raw}"
+    if name not in FORGEJO_ALLOW:
+        return None
+    return name
+
+
+def _as_int(val: object, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        n = default
+    return max(lo, min(n, hi))
+
+
+def lab_git(args: list[object]) -> dict:
+    """JSON wrap of scripts/csd-autodev-git. Never GitHub. Never protected trunks."""
+    if not args or not all(isinstance(a, str) for a in args):
+        return {"ok": False, "rc": 2, "stdout": "args must be a string array"}
+    argv = [str(a) for a in args]
+    if any("github.com" in a.lower() for a in argv):
+        return {"ok": False, "rc": 2, "stdout": "never GitHub"}
+    if any(
+        a == "-c" or a.startswith("--exec") or "credential" in a.lower() for a in argv
+    ):
+        return {"ok": False, "rc": 2, "stdout": "refusing git config/credential args"}
+    if argv[0] in {"push", "checkout", "switch", "merge", "rebase"}:
+        for a in argv[1:]:
+            for branch in PROTECTED_REFS:
+                if a == branch or a.endswith(f":{branch}") or a.endswith(f"/{branch}"):
+                    return {
+                        "ok": False,
+                        "rc": 2,
+                        "stdout": f"refusing {argv[0]} {branch}",
+                    }
+    try:
+        rc, text = _run_cli([str(GIT_CLI), *argv], timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "rc": 1, "stdout": str(exc)[:400]}
+    return {"ok": rc == 0, "rc": rc, "stdout": text}
+
+
+def lab_gpu(refresh: bool = False) -> dict:
+    """Wrap csd-gpu-plan. Prefer CSD_GPU_PLAN file to avoid extra SSH."""
+    if not refresh:
+        plan = _read_json(GPU_PLAN)
+        if plan.get("host-a") is not None and plan.get("host-gpu-b") is not None:
+            return plan
+    try:
+        rc, text = _run_cli([str(GPU_PLAN_CLI)], timeout=40)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    data = _parse_last_json(text)
+    if data.get("host-a") is not None:
+        return data
+    plan = _read_json(GPU_PLAN)
+    if plan:
+        return plan
+    return {"ok": False, "error": text[:400], "rc": rc}
+
+
+def lab_gpu_lock() -> dict:
+    """Observe host-gpu-b.lock from the plan. Acquire/release is not here."""
+    plan = lab_gpu(refresh=False)
+    g = plan.get("host-gpu-b") if isinstance(plan.get("host-gpu-b"), dict) else {}
+    return {
+        "lock": str(g.get("lock") or "unknown"),
+        "comfy": str(g.get("comfy") or "unknown"),
+        "helper_ok": bool(g.get("helper_ok")),
+    }
+
+
+def lab_priority(action: str) -> dict:
+    """Wrap csd-autodev-priority on|off|status. Never pause 3090 LocalAI."""
+    if action not in {"on", "off", "status"}:
+        return {"ok": False, "error": "action must be on|off|status"}
+    try:
+        _rc, text = _run_cli([str(PRIORITY_CLI), action], timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    steer: dict = {}
+    comfy = ""
+    webui = ""
+    for line in text.splitlines():
+        if line.startswith("steer="):
+            try:
+                parsed = json.loads(line[6:])
+            except json.JSONDecodeError:
+                parsed = {}
+            if isinstance(parsed, dict):
+                steer = parsed
+        elif line.startswith("comfy=") or line.startswith("comfy:"):
+            comfy = line.split(":", 1)[-1].split("=", 1)[-1].strip()
+        elif "webui" in line.lower():
+            webui = line.strip()
+    if not steer and STEER.is_file():
+        steer = _read_json(STEER)
+    return {"steer": steer, "comfy": comfy, "webui": webui}
+
+
+def lab_loop(mode: str) -> dict:
+    """Wrap csd-autodev-loop --once. Worker is systemd, not HTTP."""
+    if mode == "worker":
+        hb = _read_json(HEARTBEAT)
+        last = hb.get("last") if isinstance(hb.get("last"), dict) else {}
+        age = time.time() - float(hb.get("t") or 0) if hb.get("t") else None
+        live = bool(age is not None and age < 90)
+        return {
+            "ok": live,
+            "rc": 0 if live else 1,
+            "goal": str(last.get("goal") or ""),
+            "applied": last.get("applied")
+            if isinstance(last.get("applied"), dict)
+            else {},
+            "out": "",
+            "notes": (
+                "worker is systemd csd-autodev-loop.service; HTTP does not spawn it"
+            ),
+        }
+    if mode != "once":
+        return {
+            "ok": False,
+            "rc": 2,
+            "goal": "",
+            "applied": {},
+            "out": "mode must be once|worker",
+        }
+    try:
+        rc, text = _run_cli([str(LOOP_CLI), "--once"], timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "rc": 1, "goal": "", "applied": {}, "out": str(exc)[:400]}
+    rec = _parse_last_json(text)
+    applied = rec.get("applied") if isinstance(rec.get("applied"), dict) else {}
+    return {
+        "ok": bool(rec.get("ok")) if rec else rc == 0,
+        "rc": rc,
+        "goal": str(rec.get("goal") or ""),
+        "applied": applied,
+        "out": str(rec.get("out") or text[:2000]),
+    }
+
+
+def lab_forgejo(cmd: str, payload: dict) -> dict:
+    """JSON wrap of csd-autodev-forgejo. Allowlisted repos only."""
+    rest: list[str] = []
+    timeout = 90
+    if cmd == "whoami":
+        rest = ["whoami"]
+    elif cmd == "prs":
+        repo = str(payload.get("repo") or "")
+        if not _repo_ok(repo):
+            return {
+                "http": 400,
+                "repo": repo,
+                "pulls": [],
+                "error": "repo not allowlisted",
+            }
+        limit = _as_int(payload.get("limit"), 20, 1, 100)
+        rest = [
+            "prs",
+            repo,
+            "--state",
+            str(payload.get("state") or "open"),
+            "--limit",
+            str(limit),
+        ]
+    elif cmd == "pr-create":
+        repo = str(payload.get("repo") or "")
+        title = str(payload.get("title") or "")
+        head = str(payload.get("head") or "")
+        if not _repo_ok(repo) or not title or not head:
+            return {"http": 400, "error": "repo, title, head required"}
+        if head in PROTECTED_REFS:
+            return {"http": 400, "error": f"refusing head {head}"}
+        rest = [
+            "pr-create",
+            repo,
+            title,
+            head,
+            "--base",
+            str(payload.get("base") or "main"),
+            "--body",
+            str(payload.get("body") or ""),
+        ]
+    elif cmd == "status":
+        repo = str(payload.get("repo") or "")
+        sha = str(payload.get("sha") or "")
+        if not _repo_ok(repo) or not sha:
+            return {
+                "http": 400,
+                "state": "error",
+                "checks": [],
+                "error": "repo and sha required",
+            }
+        rest = ["status", repo, sha]
+    elif cmd == "wait":
+        repo = str(payload.get("repo") or "")
+        sha = str(payload.get("sha") or "")
+        if not _repo_ok(repo) or not sha:
+            return {"http": 400, "state": "error", "error": "repo and sha required"}
+        wait_t = _as_int(payload.get("timeout"), 1800, 1, 1800)
+        poll = _as_int(payload.get("poll"), 30, 1, 120)
+        rest = ["wait", repo, sha, "--timeout", str(wait_t), "--poll", str(poll)]
+        timeout = wait_t + poll + 15
+    elif cmd == "comment":
+        repo = str(payload.get("repo") or "")
+        body = str(payload.get("body") or "")
+        number = payload.get("number")
+        if not _repo_ok(repo) or not body or number is None:
+            return {"http": 400, "ok": False, "error": "repo, number, body required"}
+        rest = ["comment", repo, str(int(number)), body]
+    elif cmd == "merge-gate":
+        repo = str(payload.get("repo") or "")
+        sha = str(payload.get("sha") or "")
+        number = payload.get("number")
+        if not _repo_ok(repo) or not sha or number is None:
+            return {
+                "ok": False,
+                "state": "error",
+                "merged": False,
+                "required_ran": False,
+                "required_succeeded": False,
+                "notes": "repo, sha, number required",
+            }
+        rest = ["merge-gate", repo, sha, str(int(number))]
+        timeout = 120
+    else:
+        return {"ok": False, "error": f"unknown forgejo cmd {cmd}"}
+    try:
+        rc, text = _run_cli(_forgejo_argv(rest), timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "http": 0, "error": str(exc)[:200]}
+    rec = _parse_last_json(text)
+    if not rec:
+        rec = {"ok": rc == 0, "error": text[:400]}
+    rec.setdefault("ok", rc == 0)
+    return rec
+
+
+def _qs_payload(query: str) -> dict:
+    q = parse_qs(query)
+    out: dict = {}
+    for key, vals in q.items():
+        if not vals:
+            continue
+        out[key] = vals[0]
+    for key in ("limit", "number", "timeout", "poll"):
+        if key in out:
+            try:
+                out[key] = int(out[key])
+            except (TypeError, ValueError):
+                out.pop(key, None)
+    if "pause" in out:
+        out["pause"] = str(out["pause"]).lower() in {"1", "true", "yes"}
+    if "refresh" in out:
+        out["refresh"] = str(out["refresh"]).lower() in {"1", "true", "yes"}
+    if "autodev_priority" in out:
+        out["autodev_priority"] = str(out["autodev_priority"]).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+    return out
+
+
+def _merged_p1_ids(text: str) -> set[str]:
+    """IDs listed as merged in the Phase 1 board or GOALS.md."""
+    found: set[str] = set()
+    for line in text.splitlines():
+        idx = line.lower().find("merged")
+        if idx < 0:
+            continue
+        prefix = line[:idx]
+        for match in re.finditer(r"P1-(\d+)\.\.P1-(\d+)", prefix):
+            start, end = int(match.group(1)), int(match.group(2))
+            for i in range(start, end + 1):
+                found.add(f"P1-{i:02d}")
+        for match in re.finditer(r"P1-\d+", prefix):
+            found.add(match.group(0))
+    return found
+
+
+def _parse_phase1_board(text: str, next_goal: str) -> list[dict]:
+    """Parse PHASE-1-TASK-BOARD.md sequenced rows into JSON."""
+    merged = _merged_p1_ids(text)
+    goals_text = GOALS.read_text(encoding="utf-8") if GOALS.is_file() else ""
+    if goals_text:
+        merged |= _merged_p1_ids(goals_text)
+        for line in goals_text.splitlines():
+            if "| met |" not in line:
+                continue
+            hit = re.search(r"P1-\d+", line)
+            if hit:
+                merged.add(hit.group(0))
+    blocked = {"P1-05"}
+    nxt = (next_goal or "").strip()
+    rows: list[dict] = []
+    for line in text.splitlines():
+        match = re.match(
+            r"^\|\s*`(P1-\d+)`\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|",
+            line,
+        )
+        if not match:
+            continue
+        pid, depends, title, gate, alloc = (g.strip() for g in match.groups())
+        if pid in blocked:
+            status = "blocked"
+        elif nxt and (pid == nxt or nxt.startswith(pid)):
+            status = "next"
+        elif pid in merged:
+            status = "done"
+        else:
+            status = "open"
+        branch = ""
+        bm = re.search(r"`([^`]+)`\s*$", title)
+        if not bm:
+            bm = re.search(r"—\s*`([^`]+)`", title)
+        if bm:
+            branch = bm.group(1)
+        rows.append(
+            {
+                "id": pid,
+                "depends": depends,
+                "title": title,
+                "branch": branch,
+                "acceptance": gate[:400],
+                "allocation": alloc[:240],
+                "status": status,
+            }
+        )
+    return rows
+
+
+def csd_vault_path() -> Path:
+    """CSD vault only. Never the operator ~/.secrets or model vaults."""
+    raw = os.environ.get("CSD_VAULT") or os.environ.get("SECRET_VAULT")
+    path = Path(raw) if raw else Path("/fleet-data/cabal/csd-vault")
+    return path
+
+
+def hf_autodev_gap() -> dict:
+    """Live presence of hf/autodev without reading token bytes.
+
+    Why: goals API must report mint HF when the CSD vault name is missing.
+    Never copy gpu/huggingface-token. Never walk operator secrets.
+
+    Returns:
+        Dict with autodev bool, gap, mint steps, and private repo names.
+    """
+    vault = csd_vault_path()
+    refused = vault.resolve() == OPERATOR_SECRETS.resolve()
+    present = False
+    if not refused and vault.is_dir():
+        hf_dir = vault / "hf"
+        if hf_dir.is_dir():
+            present = any(
+                p.is_file() and p.stat().st_size > 0 and p.name.startswith("autodev")
+                for p in hf_dir.iterdir()
+            )
+    return {
+        "autodev": present,
+        "gap": None if present else "mint HF",
+        "vault": "refused-operator-vault" if refused else str(vault),
+        "mint": HF_MINT,
+        "never_copy": "gpu/huggingface-token",
+        "repos": [
+            "tzervas/cogsyndelta-region-stream_vae-tiny",
+            "tzervas/cogsyndelta-region-residual_mlp-tiny",
+            "tzervas/cogsyndelta-region-route-tiny",
+            "tzervas/cogsyndelta-tiny",
+            "tzervas/cogsyndelta-small",
+            "tzervas/cogsyndelta-medium",
+        ],
+        "publish": (
+            "private tzervas/cogsyndelta-region-<name>-<size> then "
+            "tzervas/cogsyndelta-<size> only after mint and a "
+            "green receipt in benchmark_results/scale_ladder.json"
+        ),
+    }
+
+
+def load_scale_ladder() -> dict:
+    """Receipt file for ladder rungs. green=true is a Grafana sat only."""
+    path = Path(os.environ.get("CSD_SCALE_LADDER") or str(SCALE_LADDER))
+    rec = _read_json(path)
+    rungs = rec.get("rungs") if isinstance(rec.get("rungs"), list) else []
+    return {
+        "ok": bool(rungs),
+        "path": str(path),
+        "schema": rec.get("schema"),
+        "doc": rec.get("doc") or "docs/program/CSD-SCALE-LADDER.md",
+        "grafana_sat": rec.get("grafana_sat")
+        if isinstance(rec.get("grafana_sat"), dict)
+        else {},
+        "rungs": rungs,
+        "any_green": any(
+            bool(row.get("green")) for row in rungs if isinstance(row, dict)
+        ),
+    }
+
+
+def scale_ladder_prom() -> str:
+    """Prometheus exposition from scale_ladder.json. 1 only if green is true."""
+    rec = load_scale_ladder()
+    lines = [
+        "# HELP csd_scale_ladder_rung_green 1 when scale_ladder.json green is true",
+        "# TYPE csd_scale_ladder_rung_green gauge",
+    ]
+    for row in rec.get("rungs") or []:
+        if not isinstance(row, dict):
+            continue
+        n = int(row.get("n") or 0)
+        size = re.sub(r"[^a-z0-9_]+", "", str(row.get("size") or "unknown").lower())
+        val = 1 if row.get("green") is True else 0
+        lines.append(f'csd_scale_ladder_rung_green{{rung="{n}",size="{size}"}} {val}')
+    return "\n".join(lines) + "\n"
+
+
+def need_grok_path() -> Path:
+    """Return the ping mailbox path (CSD_GROK_NEED)."""
+    return Path(os.environ.get("CSD_GROK_NEED", str(GROK_NEED)))
+
+
+def cap_need_grok(rec: dict) -> dict:
+    """Keep ping JSON at or under 2 KiB. Drop dumps, never transcripts."""
+    out = {k: v for k, v in rec.items() if k not in PING_DROP}
+    out["identity"] = "autodev"
+    if out.get("need") is not True:
+        return {"need": False}
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    if len(raw) <= PING_MAX:
+        return out
+    out.pop("tried", None)
+    raw = json.dumps(out, separators=(",", ":")).encode()
+    if len(raw) <= PING_MAX:
+        return out
+    out.pop("paths", None)
+    evidence = str(out.get("evidence") or "")
+    while len(json.dumps(out, separators=(",", ":")).encode()) > PING_MAX:
+        if len(evidence) > 40:
+            evidence = evidence[: max(40, len(evidence) // 2)]
+            out["evidence"] = evidence
+            continue
+        q = str(out.get("question") or "")
+        if len(q) > 40:
+            out["question"] = q[:40]
+            continue
+        break
+    return out
+
+
+def load_need_grok() -> dict:
+    """Read ping mailbox plus file mtime. Missing file is need=false."""
+    path = need_grok_path()
+    rec = _read_json(path)
+    mtime = path.stat().st_mtime if path.is_file() else 0.0
+    enabled = need_grok_enabled()
+    return {
+        "ok": True,
+        "need": False if not enabled else rec.get("need") is True,
+        "enabled": enabled,
+        "identity": rec.get("identity") or "autodev",
+        "question": rec.get("question") or "",
+        "evidence": rec.get("evidence") or "",
+        "goal": rec.get("goal") or "",
+        "blocker": rec.get("blocker") or "",
+        "paths": rec.get("paths") if isinstance(rec.get("paths"), list) else [],
+        "tried": rec.get("tried") if isinstance(rec.get("tried"), list) else [],
+        "t": rec.get("t"),
+        "mtime": mtime,
+        "path": str(path),
+        "hosted_grok": False,
+    }
+
+
+def write_need_grok_mailbox(payload: dict) -> dict:
+    """Write/merge ping mailbox. Never spawn grok. Cap 2 KiB.
+
+    Why: GET/POST /api/grok-need only rewrite the file. Hosted Grok wakes
+    when the operator opens a session after need=true.
+    """
+    path = need_grok_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not need_grok_enabled():
+        rec = {"need": False, "enabled": False, "ok": True, "hosted_grok": False}
+        path.write_text(
+            json.dumps({"need": False, "enabled": False}) + "\n", encoding="utf-8"
+        )
+        rec["mtime"] = path.stat().st_mtime
+        return rec
+    if payload.get("need") is not True:
+        rec: dict = {"need": False}
+        path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+        rec.update({"ok": True, "mtime": path.stat().st_mtime, "hosted_grok": False})
+        return rec
+    cur = _read_json(path)
+    merged = {**cur, **payload, "need": True, "identity": "autodev"}
+    if not merged.get("t"):
+        merged["t"] = int(time.time())
+    rec = cap_need_grok(merged)
+    path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    rec["ok"] = True
+    rec["mtime"] = path.stat().st_mtime
+    rec["hosted_grok"] = False
+    return rec
+
+
+def need_grok_prom() -> str:
+    """Prometheus gauges from mailbox JSON and file mtime.
+
+    Why: Grafana pages maintainers@ once when need=true. Mtime changes only
+    when the file is rewritten, so loop ticks do not re-fire the alert.
+    """
+    rec = load_need_grok()
+    enabled = 1 if rec.get("enabled") else 0
+    need = 1 if rec.get("need") is True else 0
+    mtime = int(rec.get("mtime") or 0)
+    return (
+        "# HELP csd_need_grok 1 when csd-need-grok.json need is true\n"
+        "# TYPE csd_need_grok gauge\n"
+        f'csd_need_grok{{identity="autodev"}} {need}\n'
+        "# HELP csd_need_grok_enabled 1 when CSD_NEED_GROK feature flag is on\n"
+        "# TYPE csd_need_grok_enabled gauge\n"
+        f"csd_need_grok_enabled {enabled}\n"
+        "# HELP csd_need_grok_mtime_seconds Unix mtime of the ping mailbox\n"
+        "# TYPE csd_need_grok_mtime_seconds gauge\n"
+        f"csd_need_grok_mtime_seconds {mtime}\n"
+    )
+
+
+def lab_metrics() -> str:
+    """Lab /metrics: scale ladder plus need_grok. Never hosted Grok."""
+    return scale_ladder_prom() + need_grok_prom()
+
+
+def lab_goals() -> dict:
+    """PHASE-1 board plus steer next_goal and autodev heartbeat.
+
+    Why: the lab Goals/Todos tab must render from GET /api/goals JSON, not
+    a second Open WebUI. Steer note/reasoning stay in CSD_STEER.
+
+    Returns:
+        Dict with ok, next_goal, steer, notes, reasoning, heartbeat, phase1,
+        todos, scale_ladder, and hf (honest mint-HF gap when unminted).
+    """
+    steer = _read_json(STEER)
+    next_goal = str(steer.get("next_goal") or "").strip()
+    notes = str(steer.get("note") or steer.get("notes") or "")
+    reasoning = str(steer.get("reasoning") or notes)
+    board_text = PHASE1.read_text(encoding="utf-8") if PHASE1.is_file() else ""
+    phase1 = _parse_phase1_board(board_text, next_goal)
+    todos = [row for row in phase1 if row.get("status") in {"next", "open"}]
+    ng = next_goal.lower()
+    if "region-pretrain" in ng or ("region" in ng and "pretrain" in ng):
+        todos.insert(
+            0,
+            {
+                "id": "region-pretrain",
+                "depends": "PoC-1",
+                "title": ("PRETRAIN LatentVAE on WikiText-2 train (failing test first)"),
+                "branch": "feat/agent-harness",
+                "acceptance": (
+                    "last_loss < first_loss on "
+                    "Salesforce/wikitext wikitext-2-raw-v1 train"
+                ),
+                "allocation": ("3090 local/code; 5080 tiny CUDA later; 1080 Ti RAG"),
+                "status": "next",
+            },
+        )
+    hb = _read_json(HEARTBEAT)
+    last = hb.get("last") if isinstance(hb.get("last"), dict) else {}
+    age = None
+    if hb.get("t"):
+        age = time.time() - float(hb.get("t") or 0)
+    cluster = hb.get("cluster") if isinstance(hb.get("cluster"), dict) else {}
+    mailbox = hb.get("need_grok") if isinstance(hb.get("need_grok"), dict) else {}
+    heartbeat = {
+        "t": hb.get("t"),
+        "pid": hb.get("pid"),
+        "wt": hb.get("wt"),
+        "age_s": age,
+        "live": bool(age is not None and age < 90),
+        "identity": hb.get("identity") or "autodev",
+        "next_goal": str(hb.get("next_goal") or next_goal),
+        "ti": hb.get("ti"),
+        "cluster": cluster,
+        "need_grok": mailbox or load_need_grok(),
+        "last": {
+            "ok": last.get("ok"),
+            "goal": str(last.get("goal") or "")[:240],
+            "error": _last_error(last, {}),
+            "applied": last.get("applied")
+            if isinstance(last.get("applied"), dict)
+            else {},
+            "skipped": last.get("skipped"),
+        },
+    }
+    return {
+        "ok": bool(phase1),
+        "next_goal": next_goal,
+        "steer": steer,
+        "notes": notes,
+        "reasoning": reasoning,
+        "heartbeat": heartbeat,
+        "phase1": phase1,
+        "todos": todos,
+        "source": {
+            "board": "docs/program/PHASE-1-TASK-BOARD.md",
+            "steer": str(STEER),
+            "heartbeat": str(HEARTBEAT),
+            "scale_ladder": "docs/program/CSD-SCALE-LADDER.md",
+        },
+        "scale_ladder": load_scale_ladder(),
+        "hf": hf_autodev_gap(),
+        "grok_need": load_need_grok(),
+    }
+
+
+def _resource_routes(method: str, path: str, payload: dict) -> tuple[int, dict] | None:
+    """Shared resource surface: runs, agents, leases (+ sessions via serve)."""
+    from csd_autodev import events as run_events
+    from csd_autodev import store
+
+    if path == "/api/runs":
+        if method == "GET":
+            return 200, store.list_runs()
+        if method == "POST":
+            return 200, store.create_run(payload if isinstance(payload, dict) else {})
+        return 405, {"ok": False, "error": "GET or POST"}
+    if path.startswith("/api/runs/"):
+        rest = path[len("/api/runs/") :]
+        parts = [p for p in rest.split("/") if p]
+        if not parts:
+            return 404, {"ok": False, "error": "not found"}
+        run_id = parts[0]
+        if len(parts) == 1:
+            if method == "GET":
+                rec = store.get_run(run_id)
+                code = 404 if rec.get("error") == "not found" else 200
+                return code, rec
+            if method == "PATCH":
+                body = payload if isinstance(payload, dict) else {}
+                patch = {k: body[k] for k in store._RUN_UPDATE_KEYS if k in body}
+                try:
+                    rec = store.update_run(run_id, patch)
+                except ValueError as exc:
+                    return 400, {"ok": False, "error": str(exc), "run_id": run_id}
+                if rec is None:
+                    return 404, {"ok": False, "error": "not found", "run_id": run_id}
+                return 200, rec
+            return 405, {"ok": False, "error": "GET or PATCH"}
+        sub = parts[1]
+        if sub == "events":
+            if method == "GET":
+                # JSON poll (SSE is handled in do_GET). after= from payload/qs.
+                try:
+                    after = int(payload.get("after") or 0)
+                except (TypeError, ValueError):
+                    after = 0
+                return 200, {
+                    "ok": True,
+                    "run_id": run_id,
+                    "events": run_events.list_events(run_id, after=after),
+                }
+            if method == "POST":
+                body = payload if isinstance(payload, dict) else {}
+                kind = str(body.get("kind") or "")
+                try:
+                    ev = run_events.append_event(
+                        run_id,
+                        kind,
+                        body.get("payload")
+                        if isinstance(body.get("payload"), dict)
+                        else {
+                            k: v
+                            for k, v in body.items()
+                            if k not in {"kind", "payload", "checkpoint_sha256", "run_id"}
+                        },
+                        checkpoint_sha256=body.get("checkpoint_sha256"),
+                    )
+                except ValueError as exc:
+                    return 400, {"ok": False, "error": str(exc)}
+                return 200, {"ok": True, "event": ev}
+            return 405, {"ok": False, "error": "GET or POST"}
+        if sub == "input":
+            if method != "POST":
+                return 405, {"ok": False, "error": "POST"}
+            return 200, run_events.post_input(
+                run_id, payload if isinstance(payload, dict) else {}
+            )
+        if sub == "override" and len(parts) >= 3 and parts[2] == "consume":
+            if method != "POST":
+                return 405, {"ok": False, "error": "POST"}
+            return 200, run_events.consume_override(run_id)
+        if sub == "call":
+            if method != "POST":
+                return 405, {"ok": False, "error": "POST"}
+            body = payload if isinstance(payload, dict) else {}
+            action = str(body.get("action") or "").strip().lower()
+            if action == "clear":
+                return 200, run_events.clear_call(run_id)
+            try:
+                pid = int(body.get("pid"))
+            except (TypeError, ValueError):
+                return 400, {"ok": False, "error": "pid required"}
+            argv = body.get("argv") if isinstance(body.get("argv"), list) else None
+            return 200, run_events.register_call(run_id, pid, argv=argv)
+        return 404, {"ok": False, "error": "not found"}
+    if path == "/api/decisions":
+        from csd_autodev import decisions
+
+        if method == "GET":
+            return 200, decisions.table_summary()
+        if method == "POST":
+            return 200, decisions.evaluate(payload if isinstance(payload, dict) else {})
+        return 405, {"ok": False, "error": "GET or POST"}
+    if path == "/api/escalations":
+        from csd_autodev import escalations as esc
+
+        if method == "GET":
+            body = payload if isinstance(payload, dict) else {}
+            return 200, esc.list_escalations(status=body.get("status"))
+        if method == "POST":
+            try:
+                rec = esc.open_escalation(payload if isinstance(payload, dict) else {})
+            except esc.EscalationContractError as exc:
+                return 400, {"ok": False, "error": str(exc)}
+            return 200, {"ok": True, "escalation": rec}
+        return 405, {"ok": False, "error": "GET or POST"}
+    if path.startswith("/api/escalations/"):
+        from csd_autodev import escalations as esc
+
+        ident = path[len("/api/escalations/") :]
+        if ident == "stats":
+            if method != "GET":
+                return 405, {"ok": False, "error": "GET"}
+            return 200, esc.stats()
+        if method == "GET":
+            rec = esc.get_escalation(ident)
+            code = 404 if rec.get("error") else 200
+            return code, rec
+        if method == "PATCH":
+            try:
+                rec = esc.resolve_escalation(
+                    ident, payload if isinstance(payload, dict) else {}
+                )
+            except esc.EscalationContractError as exc:
+                return 400, {"ok": False, "error": str(exc)}
+            if rec is None:
+                return 404, {"ok": False, "error": "not found", "escalation_id": ident}
+            return 200, rec
+        return 405, {"ok": False, "error": "GET or PATCH"}
+    if path == "/api/agents":
+        if method == "GET":
+            return 200, store.list_agents()
+        if method == "POST":
+            return 200, store.create_agent(payload if isinstance(payload, dict) else {})
+        return 405, {"ok": False, "error": "GET or POST"}
+    if path.startswith("/api/agents/"):
+        agent_id = path[len("/api/agents/") :]
+        if method == "GET":
+            rec = store.get_agent(agent_id)
+            code = 404 if rec.get("error") == "not found" else 200
+            return code, rec
+        return 405, {"ok": False, "error": "GET"}
+    if path == "/api/leases":
+        if method == "GET":
+            return 200, store.list_leases()
+        if method == "POST":
+            return 200, store.create_lease(payload if isinstance(payload, dict) else {})
+        return 405, {"ok": False, "error": "GET or POST"}
+    if path.startswith("/api/leases/"):
+        lease_id = path[len("/api/leases/") :]
+        if method == "GET":
+            rec = store.get_lease(lease_id)
+            code = 404 if rec.get("error") == "not found" else 200
+            return code, rec
+        return 405, {"ok": False, "error": "GET"}
+    return None
+
+
+def handle_lab(method: str, path: str, payload: dict) -> tuple[int, dict] | None:
+    """Lab JSON routes wrapping existing CLIs. None = not a wrap route."""
+    if len(path) > 1:
+        path = path.rstrip("/")
+    hit = _resource_routes(method, path, payload)
+    if hit is not None:
+        return hit
+    if path == "/api/gpu":
+        return 200, lab_gpu(refresh=bool(payload.get("refresh")))
+    if path == "/api/gpu/lock":
+        return 200, lab_gpu_lock()
+    if path == "/api/git":
+        if method != "POST":
+            return 405, {"ok": False, "rc": 405, "stdout": "POST args"}
+        args = payload.get("args") if isinstance(payload.get("args"), list) else []
+        return 200, lab_git(args)
+    if path == "/api/loop":
+        if method != "POST":
+            return 405, {"ok": False, "rc": 405, "out": "POST mode"}
+        return 200, lab_loop(str(payload.get("mode") or ""))
+    if path == "/api/priority":
+        return 200, lab_priority(str(payload.get("action") or "status"))
+    if path == "/api/steer":
+        if method == "GET":
+            return 200, _read_json(STEER)
+        if method == "POST":
+            return 200, write_steer(**payload)
+        return 405, {"ok": False, "error": "GET or POST"}
+    if path == "/api/goals":
+        return 200, lab_goals()
+    if path in ("/api/grok-need", "/api/need-grok"):
+        if method == "GET":
+            return 200, load_need_grok()
+        if method == "POST":
+            return 200, write_need_grok_mailbox(payload)
+        return 405, {"ok": False, "error": "GET or POST", "hosted_grok": False}
+    if path == "/metrics":
+        return 200, {"ok": True, "exposition": lab_metrics()}
+    if path == "/api/forgejo/whoami":
+        return 200, lab_forgejo("whoami", payload)
+    if path == "/api/forgejo/prs":
+        return 200, lab_forgejo("prs", payload)
+    if path == "/api/forgejo/pr-create":
+        if method != "POST":
+            return 405, {"http": 405, "error": "POST"}
+        return 200, lab_forgejo("pr-create", payload)
+    if path == "/api/forgejo/status":
+        return 200, lab_forgejo("status", payload)
+    if path == "/api/forgejo/wait":
+        return 200, lab_forgejo("wait", payload)
+    if path == "/api/forgejo/comment":
+        if method != "POST":
+            return 405, {"http": 405, "ok": False}
+        return 200, lab_forgejo("comment", payload)
+    if path == "/api/forgejo/merge-gate":
+        if method != "POST":
+            return 405, {
+                "ok": False,
+                "state": "error",
+                "merged": False,
+                "notes": "POST",
+            }
+        return 200, lab_forgejo("merge-gate", payload)
+    return None
+
+
+def lab_bind() -> str:
+    """LAN bind only. Why: never expose the lab agent on WAN 0.0.0.0."""
+    bind = os.environ.get("CSD_LAB_BIND", FLEET.get("events.bind"))
+    if bind in WAN_BINDS:
+        raise SystemExit("refusing WAN bind 0.0.0.0")
+    return bind
+
+
+def spawn_alias(alias: str, why: str) -> dict:
+    """Stand a catalog alias on 3090 or 5080 without dual 14B."""
+    router = Path(__file__).resolve().parents[1] / "scripts/csd-model-router"
+    p = subprocess.run(
+        [str(router), "request", "--alias", alias, "--why", why, "--noping"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    try:
+        rec = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        rec = {"ok": False, "error": (p.stdout or p.stderr or "")[:400]}
+    rec["rc"] = p.returncode
+    return rec
+
+
+def comfy_tool(cmd: str, payload: dict | None = None) -> dict:
+    """Lab JSON wrap of scripts/csd-comfy. Fail-closed when masked."""
+    script = Path(__file__).resolve().parent / "csd-comfy"
+    p = subprocess.run(
+        [str(script), cmd],
+        input=json.dumps(payload or {}),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=45,
+    )
+    try:
+        rec = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        rec = {"ok": False, "notes": (p.stderr or p.stdout or "bad json")[:400]}
+    if not isinstance(rec, dict):
+        return {"ok": False, "notes": "bad json"}
+    return rec
+
+
+def chat(prompt: str) -> str:
+    body = json.dumps(
+        {
+            "model": "local/code",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 512,
+            "temperature": 0.2,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"{LOCALAI}/v1/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {localai_key()}"} if localai_key() else {}),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        data = json.load(resp)
+    text = str(
+        ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    )
+    append_chat(prompt, text, "local/code")
+    return text
+
+
+def proxy_upstream(
+    method: str,
+    path_qs: str,
+    body: bytes | None = None,
+    extra_headers: dict | None = None,
+) -> tuple[int, bytes]:
+    """Homelab UI → prime GPU agent. Why: cards are inference providers only."""
+    headers = dict(extra_headers or {})
+    if body is not None:
+        headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(
+        UPSTREAM + path_qs,
+        data=body,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except OSError as exc:
+        return 502, json.dumps(
+            {"error": "prime agent down", "detail": str(exc)[:200]}
+        ).encode()
+
+
+def lab_root_redirect(path: str) -> str | None:
+    """Send ``/`` to ``/lab`` so JS BASE is ``/lab`` (avoids 500 on bare host)."""
+    if path in ("/", "/goals", "/todos"):
+        return "/lab"
+    return None
+
+
+def serve(port: int) -> None:
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            """Silence BaseHTTPRequestHandler's stderr log.
+
+            INTENTIONAL: the console logs its own requests, and the base
+            class would duplicate every one of them onto stderr.
+            """
+            return
+
+        def _write_body(self, raw: bytes) -> None:
+            if getattr(self, "_omit_body", False):
+                return
+            self.wfile.write(raw)
+
+        def _send(self, code: int, raw: bytes, ctype: str = "application/json") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self._write_body(raw)
+
+        def _sse_run_events(self, run_id: str, *, after: int = 0) -> None:
+            """Gapless SSE feed; resume from ``after`` with no missing seq (R3-A2)."""
+            from csd_autodev import events as run_events
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            if getattr(self, "_omit_body", False):
+                return
+            cursor = int(after)
+            # Bound the live tail so unit/integration tests can finish; production
+            # clients disconnect when done. Override with CSD_SSE_MAX_SEC.
+            try:
+                max_sec = float(os.environ.get("CSD_SSE_MAX_SEC", "3600"))
+            except ValueError:
+                max_sec = 3600.0
+            deadline = time.time() + max(1.0, max_sec)
+            try:
+                while time.time() < deadline:
+                    batch = run_events.wait_events(run_id, after=cursor, timeout=1.0)
+                    for ev in batch:
+                        self.wfile.write(run_events.format_sse(ev))
+                        self.wfile.flush()
+                        cursor = int(ev.get("seq") or cursor)
+                    # Heartbeat comment keeps proxies from closing idle streams.
+                    if not batch:
+                        self.wfile.write(b": tick\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+        def do_HEAD(self) -> None:
+            """Probes (curl -I, CDNs) 501 without this; public `/` looked dead."""
+            self._omit_body = True
+            try:
+                self.do_GET()
+            finally:
+                self._omit_body = False
+
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            loc = lab_root_redirect(path)
+            if loc is not None:
+                self.send_response(302)
+                self.send_header("Location", loc)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path in ("/lab", "/lab/", "/lab/goals", "/lab/todos"):
+                body = PAGE.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self._write_body(body)
+                return
+            parsed = urlparse(self.path)
+            apipath = parsed.path[4:] if parsed.path.startswith("/lab/") else parsed.path
+            if apipath in ("/metrics", "/api/metrics"):
+                self._send(
+                    200,
+                    lab_metrics().encode(),
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
+                return
+            if UPSTREAM and apipath.startswith("/api/"):
+                qs = parsed.path + (("?" + parsed.query) if parsed.query else "")
+                extra = {}
+                if self.headers.get("Authorization"):
+                    extra["Authorization"] = self.headers.get("Authorization") or ""
+                code, raw = proxy_upstream("GET", qs, extra_headers=extra)
+                self._send(code, raw)
+                return
+            if apipath.startswith("/api/status"):
+                try:
+                    raw = json.dumps(snapshot()).encode()
+                    code = 200
+                except Exception as exc:
+                    raw = json.dumps({"ok": False, "error": str(exc)[:300]}).encode()
+                    code = 200
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self._write_body(raw)
+                return
+            if apipath.startswith("/api/sessions"):
+                q = parse_qs(parsed.query)
+                sid = (q.get("id") or [""])[0]
+                body = load_session(sid) if sid else {"sessions": list_sessions()}
+                raw = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self._write_body(raw)
+                return
+            if apipath.startswith("/api/comfy/list-workflows"):
+                q = parse_qs(parsed.query)
+                src = (q.get("source") or ["catalog"])[0]
+                rec = comfy_tool("list-workflows", {"source": src})
+                self._send(200, json.dumps(rec).encode())
+                return
+            if apipath.startswith("/api/comfy/prompt-status"):
+                q = parse_qs(parsed.query)
+                pid = (q.get("prompt_id") or [""])[0]
+                rec = comfy_tool("prompt-status", {"prompt_id": pid})
+                self._send(200, json.dumps(rec).encode())
+                return
+            # SSE live feed: GET /api/runs/{id}/events?after=SEQ (R3-A2).
+            events_match = re.match(r"^/api/runs/([^/]+)/events$", apipath)
+            if events_match:
+                q = parse_qs(parsed.query)
+                fmt = (q.get("format") or ["sse"])[0].lower()
+                try:
+                    after = int((q.get("after") or ["0"])[0])
+                except ValueError:
+                    after = 0
+                run_id = events_match.group(1)
+                if fmt == "json":
+                    from csd_autodev import events as run_events
+
+                    rec = {
+                        "ok": True,
+                        "run_id": run_id,
+                        "events": run_events.list_events(run_id, after=after),
+                    }
+                    self._send(200, json.dumps(rec).encode())
+                    return
+                self._sse_run_events(run_id, after=after)
+                return
+            hit = handle_lab("GET", apipath, _qs_payload(parsed.query))
+            if hit is not None:
+                code, rec = hit
+                self._send(code, json.dumps(rec).encode())
+                return
+            self.send_error(404)
+
+        def do_POST(self) -> None:
+            n = int(self.headers.get("Content-Length") or "0")
+            raw_in = self.rfile.read(n)
+            postpath = urlparse(self.path).path
+            if postpath.startswith("/lab/"):
+                postpath = postpath[4:]
+            if UPSTREAM and postpath.startswith("/api/"):
+                extra = {}
+                if self.headers.get("Authorization"):
+                    extra["Authorization"] = self.headers.get("Authorization") or ""
+                code, raw = proxy_upstream("POST", postpath, raw_in, extra_headers=extra)
+                self._send(code, raw)
+                return
+            payload = json.loads(raw_in or b"{}")
+            if postpath == "/api/apply":
+                if not check_apply_auth(self.headers.get("Authorization") or ""):
+                    self._send(401, b'{"error":"unauthorized"}')
+                    return
+                rec = http_apply(
+                    str(payload.get("worktree") or ""),
+                    str(payload.get("path") or ""),
+                    str(payload.get("content") or ""),
+                )
+                raw = json.dumps(rec).encode()
+                self._send(200 if rec.get("ok") else 400, raw)
+                return
+            if not isinstance(payload, dict):
+                payload = {}
+            hit = handle_lab("POST", postpath, payload)
+            if hit is not None:
+                code, rec = hit
+                self._send(code, json.dumps(rec).encode())
+                return
+            if postpath == "/api/steer":
+                raw = json.dumps(write_steer(**payload)).encode()
+            elif postpath == "/api/spawn":
+                raw = json.dumps(
+                    spawn_alias(
+                        str(payload.get("alias") or "local/code"),
+                        str(payload.get("why") or "lab"),
+                    )
+                ).encode()
+            elif postpath == "/api/chat":
+                text = chat(str(payload.get("prompt") or ""))
+                raw = json.dumps({"content": text}).encode()
+            elif postpath == "/api/comfy/list-workflows":
+                raw = json.dumps(comfy_tool("list-workflows", payload)).encode()
+            elif postpath == "/api/comfy/queue-prompt":
+                raw = json.dumps(comfy_tool("queue-prompt", payload)).encode()
+            elif postpath == "/api/comfy/prompt-status":
+                raw = json.dumps(comfy_tool("prompt-status", payload)).encode()
+            elif postpath == "/api/comfy/flux-klein-4b":
+                raw = json.dumps(comfy_tool("flux-klein-4b", payload)).encode()
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self._write_body(raw)
+
+        def do_PATCH(self) -> None:
+            n = int(self.headers.get("Content-Length") or "0")
+            raw_in = self.rfile.read(n)
+            patchpath = urlparse(self.path).path
+            if patchpath.startswith("/lab/"):
+                patchpath = patchpath[4:]
+            if UPSTREAM and patchpath.startswith("/api/"):
+                extra = {}
+                if self.headers.get("Authorization"):
+                    extra["Authorization"] = self.headers.get("Authorization") or ""
+                code, raw = proxy_upstream(
+                    "PATCH", patchpath, raw_in, extra_headers=extra
+                )
+                self._send(code, raw)
+                return
+            try:
+                payload = json.loads(raw_in or b"{}")
+            except json.JSONDecodeError:
+                self._send(400, b'{"ok":false,"error":"invalid json"}')
+                return
+            if not isinstance(payload, dict):
+                payload = {}
+            hit = handle_lab("PATCH", patchpath, payload)
+            if hit is None:
+                self.send_error(404)
+                return
+            code, rec = hit
+            self._send(code, json.dumps(rec).encode())
+
+    bind = lab_bind()
+    httpd = ThreadingHTTPServer((bind, port), H)
+    print(f"csd-lab-console http://{bind}:{port}/lab")
+    httpd.serve_forever()
+
+
+# The console's single page. It used to live here as a 928-line triple-quoted
+# string, which meant ruff linted HTML, CSS and JavaScript as if it were Python:
+# 30 of this repo's 46 E501 findings were minified JS lines, and they turned the
+# gate red for every pull request. A file also has to carry the extension that
+# matches its contents -- markup in a .py-linted file is exactly the case the
+# rule exists for.
+#
+# Read once at import, so a missing asset fails loudly at startup rather than as
+# a blank page on the first request.
+PAGE_FILE = ROOT / "web/lab-console.html"
+try:
+    PAGE = PAGE_FILE.read_text(encoding="utf-8")
+except OSError as exc:  # pragma: no cover - deployment error, not a code path
+    raise SystemExit(
+        f"csd-lab-console: cannot read its page asset {PAGE_FILE}: {exc}. "
+        "The deploy must ship web/ alongside scripts/."
+    ) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Service (--http) or thin HTTP client (every other operator path)."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    # Service mode is the only in-process entry; clients talk HTTP (R1).
+    if "--http" in argv_list:
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--http", type=int, metavar="PORT", required=True)
+        args = ap.parse_args(argv_list)
+        serve(args.http)
+        return 0
+    from csd_client.cli import main as client_main
+
+    return int(client_main(argv_list))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

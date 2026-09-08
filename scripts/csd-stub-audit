@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Audit unfinished functions against the stub contract.
+
+WHY THIS EXISTS. docs/AGENT-ORGANISATION.md states the contract in full -- every
+stub carries GOAL/BLOCKED/UNBLOCK/SEQUENCE, `raise NotImplementedError` beats a
+silent body, and "the stub audit runs every cycle, so a stub whose blocker has
+landed becomes an actionable task automatically rather than waiting to be
+noticed". No such audit existed: the same document lists "stub audit" as item 3
+of work still to be decomposed. A contract nothing checks is a comment, and the
+failure it was written to prevent -- a stub that outlives everyone's memory of
+it -- is precisely the one that leaves no trace until someone calls the function.
+
+So this reads the source and reports what is THERE. It proposes nothing: a stub
+is legitimate work-in-progress, and an audit that treated every stub as a defect
+would push agents into writing plausible-looking bodies instead of annotating
+honest gaps, which is strictly worse than the gap.
+
+What it reports, per stub:
+  - file, line, qualified name, and which of the four markers are MISSING
+  - the GOAL id, checked against the goals file when --goals is given: an id
+    that names no row, and an id whose row already says `done`, are both
+    failures -- the second is the exact case the contract is about
+  - a silent body (pass / ... / return None) as a WARNING, never a failure,
+    because it is indistinguishable from a working function at runtime
+
+What it deliberately does not flag: `abstractmethod`, `typing.overload`, and
+anything inside a Protocol or ABC. Those bodies are `...` because the interface
+IS the declaration; calling them unfinished work would make the audit noise, and
+an audit that cries wolf gets `|| true`-d into a no-op in CI.
+
+It also reads extensionless files with a Python shebang. Every script in this
+repo is one -- `csd-repo-survey`'s `rglob("*.py")` sees zero of the 19 -- so an
+audit that matched only *.py would have reported this repo clean without ever
+opening its source.
+
+Usage:
+    csd-stub-audit <path> [--goals GOALS.md] [--json]
+
+Exit: 0 no failures (warnings allowed), 1 failures, 2 bad usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import pathlib
+import re
+import sys
+
+SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    "target",
+    ".mypy_cache",
+    ".pytest_cache",
+    "dist",
+    "build",
+}
+
+REQUIRED = ("GOAL", "BLOCKED", "UNBLOCK", "SEQUENCE")
+OPTIONAL = ("OWNER",)
+
+# AN INTENTIONAL NO-OP IS NOT A STUB. `def log_message(self, *a): pass` on a
+# BaseHTTPRequestHandler is a COMPLETE implementation whose behaviour is "do
+# nothing" -- three of them in this repo silence the stdlib's stderr spam, and
+# the audit failed all three because the contract had no way to say so.
+#
+# The escape hatch is deliberately narrow: it demands a REASON on the same line.
+# `INTENTIONAL:` alone would be a way to silence the audit; `INTENTIONAL: <why>`
+# is a claim someone can read and disagree with, which is the same standard the
+# four required markers hold a real stub to. Without the reason it is still a
+# failure.
+INTENTIONAL = "INTENTIONAL"
+
+# `...` in a Protocol body is a declaration, not an unfinished function. Same
+# for an overload signature, whose body is never executed at all.
+INTERFACE_BASES = {"Protocol", "ABC", "ABCMeta"}
+INTERFACE_DECORATORS = {
+    "abstractmethod",
+    "abstractproperty",
+    "abstractclassmethod",
+    "abstractstaticmethod",
+    "overload",
+}
+
+# A body that returns instead of raising leaves no evidence at the call site.
+SILENT_BODIES = {"pass", "ellipsis", "return-none", "docstring-only"}
+SILENT_WHY = "a silent stub is indistinguishable from a working function at runtime"
+
+
+def dotted(node: ast.AST) -> str:
+    """Last name of a decorator or exception expression.
+
+    Matching on the last segment only is deliberate: `abstractmethod`,
+    `abc.abstractmethod` and `abc.abstractmethod()` are the same intent written
+    three ways, and a check that only knew the bare name would audit every ABC
+    in the repo as unfinished work.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return dotted(node.func)
+    return ""
+
+
+def is_python(path: pathlib.Path) -> bool:
+    if path.suffix == ".py":
+        return True
+    if path.suffix:
+        return False
+    try:
+        with path.open("rb") as fh:
+            first = fh.readline(200)
+    except OSError:
+        return False
+    return first.startswith(b"#!") and b"python" in first
+
+
+def is_test_file(rel: pathlib.Path) -> bool:
+    name = rel.name
+    return (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or "tests" in rel.parts
+        or name == "conftest.py"
+    )
+
+
+def py_files(root: pathlib.Path):
+    if root.is_file():
+        yield root
+        return
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        if is_test_file(p.relative_to(root)):
+            continue
+        if is_python(p):
+            yield p
+
+
+def body_kind(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """Name the stub shape, or None when the function actually does something."""
+    body = list(fn.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+        if not body:
+            return "docstring-only"
+    if len(body) != 1:
+        return None
+    stmt = body[0]
+    if isinstance(stmt, ast.Pass):
+        return "pass"
+    if (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and stmt.value.value is Ellipsis
+    ):
+        return "ellipsis"
+    if isinstance(stmt, ast.Return):
+        if stmt.value is None:
+            return "return-none"
+        if isinstance(stmt.value, ast.Constant) and stmt.value.value is None:
+            return "return-none"
+    if (
+        isinstance(stmt, ast.Raise)
+        and stmt.exc is not None
+        and dotted(stmt.exc) == "NotImplementedError"
+    ):
+        return "notimplemented"
+    return None
+
+
+def annotation_text(fn: ast.FunctionDef | ast.AsyncFunctionDef, lines: list[str]) -> str:
+    """Docstring plus the comment block adjacent to the function.
+
+    The contract's example puts the markers in a docstring, but a stub written
+    as a bare `...` under a comment block carries exactly the same information
+    and there is no reason to fail it for the choice of syntax. Comments inside
+    the body count too -- that is where an annotation lands when someone adds it
+    to an existing `pass`.
+    """
+    parts: list[str] = []
+    doc = ast.get_docstring(fn)
+    if doc:
+        parts.append(doc)
+
+    first = min([d.lineno for d in fn.decorator_list] + [fn.lineno])
+    above: list[str] = []
+    i = first - 2
+    while i >= 0:
+        stripped = lines[i].strip()
+        if not stripped.startswith("#"):
+            break
+        above.append(stripped.lstrip("#").strip())
+        i -= 1
+    parts.extend(reversed(above))
+
+    end = fn.end_lineno or fn.lineno
+    for line in lines[fn.lineno - 1 : end]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            parts.append(stripped.lstrip("#").strip())
+    return "\n".join(parts)
+
+
+def markers(text: str) -> dict[str, str]:
+    found = {}
+    for name in REQUIRED + OPTIONAL + (INTENTIONAL,):
+        hit = re.search(rf"^\s*(?:#\s*)?{name}:[ \t]*(.*)$", text, re.M)
+        if hit:
+            found[name] = hit.group(1).strip()
+    return found
+
+
+def parse_goals(path: pathlib.Path) -> tuple[dict[str, str], str]:
+    """Goal id -> state, read from the markdown tables the goals files use.
+
+    The last cell is the state because that is the shape `csd-autodev-loop`
+    already writes and closes (`| G-PROVE-1 | first | open |`); reading it any
+    other way would make the audit and the loop disagree about which goals are
+    still open.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    rows: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        gid = cells[0]
+        if not gid or set(gid) <= set("-: "):
+            continue
+        rows[gid] = cells[-1].lower()
+    return rows, text
+
+
+def find_stubs(path: pathlib.Path, root: pathlib.Path) -> tuple[list[dict], dict | None]:
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        # One unparseable file must not take the audit down with it: the audit
+        # runs every cycle over a tree an agent is actively editing, so a
+        # half-written file is the normal case, not the exceptional one.
+        return [], {
+            "path": str(path.relative_to(root)),
+            "error": "SyntaxError",
+            "detail": str(e.msg),
+            "line": e.lineno,
+        }
+    except (OSError, ValueError) as e:
+        return [], {
+            "path": str(path.relative_to(root)),
+            "error": type(e).__name__,
+            "detail": str(e),
+            "line": None,
+        }
+
+    lines = src.splitlines()
+    rel = str(path.relative_to(root))
+    out: list[dict] = []
+
+    def walk(node: ast.AST, prefix: str, in_interface: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                bases = {dotted(b) for b in child.bases}
+                bases |= {dotted(k.value) for k in child.keywords if k.arg == "metaclass"}
+                walk(
+                    child,
+                    f"{prefix}{child.name}.",
+                    in_interface or bool(bases & INTERFACE_BASES),
+                )
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                decs = {dotted(d) for d in child.decorator_list}
+                skip = in_interface or bool(decs & INTERFACE_DECORATORS)
+                if not skip:
+                    kind = body_kind(child)
+                    if kind is not None:
+                        out.append(record(child, prefix, kind, lines, rel))
+                walk(child, f"{prefix}{child.name}.", False)
+            else:
+                walk(child, prefix, in_interface)
+
+    walk(tree, "", False)
+    return out, None
+
+
+def record(fn, prefix: str, kind: str, lines: list[str], rel: str) -> dict:
+    found = markers(annotation_text(fn, lines))
+    # A stated intention, with its reason, discharges the stub contract: this is
+    # finished work that does nothing, not unfinished work.
+    reason = (found.get(INTENTIONAL) or "").strip()
+    if reason:
+        return {
+            "path": rel,
+            "line": fn.lineno,
+            "name": f"{prefix}{fn.name}",
+            "body": kind,
+            "present": [INTENTIONAL],
+            "missing": [],
+            "goal": None,
+            "owner": found.get("OWNER"),
+            "intentional": reason,
+            "compliant": True,
+            "failures": [],
+            "warnings": [],
+        }
+    missing = [m for m in REQUIRED if m not in found]
+    goal = (found.get("GOAL") or "").split()[0] if found.get("GOAL") else None
+    return {
+        "path": rel,
+        "line": fn.lineno,
+        "name": f"{prefix}{fn.name}",
+        "body": kind,
+        "present": sorted(found),
+        "missing": missing,
+        "goal": goal,
+        "owner": found.get("OWNER"),
+        "compliant": not missing,
+        "failures": [],
+        "warnings": [],
+    }
+
+
+def judge(stubs: list[dict], goals: dict[str, str] | None, goals_text: str) -> None:
+    for s in stubs:
+        if s["missing"]:
+            s["failures"].append(
+                "missing "
+                + ", ".join(s["missing"])
+                + " -- an unannotated stub has no stated blocker and no place "
+                "in the sequence, so nothing can ever schedule it"
+            )
+        if s["body"] in SILENT_BODIES:
+            s["warnings"].append(SILENT_WHY)
+        if goals is None or not s["goal"]:
+            continue
+        gid = s["goal"]
+        if gid in goals:
+            # The row exists and is already closed. This is the exact case the
+            # contract is written against: the goal was marked done, everyone
+            # stopped thinking about it, and the stub it was tracking is still
+            # here waiting to be called.
+            if goals[gid] == "done":
+                s["failures"].append(f"its goal {gid} is closed but the stub remains")
+        elif not re.search(rf"\b{re.escape(gid)}\b", goals_text):
+            s["failures"].append(f"{gid} names a goal that does not exist")
+
+
+def audit(root: pathlib.Path, goals_path: pathlib.Path | None) -> dict:
+    goals, goals_text = (None, "")
+    if goals_path is not None:
+        goals, goals_text = parse_goals(goals_path)
+
+    stubs: list[dict] = []
+    unreadable: list[dict] = []
+    scanned = 0
+    for p in py_files(root):
+        scanned += 1
+        found, bad = find_stubs(p, root if root.is_dir() else root.parent)
+        stubs.extend(found)
+        if bad:
+            unreadable.append(bad)
+
+    judge(stubs, goals, goals_text)
+    return {
+        "root": str(root),
+        "goals_file": str(goals_path) if goals_path else None,
+        "files_scanned": scanned,
+        "stubs": stubs,
+        "unreadable": unreadable,
+        "failures": sum(len(s["failures"]) for s in stubs),
+        "warnings": sum(len(s["warnings"]) for s in stubs),
+    }
+
+
+def report(a: dict) -> None:
+    root = pathlib.Path(a["root"])
+    stubs = a["stubs"]
+    failing = [s for s in stubs if s["failures"]]
+    warning = [s for s in stubs if not s["failures"] and s["warnings"]]
+    clean = [s for s in stubs if not s["failures"] and not s["warnings"]]
+
+    print(
+        f"  {root.name}: {a['files_scanned']} python file(s), "
+        f"{len(stubs)} stub(s), {a['failures']} failure(s), "
+        f"{a['warnings']} warning(s), "
+        f"{len(a['unreadable'])} unreadable file(s)\n"
+    )
+
+    if failing:
+        print(f"  --- FAIL: stubs outside the contract ({len(failing)}) ---")
+        for s in failing:
+            print(f"    {s['path']}:{s['line']}  {s['name']}()")
+            # A failing stub's warnings are printed here rather than only in
+            # the WARN section: the header counts them, and a count with no
+            # matching line reads as a truncated report.
+            for f in s["failures"] + s["warnings"]:
+                print(f"      {f}")
+            if s["missing"]:
+                print(
+                    "      -> add "
+                    + "/".join(f"{m}:" for m in s["missing"])
+                    + " to its docstring (docs/AGENT-ORGANISATION.md)"
+                )
+            else:
+                print("      -> fix the id, or reopen the goal row, or finish the stub")
+
+    if warning:
+        print(f"\n  --- WARN: annotated but silent ({len(warning)}) ---")
+        for s in warning:
+            print(f"    {s['path']}:{s['line']}  {s['name']}()  body is `{s['body']}`")
+            print(f"      {SILENT_WHY}")
+            goal = s["goal"] or "GOAL"
+            print(f'      -> raise NotImplementedError("{goal}") instead')
+
+    if clean:
+        print(f"\n  --- OK: annotated and sequenced ({len(clean)}) ---")
+        for s in clean:
+            owner = f"  owner {s['owner']}" if s["owner"] else ""
+            print(f"    {s['path']}:{s['line']}  {s['name']}()  goal {s['goal']}{owner}")
+
+    if a["unreadable"]:
+        print(f"\n  --- unreadable, NOT audited ({len(a['unreadable'])}) ---")
+        for u in a["unreadable"]:
+            where = f":{u['line']}" if u["line"] else ""
+            print(f"    {u['path']}{where}  {u['error']}: {u['detail']}")
+            print("      -> a file that will not parse hides every stub in it")
+
+    if not stubs and not a["unreadable"]:
+        print("  No stubs. Nothing is waiting on a blocker here.")
+
+    print("\n  Stubs are allowed. Unannotated stubs are not: docs/AGENT-ORGANISATION.md.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("path")
+    ap.add_argument(
+        "--goals", default=None, help="goals file every GOAL: id must name a live row in"
+    )
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    root = pathlib.Path(a.path).resolve()
+    if not root.exists():
+        print(f"no such path: {root}", file=sys.stderr)
+        return 2
+
+    goals_path = None
+    if a.goals is not None:
+        goals_path = pathlib.Path(a.goals).resolve()
+        if not goals_path.is_file():
+            # Silently auditing without the goals check would report a clean
+            # gate for a check that never ran, which is the failure mode the
+            # test collection allow-list already caused once in this repo.
+            print(f"no such goals file: {goals_path}", file=sys.stderr)
+            return 2
+
+    result = audit(root, goals_path)
+    if a.json:
+        print(json.dumps(result, indent=2))
+    else:
+        report(result)
+    return 1 if result["failures"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

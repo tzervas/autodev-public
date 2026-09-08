@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Cut a Forgejo release, and only when the repository is actually done.
+
+WHY A TOOL AND NOT A COMMAND. "Fully polished" is unbounded, so a pipeline
+without a definition of done never advances past its first repository. This
+encodes the definition from docs/PROGRAM.md and REFUSES to tag anything that does
+not meet it -- which makes "done" a fact about the repo rather than a judgement
+somebody made when they got tired of it.
+
+WHAT IT CHECKS, each by running the tool that owns it:
+  adopted to the house standard          csd-repo-onboard
+  no critical or high security findings  csd-security-scan
+  every medium fixed or annotated        csd-security-scan --release
+  no unannotated stubs                   csd-stub-audit
+  the repo's own suite passes            its declared test command
+  CI CLEAN on the default branch         csd-ci-scrutiny
+  no open goals                          the goal file
+
+NEVER PUBLISHES OUTWARD. A Forgejo release and a git tag, nothing else. No
+registry, no package index, no mirror. Publishing outward is a decision that
+stays with the operator, and a tool that could do it by accident is a tool that
+eventually will.
+
+An absent checker is a REFUSAL, not a pass. A release that says "done" because
+nothing was able to look is the worst artefact this pipeline could produce.
+
+Usage:
+    csd-release <repo-path> --repo owner/name [--tag v0.1.0] [--dry-run]
+Exit: 0 released (or would) · 1 not ready · 2 usage · 3 could not verify
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        This copy used to `return default` -- so a standalone run resolved
+        forge.api to None and failed later, somewhere else, while the seven
+        other copies of this fallback read the committed config correctly. A
+        fallback that cannot do the job is not a fallback; it is a delayed
+        failure. test_fleet_fallbacks.py now pins all of them to the same
+        behaviour, because eight copies is eight chances to write it wrong.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+FORGE_API = os.environ.get("AUTODEV_FORGE_API", FLEET.get("forge.api"))
+CHECKS = [
+    ("adopted", ROOT / "scripts/csd-repo-onboard", []),
+    ("security-merge", ROOT / "scripts/csd-security-scan", []),
+    ("security-release", ROOT / "scripts/csd-security-scan", ["--release"]),
+    ("stubs", ROOT / "scripts/csd-stub-audit", []),
+]
+
+
+def run(argv: list[str], cwd: Path | None = None, timeout: int = 900):
+    try:
+        p = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, "not found"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+
+
+def api(method: str, path: str, token: str, body: dict | None = None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        FORGE_API + path,
+        data=data,
+        method=method,
+        headers={"Authorization": f"token {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw.strip() else {})
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()[:400].decode("utf-8", "replace")
+
+
+def already_released(repo: str, token: str, head: str) -> str:
+    """The tag already on this commit, if there is one.
+
+    A RELEASE NEEDS SOMETHING TO RELEASE. Nothing checked, so every pass of the
+    gate cut another version from the same tree: v0.1.2, v0.1.3 and v0.1.4 all
+    point at 1783642. The ladder runs csd-release on every adoption tick, so an
+    idle repository would have accumulated a version per tick, each one telling
+    a consumer that something changed.
+
+    Compared by COMMIT rather than by counting merges since the last tag: what a
+    tag means is "this tree", and two tags on one tree is the thing to prevent.
+    """
+    st, tags = api("GET", f"/repos/{repo}/tags?limit=50", token)
+    if st != 200 or not isinstance(tags, list):
+        return ""
+    for t in tags:
+        sha = str((t.get("commit") or {}).get("sha") or "")
+        if sha and head and sha.startswith(head[:12]):
+            return str(t.get("name") or "")
+    return ""
+
+
+def next_tag(repo: str, token: str) -> str:
+    """The next patch version, or v0.1.0 for a first release.
+
+    Derived from what the forge already has rather than from a file in the repo:
+    a VERSION file and the tags drift, and the tags are what a consumer sees.
+    """
+    st, tags = api("GET", f"/repos/{repo}/tags?limit=50", token)
+    best = (0, 0, 0)
+    if st == 200 and isinstance(tags, list):
+        for t in tags:
+            m = re.match(r"v?(\d+)\.(\d+)\.(\d+)$", str(t.get("name") or ""))
+            if m:
+                best = max(best, tuple(int(g) for g in m.groups()))
+    if best == (0, 0, 0):
+        return "v0.1.0"
+    return f"v{best[0]}.{best[1]}.{best[2] + 1}"
+
+
+def notes(repo: str, token: str, since_tag: str | None) -> str:
+    """Release notes from the PRs that merged, not from a model.
+
+    The merged titles are what actually changed; asking a model to summarise them
+    adds a place for the notes to be wrong about the code.
+    """
+    st, pulls = api("GET", f"/repos/{repo}/pulls?state=closed&limit=50", token)
+    lines = []
+    if st == 200 and isinstance(pulls, list):
+        for p in sorted(pulls, key=lambda x: x.get("number") or 0):
+            if p.get("merged"):
+                lines.append(f"- #{p['number']} {p.get('title')}")
+    body = "\n".join(lines[-40:]) or "- (no merged pull requests found)"
+    return f"## Merged\n\n{body}\n"
+
+
+def unreleased_work(path: Path, base: str = "main") -> list:
+    """Anything in this worktree that the merge target does not have.
+
+    THE CHECKS RUN AGAINST A WORKING TREE, and a release is cut from the BRANCH.
+    Those are the same thing only when the tree is clean and merged, and on
+    2026-09-08 they were not: the agent had `.shellcheckrc` as an unpushed local
+    commit, `adopted` passed because the file was on disk, and the rung reported
+    READY for a release that would have shipped without it.
+
+    A gate that passes on work nobody else can see is not a gate. Reported as a
+    blocker rather than a warning, because the whole point of the rung is that
+    its evidence is checkable by someone other than the agent that produced it.
+    """
+    out = []
+
+    rc, o = run(["git", "status", "--porcelain"], cwd=path, timeout=60)
+    if rc == 0 and o.strip():
+        n = len([ln for ln in o.splitlines() if ln.strip()])
+        out.append(f"{n} uncommitted change(s) in the worktree")
+
+    rc, o = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path, timeout=60)
+    branch = o.strip() if rc == 0 else ""
+    if branch and branch != base:
+        out.append(f"the worktree is on {branch!r}, not {base!r}")
+
+    for remote in ("origin", "forgejo"):
+        rc, o = run(
+            ["git", "rev-list", "--count", f"{remote}/{base}..HEAD"],
+            cwd=path,
+            timeout=60,
+        )
+        if rc == 0 and o.strip().isdigit():
+            ahead = int(o.strip())
+            if ahead:
+                out.append(f"{ahead} commit(s) not on {remote}/{base}")
+            break
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("path")
+    ap.add_argument("--repo", required=True, help="owner/name on the forge")
+    ap.add_argument("--tag", default="")
+    ap.add_argument("--goals", default="")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+
+    path = Path(a.path).resolve()
+    if not path.is_dir():
+        print(json.dumps({"ok": False, "error": f"no repo at {path}"}))
+        return 2
+    token = os.environ.get("TOKEN", "")
+    if not token:
+        print(json.dumps({"ok": False, "error": "no TOKEN"}))
+        return 3
+
+    results, blocking, unverifiable = [], [], []
+
+    # BEFORE ANY CHECK: is this tree the thing that would be released?
+    stale = unreleased_work(path)
+    if stale:
+        results.append(
+            {
+                "check": "merged",
+                "status": "FAIL",
+                "rc": 1,
+                "tail": (
+                    "the worktree is not what would be released: "
+                    + "; ".join(stale)
+                    + ". Every check below runs against these files, so a pass "
+                    "would be evidence about work that is not on the branch."
+                ),
+            }
+        )
+        blocking.append("merged")
+
+    for name, tool, extra in CHECKS:
+        if not tool.is_file():
+            # A missing checker is a refusal. A release that says "done" because
+            # nothing could look is the worst artefact this pipeline can make.
+            unverifiable.append(name)
+            results.append({"check": name, "status": "MISSING"})
+            continue
+        rc, out = run([sys.executable, str(tool), str(path), *extra])
+        ok = rc == 0
+        results.append(
+            {
+                "check": name,
+                "status": "pass" if ok else "FAIL",
+                "rc": rc,
+                "tail": out.strip()[-500:],
+            }
+        )
+        if not ok:
+            blocking.append(name)
+
+    if a.goals and Path(a.goals).is_file():
+        open_goals = Path(a.goals).read_text(encoding="utf-8").count("| open |")
+        results.append(
+            {
+                "check": "goals",
+                "status": "pass" if not open_goals else "FAIL",
+                "open": open_goals,
+            }
+        )
+        if open_goals:
+            blocking.append(f"goals({open_goals} open)")
+
+    ready = not blocking and not unverifiable
+    # IS THERE ANYTHING TO RELEASE? The ladder runs this on every adoption tick,
+    # and nothing checked, so an already-released tree got a fresh version every
+    # pass: v0.1.2, v0.1.3 and v0.1.4 all point at the same commit. Each one
+    # tells a consumer that something changed.
+    rc_head, head = run(["git", "rev-parse", "HEAD"], cwd=path, timeout=60)
+    head = head.strip() if rc_head == 0 else ""
+    existing = already_released(a.repo, token, head) if head else ""
+    if existing and not a.tag:
+        print(f"\n  {a.repo}: {head[:12]} is already released as {existing}.")
+        print("  Nothing to release. A tag means 'this tree', and it has one.")
+        return 0
+
+    tag = a.tag or next_tag(a.repo, token)
+    out = {
+        "repo": a.repo,
+        "tag": tag,
+        "ready": ready,
+        "blocking": blocking,
+        "unverifiable": unverifiable,
+        "checks": results,
+    }
+
+    print(f"  {a.repo}: candidate {tag}")
+    for r in results:
+        print(f"    {r['status']:<8} {r['check']}")
+    if unverifiable:
+        print("\n  CANNOT VERIFY — a missing checker is a refusal, not a pass:")
+        for u in unverifiable:
+            print(f"    {u}")
+        return 3
+    if blocking:
+        print(f"\n  NOT READY: {', '.join(blocking)}")
+        first = next((r for r in results if r["status"] == "FAIL"), None)
+        if first:
+            print(f"\n  fix this first — [{first['check']}]")
+            for ln in str(first.get("tail", "")).splitlines()[:10]:
+                print(f"    {ln}")
+        return 1
+
+    if a.dry_run:
+        print(f"\n  READY. Would cut {tag} (dry run; nothing written).")
+        return 0
+
+    st, rel = api(
+        "POST",
+        f"/repos/{a.repo}/releases",
+        token,
+        {
+            "tag_name": tag,
+            "target_commitish": "main",
+            "name": f"{a.repo.split('/')[-1]} {tag}",
+            "body": notes(a.repo, token, None)
+            + "\n## Gates\n\n"
+            + "\n".join(f"- {r['check']}: {r['status']}" for r in results)
+            + "\n\nCut by autodev. Forgejo only — not published to any external "
+            "registry.\n",
+            "draft": False,
+            "prerelease": tag.startswith("v0."),
+        },
+    )
+    if st not in (200, 201):
+        print(f"\n  release failed: HTTP {st} {str(rel)[:200]}")
+        return 3
+    print(f"\n  RELEASED {tag} — {rel.get('html_url') if isinstance(rel, dict) else ''}")
+    print("  Forgejo only. Nothing was published to an external registry.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

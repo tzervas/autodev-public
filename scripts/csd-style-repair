@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Style is REPAIRED, never a refusal.
+
+WHY. A style finding used to be indistinguishable from a correctness finding:
+both came back as "the gate said no", and the loop retried the same goal hoping
+the model would guess which. Meanwhile the reviewer, asked to judge a diff,
+spent a verdict on "these assertions are fragile" -- taste, on work the goal had
+asked for, blocking a merge.
+
+Formatting is not a judgement call and should never reach a judge. It has a tool,
+the tool is deterministic, and the correct response to a style finding is to APPLY
+the fix. A pipeline that halts on formatting is a pipeline that does not run.
+
+WHAT IT DOES. Runs the REPOSITORY'S OWN formatter and linter -- read from its
+config, not imposed by us -- in fix mode, and reports what changed. Only a
+finding the tools cannot fix themselves is returned, because that one is a real
+disagreement rather than a keystroke.
+
+WHAT IT REFUSES:
+  - to touch a file outside the repository
+  - to run a formatter the repo does not configure. Reformatting a project to our
+    taste is a diff nobody asked for and a review nobody can read.
+  - to report success when a tool is missing: an absent formatter is `skipped`,
+    not `clean`. They are different facts and the second one is a lie.
+
+Usage:
+    csd-style-repair <repo> [--check] [--json]
+      --check  report what WOULD change without writing (for a gate)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+# Each entry: (name, config markers that mean "this repo uses it", fix argv,
+# check argv). The markers are why we never impose a tool: if the repo does not
+# configure it, we do not run it.
+# ONE TOOL PER ROLE PER LANGUAGE. This listed black and isort beside ruff --
+# three tools for two jobs ruff already does, and three configs to drift apart.
+# The house standard names one toolchain per language; this follows it.
+TOOLS = [
+    (
+        "ruff-format",
+        ("ruff.toml", ".ruff.toml", "pyproject.toml"),
+        ["ruff", "format", "."],
+        ["ruff", "format", "--check", "."],
+    ),
+    (
+        "ruff-lint",
+        ("ruff.toml", ".ruff.toml", "pyproject.toml"),
+        ["ruff", "check", "--fix", "."],
+        ["ruff", "check", "."],
+    ),
+    (
+        "rustfmt",
+        ("rustfmt.toml", "Cargo.toml"),
+        ["cargo", "fmt", "--all"],
+        ["cargo", "fmt", "--all", "--check"],
+    ),
+    (
+        "shfmt",
+        (".editorconfig", ".shellcheckrc"),
+        ["shfmt", "-w", "-i", "2", "."],
+        ["shfmt", "-d", "-i", "2", "."],
+    ),
+]
+
+
+def configures(repo: Path, name: str, markers: tuple[str, ...]) -> bool:
+    """Does this repo actually ask for this tool?
+
+    A marker file is necessary but not sufficient -- nearly every Python repo has
+    a pyproject.toml. The tool's own section must be in it, or we would reformat
+    projects that never opted in.
+    """
+    # The tool's OWN section, not its family's. `[tool.ruff]` says the repo
+    # lints with ruff; it does not say it wants `ruff format`, which is a
+    # different tool with an opinionated style. Running it on that basis
+    # reformatted nine files in this repo that nobody had asked to be
+    # reformatted -- a diff nobody requested and a review nobody can read.
+    key = name.replace("-", ".") if "-" in name else name
+    for m in markers:
+        p = repo / m
+        if not p.is_file():
+            continue
+        if m == "pyproject.toml":
+            try:
+                body = p.read_text(encoding="utf-8", errors="replace")
+                # ruff-format needs [tool.ruff.format]; ruff-lint accepts
+                # [tool.ruff] or [tool.ruff.lint].
+                if f"[tool.{key}]" in body or f"[tool.{key}." in body:
+                    return True
+            except OSError:
+                continue
+        else:
+            return True
+    return False
+
+
+def git_dirty(repo: Path) -> list[str]:
+    r = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return [ln[3:] for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("repo")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    repo = Path(a.repo).resolve()
+    if not repo.is_dir():
+        print(json.dumps({"ok": False, "error": f"no repo at {repo}"}))
+        return 2
+
+    before = set(git_dirty(repo))
+    ran, skipped, unfixable = [], [], []
+    for name, markers, fix, check in TOOLS:
+        if not configures(repo, name, markers):
+            skipped.append({"tool": name, "why": "not configured by this repo"})
+            continue
+        exe = (fix if not a.check else check)[0]
+        if not shutil.which(exe):
+            # NOT clean. An absent formatter and a clean tree are different
+            # facts, and reporting the second for the first is how a repo drifts
+            # while its gate says nothing is wrong.
+            skipped.append({"tool": name, "why": f"{exe} not installed"})
+            continue
+        p = subprocess.run(
+            fix if not a.check else check,
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        rec = {"tool": name, "rc": p.returncode}
+        if p.returncode != 0:
+            # In fix mode a non-zero exit means findings the tool could not
+            # repair itself -- a real disagreement, and the only kind worth a
+            # human's attention.
+            rec["unfixable"] = (p.stdout or p.stderr or "").strip()[-1500:]
+            unfixable.append(rec)
+        ran.append(rec)
+
+    after = set(git_dirty(repo))
+    changed = sorted(after - before)
+    out = {
+        "ok": not unfixable,
+        "mode": "check" if a.check else "repair",
+        "repaired": changed,
+        "ran": ran,
+        "skipped": skipped,
+        "unfixable": unfixable,
+        "note": (
+            "style findings are applied, not returned: only `unfixable` "
+            "is a finding a person should see"
+        ),
+    }
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(
+            f"  {repo.name}: {len(ran)} tool(s) ran, "
+            f"{len(changed)} file(s) repaired, {len(unfixable)} unfixable"
+        )
+        for c in changed:
+            print(f"    repaired  {c}")
+        for u in unfixable:
+            print(f"    UNFIXABLE {u['tool']}:")
+            for ln in str(u.get("unfixable", "")).splitlines()[:8]:
+                print(f"      {ln}")
+        for s in skipped:
+            print(f"    skipped   {s['tool']} — {s['why']}")
+    return 1 if unfixable else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

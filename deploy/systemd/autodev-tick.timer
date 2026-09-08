@@ -1,0 +1,20 @@
+[Unit]
+Description=Reconcile net for autodev, in case an event was never delivered
+
+[Timer]
+# This is NOT the schedule. Events drive the loop (autodev-tick.path); this
+# exists because webhook delivery is best-effort: the forge retries a few times
+# and gives up, and if the receiver was down for that window the loop would wait
+# forever for a merge that already happened.
+#
+# One hour, not five minutes. At five minutes this is a poller with an excuse,
+# and it was one -- 287 of every 288 ticks had nothing to do. At one hour the
+# common path is always the event, and this only catches the delivery that was
+# genuinely lost.
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

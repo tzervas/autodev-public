@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Judge a commit's CI honestly. Green is a claim, not evidence.
+
+WHY THIS EXISTS. A PR once carried a green tick with 8 status contexts where
+trunk-based PRs had 19: the test job had not run at all, and nothing in the UI
+said so. A check that never ran is not a check that passed, and a merge gate that
+counts "no failures" as success will merge exactly the changes whose tests were
+skipped.
+
+THE THREE VERDICTS:
+
+  FAIL      any check failed. Never mergeable. No judgement required.
+  SUSPECT   something did not run: a workflow file exists but produced no run, a
+            job was skipped, or the commit carries no checks at all. Mergeable
+            only with a human reason.
+  CLEAN     every workflow that exists produced a run, and every run succeeded.
+
+The SUSPECT class is the point. Both of the ways CI lies -- a job silently
+skipped, and a workflow that never dispatched -- look identical to success if you
+only ask "did anything fail".
+
+Usage:
+    csd-ci-scrutiny <owner/repo> <sha>            # human summary, exit 0/1/2
+    csd-ci-scrutiny <owner/repo> <sha> --json     # machine-readable
+
+Exit: 0 CLEAN, 1 FAIL, 2 SUSPECT.
+"""
+
+from __future__ import annotations
+
+try:  # the loader lives in src/, which the unit puts on PYTHONPATH
+    from csd_autodev import fleet as FLEET
+except ImportError:  # run standalone, without src/ on the path
+
+    class FLEET:  # type: ignore[no-redef]
+        """The same resolution, without the import.
+
+        The first version of this fallback returned the caller's default, which
+        was None -- so a script run outside the unit crashed on `None + str`
+        instead of using the committed defaults. A fallback that cannot do the
+        job is not a fallback; it is a delayed failure.
+        """
+
+        @staticmethod
+        def get(dotted, default=None):
+            import json as _j
+            from pathlib import Path as _P
+
+            base = _P(__file__).resolve().parents[1] / "config"
+            cfg: dict = {}
+            for name in ("fleet.example.json", "fleet.json"):
+                try:
+                    cfg = {**cfg, **_j.loads((base / name).read_text())}
+                except (OSError, ValueError):
+                    continue
+            node = cfg
+            for part in dotted.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return node
+
+
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+FJ = os.environ.get("FORGEJO_API", FLEET.get("forge.api"))
+
+# A status context in one of these states did not verify anything.
+NOT_RUN = {"skipped", "cancelled", "canceled", "pending", "waiting", "blocked", ""}
+BAD = {"failure", "error", "failed"}
+GOOD = {"success", "successful"}
+
+
+def token() -> str:
+    t = os.environ.get("TOKEN") or os.environ.get("FORGEJO_TOKEN") or ""
+    if not t:
+        print("need TOKEN via secret exec", file=sys.stderr)
+        raise SystemExit(3)
+    return t
+
+
+def api(path: str):
+    req = urllib.request.Request(FJ + path, headers={"Authorization": f"token {token()}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+
+# Triggers that a push or a pull request can actually fire. A workflow declaring
+# only `workflow_dispatch` or `schedule` is not eligible for this commit, and
+# demanding a run from it would make every PR unmergeable forever.
+AUTO_TRIGGERS = {"push", "pull_request", "pull_request_target"}
+
+
+def eligible_for_commit(body: str) -> bool:
+    """Can this workflow be triggered by a push or a pull request at all?
+
+    Without this, `abliterate.yml` -- deliberately `workflow_dispatch`-only,
+    because it burns a GPU on command -- was reported as "produced NO run at
+    all" on every pull request, and the verdict was SUSPECT no matter how green
+    the tests were. A gate that fires on every commit is not a gate; it is noise
+    that teaches you to merge past it.
+
+    Parsed textually rather than with a YAML library so this tool keeps its "no
+    dependencies beyond the standard library" property. `on:` is matched at the
+    start of a line so a mention inside a step's script cannot fool it.
+    """
+    m = re.search(r"^on:(.*?)(?=^\S|\Z)", body, re.M | re.S)
+    if not m:
+        return True  # cannot tell: treat as eligible, which fails LOUD not quiet
+    block = m.group(0)
+    # `on: push` and `on: [push, pull_request]` as well as the block form.
+    return any(re.search(rf"\b{t}\b", block) for t in AUTO_TRIGGERS)
+
+
+def workflow_name(body: str) -> str:
+    """The workflow's `name:` field, which is what a status context is built from.
+
+    Forgejo labels a check "<workflow name> / <job name> (<event>)" using the
+    NAME declared inside the file, not the filename. Matching a run back to its
+    file therefore needs both, and they are routinely different: this repo's
+    own `.github/workflows/ci.yml` declares `name: CI`, which does not equal
+    "ci" under a case-sensitive comparison.
+    """
+    m = re.search(r"(?m)^name:\s*(.+?)\s*$", body)
+    if not m:
+        return ""
+    return m.group(1).strip().strip("'\"")
+
+
+def declared_workflows(repo: str, ref: str) -> dict[str, set[str]]:
+    """Which workflows the repository SAYS it has AND could run on this commit.
+
+    This is the half that catches the lie. Comparing runs against runs can never
+    reveal a workflow that never dispatched -- only comparing against the files
+    can. But it must compare against the workflows that were ELIGIBLE, or a
+    manually-dispatched workflow reads as a missing run.
+
+    Returns each workflow's filename mapped to every identifier a status context
+    could plausibly carry for it -- the filename, its stem, and its declared
+    `name:` -- all lowercased, because the comparison used to be case-sensitive
+    and silently reported every correctly-run workflow as missing.
+    """
+    names: dict[str, set[str]] = {}
+    for d in (".forgejo/workflows", ".github/workflows"):
+        code, files = api(f"/repos/{repo}/contents/{d}?ref={ref}")
+        if code != 200 or not isinstance(files, list):
+            continue
+        for f in files:
+            name = f.get("name", "")
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            c, one = api(f"/repos/{repo}/contents/{d}/{name}?ref={ref}")
+            body = ""
+            if c == 200 and isinstance(one, dict) and one.get("content"):
+                try:
+                    body = base64.b64decode(one["content"]).decode("utf-8", "replace")
+                except Exception:
+                    body = ""
+            # An unreadable workflow stays in the set: unknown must not mean
+            # absolved.
+            if not body or eligible_for_commit(body):
+                ids = {name.lower(), name.rsplit(".", 1)[0].lower()}
+                declared_name = workflow_name(body)
+                if declared_name:
+                    ids.add(declared_name.lower())
+                names[name] = ids
+    return names
+
+
+def scrutinise(repo: str, sha: str) -> dict:
+    findings: list[str] = []
+
+    _code, statuses = api(f"/repos/{repo}/commits/{sha}/statuses")
+    statuses = statuses if isinstance(statuses, list) else []
+
+    # Latest state per context; a context can report repeatedly.
+    latest: dict[str, str] = {}
+    for s in statuses:
+        ctx = s.get("context") or "?"
+        latest.setdefault(ctx, (s.get("status") or "").lower())
+
+    failed = sorted(c for c, st in latest.items() if st in BAD)
+    not_run = sorted(c for c, st in latest.items() if st in NOT_RUN)
+    passed = sorted(c for c, st in latest.items() if st in GOOD)
+
+    declared = declared_workflows(repo, sha)
+    # Map contexts back to the workflow that produced them: Forgejo names a
+    # context "<workflow> / <job> (<event>)".
+    seen_workflows = {c.split("/", 1)[0].strip().lower() for c in latest}
+    missing = sorted(
+        filename for filename, ids in declared.items() if not (ids & seen_workflows)
+    )
+
+    if failed:
+        findings.append(f"{len(failed)} check(s) FAILED: {', '.join(failed[:5])}")
+    if not_run:
+        findings.append(
+            f"{len(not_run)} check(s) did not run "
+            f"(skipped/pending/cancelled): {', '.join(not_run[:5])}"
+        )
+    if missing:
+        findings.append(
+            f"{len(missing)} declared workflow(s) produced NO run at all: "
+            f"{', '.join(missing)}"
+        )
+    if not latest:
+        findings.append("the commit carries NO checks at all")
+
+    if failed:
+        verdict = "FAIL"
+    elif not_run or missing or not latest:
+        verdict = "SUSPECT"
+    else:
+        verdict = "CLEAN"
+
+    return {
+        "repo": repo,
+        "sha": sha,
+        "verdict": verdict,
+        "passed": passed,
+        "failed": failed,
+        "not_run": not_run,
+        "declared_workflows": sorted(declared),
+        "workflows_with_no_run": missing,
+        "findings": findings,
+        "mergeable": verdict == "CLEAN",
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("repo")
+    ap.add_argument("sha")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    r = scrutinise(a.repo, a.sha)
+    if a.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print(f"  {r['repo']} {r['sha'][:12]}  ->  {r['verdict']}")
+        print(
+            f"  passed:  {len(r['passed'])}   failed: {len(r['failed'])}   "
+            f"did not run: {len(r['not_run'])}"
+        )
+        print(
+            f"  declared workflows: {len(r['declared_workflows'])}   "
+            f"with no run: {len(r['workflows_with_no_run'])}"
+        )
+        for f in r["findings"]:
+            print(f"    - {f}")
+        if r["verdict"] == "CLEAN":
+            print("  every declared workflow ran and every check passed")
+        elif r["verdict"] == "SUSPECT":
+            print(
+                "  NOT mergeable on this evidence: something did not run, and a "
+                "check that never ran is not a check that passed"
+            )
+        else:
+            print("  NOT mergeable: a check failed")
+    return {"CLEAN": 0, "FAIL": 1, "SUSPECT": 2}[r["verdict"]]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

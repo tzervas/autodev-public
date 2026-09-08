@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# fleet-gpu-mode -- put the 3090 Ti into one of three exclusive modes.
+#
+# THE CARD IS BIMODAL BY CONSTRUCTION, WHICH IS WHY THIS IS SIMPLE.
+# vLLM holds its allocation for its whole process lifetime, so the card serves
+# exactly one model or none. There is no VRAM budget to negotiate and no
+# hysteresis to tune -- only a mode to flip. The 5080's 4B driver is never
+# evicted, so something is always alive to perform the swap.
+#
+#   dev     qwen3.5-9b       implementer / deep tier
+#   review  nemotron-9b      INDEPENDENT reviewer (different lab, different corpus)
+#   free    <none>           card released for CSD training via gpu-pack
+#
+# Emits a sentinel on completion so a waiter can block instead of polling.
+set -euo pipefail
+
+STATE=/fleet-data/autodev/gpu-mode.json
+LOCK=/fleet-data/autodev/gpu-mode.lock
+EVENTS=/fleet-data/autodev/events
+HOST_IP=203.0.113.10
+PORT=8001
+IMG=609a5b463503
+HFCACHE=/fleet-data/hf-cache
+CONTAINER=fleet-vllm-deep
+
+mkdir -p "$(dirname "$STATE")" "$EVENTS"
+
+declare -A MODEL=(
+  [dev]="QuantTrio/Qwen3.5-9B-AWQ"
+  [review]="nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+)
+declare -A SERVED=(
+  [dev]="qwen3.5-9b"
+  [review]="nemotron-9b"
+)
+declare -A UTIL=(
+  [dev]="0.82"
+  # 0.95 not 0.90: MEASURED 2026-09-07. Nemotron bf16 weights (17.78 GB) plus
+  # Mamba recurrent state left only 0.85 GiB for KV at 0.90 and the engine
+  # refused to start outright rather than degrading. 0.95 then failed a different
+  # way: utilisation is a fraction of TOTAL, and the desktop session holds ~1.3 GB,
+  # so only 0.941 is actually reachable. 0.93 works: 1.54 GiB KV = 63,855 tokens.
+  [review]="0.93"
+)
+declare -A MAXLEN=(
+  [dev]="131072"
+  # vLLM itself computed 36736 as the ceiling at 0.90; 32768 sits under that
+  # with margin once utilisation goes to 0.95. A reviewer reading PR diffs
+  # wants long context, so this is the number to revisit if reviews truncate.
+  [review]="32768"
+)
+# vLLM 0.28 ships a nemotron_v3 REASONING parser but no Nemotron TOOL parser.
+# The reviewer therefore runs without --enable-auto-tool-choice and returns its
+# findings via guided/structured output instead, which is the better shape for a
+# reviewer anyway: a fixed findings schema rather than free-form tool calls.
+declare -A EXTRA=(
+  [dev]="--enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3"
+  [review]="--reasoning-parser nemotron_v3"
+)
+
+emit() { printf '{"ts":"%s","event":"%s","mode":"%s","detail":"%s"}\n' \
+         "$(date -Is)" "$1" "${2:-}" "${3:-}" >> "$EVENTS/gpu-mode.jsonl"; }
+
+current_mode() { [ -f "$STATE" ] && python3 -c "import json;print(json.load(open('$STATE'))['mode'])" 2>/dev/null || echo unknown; }
+
+write_state() {
+  python3 - "$1" "$2" <<PY
+import json, sys, datetime
+json.dump({"mode": sys.argv[1], "served_model_name": sys.argv[2],
+           "host": "$HOST_IP", "port": $PORT,
+           "changed_at": datetime.datetime.now().astimezone().isoformat()},
+          open("$STATE","w"), indent=2)
+PY
+}
+
+# 9>&- closes the flock fd in the child. Without it podman forks conmon, which
+# INHERITS fd 9 and lives as long as the container -- so the lock stays held for
+# the container lifetime and the NEXT swap blocks on flock until its timeout.
+# The first swap works; every one after it hangs. Measured 2026-09-07.
+stop_vllm() { podman rm -f "$CONTAINER" >/dev/null 2>&1 9>&- || true; }
+
+start_vllm() {  # $1 = mode
+  local m="$1"
+  podman run -d --name "$CONTAINER" \
+    --device nvidia.com/gpu=all --ipc=host \
+    -v "$HFCACHE":/hf:z -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e VLLM_API_KEY \
+    -p "$HOST_IP:$PORT:$PORT" \
+    "$IMG" \
+    --model "${MODEL[$m]}" --served-model-name "${SERVED[$m]}" \
+    --host 0.0.0.0 --port "$PORT" \
+    --gpu-memory-utilization "${UTIL[$m]}" \
+    --max-model-len "${MAXLEN[$m]}" --max-num-seqs 16 \
+    ${EXTRA[$m]} >/dev/null 9>&-
+}
+
+wait_healthy() {  # $1 = seconds
+  local deadline=$(( $(date +%s) + $1 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    podman ps --filter "name=$CONTAINER" --format '{{.Names}}' | grep -q "$CONTAINER" || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -m3 "http://$HOST_IP:$PORT/health" || true)" = "200" ] && return 0
+    sleep 5
+  done
+  return 1
+}
+
+cmd_status() {
+  echo "mode:      $(current_mode)"
+  [ -f "$STATE" ] && cat "$STATE"
+  echo "container: $(podman ps --filter "name=$CONTAINER" --format '{{.Status}}' || echo none)"
+  nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader
+}
+
+cmd_set() {
+  local target="$1" prev
+  prev="$(current_mode)"
+  [ "$target" = "$prev" ] && { echo "already in mode '$target'"; exit 0; }
+
+  emit swap_started "$target" "from=$prev"
+  echo "swapping 3090 Ti: $prev -> $target"
+  stop_vllm
+
+  if [ "$target" = "free" ]; then
+    write_state free ""
+    emit swap_done free "card released"
+    echo "card released; free VRAM: $(nvidia-smi --query-gpu=memory.free --format=csv,noheader)"
+    return 0
+  fi
+
+  start_vllm "$target"
+  if wait_healthy 420; then
+    write_state "$target" "${SERVED[$target]}"
+    emit swap_done "$target" "served=${SERVED[$target]}"
+    echo "READY: ${SERVED[$target]} on $HOST_IP:$PORT"
+    nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader
+  else
+    emit swap_failed "$target" "health timeout; rolling back to $prev"
+    echo "FAILED to bring up '$target'; rolling back to '$prev'" >&2
+    podman logs --tail 30 "$CONTAINER" >&2 2>&1 || true
+    stop_vllm
+    if [ "$prev" != "free" ] && [ "$prev" != "unknown" ]; then
+      start_vllm "$prev" && wait_healthy 420 && write_state "$prev" "${SERVED[$prev]}"
+    fi
+    exit 1
+  fi
+}
+
+case "${1:-status}" in
+  dev|review|free)
+    # Serialise swaps on a real fd lock. Two concurrent swaps on one card would
+    # race the container name and the state file.
+    exec 9>"$LOCK"
+    flock -w 900 9 || { echo "fleet-gpu-mode: another swap holds the lock" >&2; exit 1; }
+    cmd_set "$1"
+    ;;
+  status) cmd_status ;;
+  *) echo "usage: fleet-gpu-mode [dev|review|free|status]" >&2; exit 2 ;;
+esac

@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Egress gateway for autodev's OWN Qdrant collection. Nothing else.
+
+Why this exists: Qdrant 1.19 on the shared loopback deployment
+(``127.0.0.1:6333``) has **no native auth** — the whole point of the design
+note in ``autodev-service-identity-and-sandbox`` ("Qdrant has no native auth
+on the loopback deployment, so collection scoping is enforced by the gateway,
+not by Qdrant"). This is that gateway's Qdrant leg, minimal and additive:
+
+- It does **not** touch Qdrant's own config. Every other collection
+  (``tzervas-dev-kb``, ``fleet-model-kb``, ``fleet-csd-kb``, ``fleet-gap-kb``,
+  ``fleet-harness-kb``) and every existing unauthenticated consumer of raw
+  Qdrant keeps working exactly as before — turning on Qdrant-wide API-key
+  auth would break every one of those consumers and is explicitly out of
+  scope ("execute the ratified design, do not redesign it").
+- It binds loopback only, on a NEW port, and holds no state Qdrant does not
+  already have.
+- A request is forwarded to upstream Qdrant **only if** (a) it carries a
+  valid bearer token for THIS identity, and (b) its path is under
+  ``/collections/<COLLECTION>`` — nothing else, not even
+  ``/collections`` (the bare listing, which would leak the names of the
+  master collections). Everything else is a 403, logged.
+
+**Residual, stated plainly**: this gateway is the sanctioned path for
+whoever holds the bearer token, and denial through it is a real, enforced
+boundary. It does **not** stop a process with independent network access to
+``127.0.0.1:6333`` from reaching Qdrant directly — that channel is a
+pre-existing condition of the shared loopback deployment (every existing
+collection has been reachable that way by any local process since before
+this task), and closing it fully needs either (a) Qdrant-wide auth, which is
+the breaking change above, or (b) finishing the rootless-podman sandbox
+network namespace from the ratified design (separate provisioning work,
+`Do not start the autodev loop` — this gateway is access infrastructure, not
+the loop). Both are out of scope for today; noted rather than hidden.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from hmac import compare_digest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+UPSTREAM = os.environ.get("AUTODEV_RAG_UPSTREAM", "http://127.0.0.1:6333")
+COLLECTION = os.environ.get("AUTODEV_RAG_COLLECTION", "autodev-kb")
+BIND = os.environ.get("AUTODEV_RAG_BIND", "127.0.0.1")
+PORT = int(os.environ.get("AUTODEV_RAG_PORT", "8096"))
+TOKEN_FILE = Path(
+    os.environ.get("AUTODEV_RAG_TOKEN_FILE", "/fleet-data/autodev/rag-gateway.token")
+)
+AUDIT = Path(
+    os.environ.get("AUTODEV_RAG_AUDIT", "/fleet-data/autodev/rag-gateway.audit.jsonl")
+)
+ALLOWED_PREFIX = f"/collections/{COLLECTION}"
+
+
+def load_token() -> str:
+    """Env wins (systemd ``secret exec``-style unit start); file is the fallback."""
+    env = (os.environ.get("AUTODEV_RAG_TOKEN") or "").strip()
+    if env:
+        return env
+    if TOKEN_FILE.is_file():
+        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def audit(peer: str, method: str, path: str, ok: bool, reason: str) -> None:
+    AUDIT.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "at": int(time.time()),
+        "peer": peer,
+        "method": method,
+        "path": path,
+        "ok": ok,
+        "reason": reason[:200],
+    }
+    with AUDIT.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+def in_scope(path: str) -> bool:
+    """Only this collection's namespace. Exact prefix, not a substring match —
+    ``/collections/autodev-kb-evil`` must NOT pass a naive ``startswith``."""
+    if path == ALLOWED_PREFIX:
+        return True
+    return path.startswith(ALLOWED_PREFIX + "/") or path.startswith(ALLOWED_PREFIX + "?")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: object) -> None:
+        """INTENTIONAL: silences BaseHTTPRequestHandler's stderr logging;
+        this gateway audits its own requests with more context than the
+        stdlib line carries."""
+        return
+
+    def _peer(self) -> str:
+        return str(self.client_address[0] if self.client_address else "")
+
+    def _json(self, code: int, obj: dict) -> None:
+        raw = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _authed(self) -> bool:
+        token = load_token()
+        if not token:
+            return False
+        hdr = self.headers.get("Authorization") or ""
+        if not hdr.lower().startswith("bearer "):
+            return False
+        return compare_digest(hdr[7:].strip(), token)
+
+    def _handle(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        length = int(self.headers.get("Content-Length") or "0")
+        body = self.rfile.read(length) if length else None
+
+        if path == "/health":
+            self._json(200, {"ok": True, "collection": COLLECTION})
+            return
+
+        if not self._authed():
+            audit(self._peer(), method, path, False, "auth")
+            self._json(401, {"error": "unauthorized"})
+            return
+
+        if not in_scope(path):
+            audit(self._peer(), method, path, False, "out-of-scope")
+            self._json(
+                403,
+                {
+                    "error": (
+                        f"not in scope; this credential is limited to {ALLOWED_PREFIX}"
+                    )
+                },
+            )
+            return
+
+        qs = path + (("?" + parsed.query) if parsed.query else "")
+        req = urllib.request.Request(
+            UPSTREAM + qs,
+            data=body,
+            method=method,
+            headers={"Content-Type": "application/json"} if body else {},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                code = resp.status
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            code = exc.code
+        except OSError as exc:
+            audit(self._peer(), method, path, False, f"upstream-down:{exc}")
+            self._json(502, {"error": "upstream qdrant unreachable"})
+            return
+        audit(self._peer(), method, path, True, f"proxied:{code}")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:
+        self._handle("GET")
+
+    def do_POST(self) -> None:
+        self._handle("POST")
+
+    def do_PUT(self) -> None:
+        self._handle("PUT")
+
+    def do_DELETE(self) -> None:
+        self._handle("DELETE")
+
+
+def main() -> None:
+    if not load_token():
+        print(
+            f"csd-autodev-rag-gateway: no token (set AUTODEV_RAG_TOKEN or {TOKEN_FILE}); "
+            "every request will 401",
+            file=sys.stderr,
+        )
+    httpd = ThreadingHTTPServer((BIND, PORT), Handler)
+    print(
+        f"csd-autodev-rag-gateway {BIND}:{PORT} -> {UPSTREAM} scope={ALLOWED_PREFIX}",
+        flush=True,
+    )
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

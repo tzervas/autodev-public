@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "THE COMMITTED DEFAULTS. Every value here is documentation-safe: RFC 5737",
+    "addresses (203.0.113.0/24 is TEST-NET-3), RFC 2606 domains (example.com),",
+    "and generic host and account names. Nothing here points at real",
+    "infrastructure, so this file is publishable as-is and the repository is",
+    "safe by construction rather than by a scrub before each publish.",
+    "",
+    "WHY THIS EXISTS. The fleet's real addresses were hardcoded across twenty-odd",
+    "scripts and docs -- 78 IP hits in 26 files. Making the repo public then",
+    "required rewriting them at publish time, which is a step that has to be",
+    "right every time and was wrong twice on its first run. Parameterised, the",
+    "public tree never contains them at all.",
+    "",
+    "HOW IT RESOLVES, lowest precedence first:",
+    "  1. this file            committed, safe, always present",
+    "  2. config/fleet.json    LOCAL ONLY, gitignored, the real values",
+    "  3. environment          AUTODEV_* variables, for one-off overrides",
+    "",
+    "SECRETS ARE NOT HERE AND NEVER WILL BE. This file holds addresses and names.",
+    "Credentials are injected at run time by `secret exec VAR=name -- cmd` from",
+    "the agent's own vault, so they are never in a file, never in argv, and never",
+    "in this repository. `*_secret` keys below name the VAULT ENTRY to read, not",
+    "the value."
+  ],
+  "forge": {
+    "api": "https://git.example.com/api/v1",
+    "web": "https://git.example.com",
+    "ssh_port": 2222,
+    "token_secret": "forgejo/token",
+    "webhook_secret": "forgejo/webhook-secret",
+    "_comment": "Self-hosted Forgejo. token_secret names a vault entry, not a token."
+  },
+  "gateway": {
+    "url": "http://203.0.113.20:4000/v1",
+    "key_secret": "inference/gateway-key",
+    "context_window": 65536,
+    "_comment": "OpenAI-compatible gateway. LiteLLM in front of vLLM here, but anything that speaks the API works."
+  },
+  "events": {
+    "bind": "203.0.113.10",
+    "port": 9119,
+    "dir": "/var/lib/autodev/events",
+    "allow_from": "203.0.113.20/32",
+    "_comment": "The webhook receiver. allow_from is enforced by systemd IPAddressAllow -- only the forge may reach it."
+  },
+  "paths": {
+    "state": "/var/lib/autodev/state",
+    "work": "/var/lib/autodev/work",
+    "mail": "/var/lib/autodev/mail",
+    "harness": "/opt/autodev",
+    "_comment": "FHS locations. A deployment may put these anywhere; the loader does not care."
+  },
+  "identity": {
+    "account": "svc-autodev",
+    "git_name": "autodev",
+    "git_email": "autodev@example.com",
+    "vault": "/var/lib/autodev/.secrets",
+    "_comment": "The unprivileged service account the loop runs as."
+  },
+  "hosts": {
+    "_comment": "Inference backends. Names are labels; nothing resolves them but you.",
+    "primary": {"name": "host-a", "address": "203.0.113.10", "gpu": "24GB", "vllm_port": 8001},
+    "secondary": {"name": "host-b", "address": "203.0.113.11", "gpu": "16GB", "vllm_port": 8000},
+    "edge": {"name": "host-edge", "address": "203.0.113.20", "gpu": null}
+  },
+  "org": {
+    "collective": "example-org",
+    "_comment": "The forge organisation autodev develops in. Its own copies, never the operator's."
+  }
+}
