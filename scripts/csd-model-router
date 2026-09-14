@@ -29,9 +29,22 @@ def state_path() -> Path:
 
 
 def cat_path() -> Path:
-    return Path(
-        os.environ.get("CSD_ROUTER_CATALOG", str(ROOT / "config" / "model-router.json"))
-    )
+    """The catalog, preferring the private override and falling back to the example.
+
+    Same precedence as every other config in this repo -- committed and
+    documentation-safe first, gitignored real values second -- except that this
+    one is a FILE choice rather than a merge, because `catalog()` fails closed
+    on a missing file and a half-merged host inventory is worse than either.
+
+    Without the fallback a fresh clone had no catalog at all. csd-model-router
+    said so and exited; csd-lab-console's `_read_json` returned {} and reported
+    an empty cluster, which is the quieter and worse of the two failures.
+    """
+    override = os.environ.get("CSD_ROUTER_CATALOG")
+    if override:
+        return Path(override)
+    real = ROOT / "config" / "model-router.json"
+    return real if real.is_file() else ROOT / "config" / "model-router.example.json"
 
 
 def _load_json(path: Path) -> dict[str, Any]:

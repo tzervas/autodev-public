@@ -95,7 +95,23 @@ GOALS = ROOT / "docs/program/GOALS.md"
 PHASE1 = Path(
     os.environ.get("CSD_PHASE1_BOARD", str(ROOT / "docs/program/PHASE-1-TASK-BOARD.md"))
 )
-ROUTER_JSON = ROOT / "config/model-router.json"
+
+
+def _router_json() -> Path:
+    """The catalog, private override first, committed example second.
+
+    This was a bare path to config/model-router.json, which is gitignored and
+    therefore absent from every fresh clone. `_read_json` returns {} rather
+    than raising, so the console did not fail -- it reported an empty cluster,
+    no pool VRAM and no runtimes, with every indicator healthy. An absent
+    catalog and a catalog describing nothing are different facts and this
+    reported the second for the first.
+    """
+    real = ROOT / "config/model-router.json"
+    return real if real.is_file() else ROOT / "config/model-router.example.json"
+
+
+ROUTER_JSON = _router_json()
 SCRIPTS = ROOT / "scripts"
 SECRET_BIN = os.environ.get("CSD_SECRET_BIN", "/usr/local/bin/secret")
 HEARTBEAT = Path(
