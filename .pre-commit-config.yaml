@@ -1,0 +1,42 @@
+# Style is REPAIRED, never a refusal -- see scripts/csd-style-repair.
+#
+# WHY THIS FILE IS THE DECLARATION. csd-style-repair asks "does this repo
+# configure this tool?" before running anything, because imposing a formatter
+# nobody opted into is a diff nobody asked for and a review nobody can read.
+# Until now that question was answered by sniffing pyproject.toml for a
+# `[tool.X]` section, which only works for the four tools the TOOLS table
+# knows. This file IS the answer, declaratively, for any language.
+#
+# FILE DISCOVERY IS BY SHEBANG, NOT BY EXTENSION. Every script here is
+# extensionless, and `ruff check .` walks *.py only -- which is why
+# pyproject.toml carries a hand-written `extend-include` list of 22 paths.
+# That list is LESSONS.md pattern 1 exactly: an allow-list someone has to
+# remember to update, which reports "clean" for the files it forgot. pre-commit
+# passes explicit paths chosen by `identify`, which reads shebangs. VERIFIED on
+# this tree: scripts/autodev and scripts/csd-security-scan classify as `python`,
+# scripts/gate and scripts/fleet-gpu-mode as `shell` -- so the shell scripts are
+# NOT handed to ruff, which is the failure the extend-include comment warns
+# about ("834 errors that were semicolons in bash").
+#
+# VERSIONS ARE PINNED TO CI. .github/workflows/ci.yml pins RUFF_VERSION and
+# SHELLCHECK_PY_VERSION; these revs track them. Two definitions of correctness
+# is how a repo ends up green in one place and broken in the other, and the
+# ruff currently on PATH here (0.15.8) formats differently from the pinned
+# 0.14.13 -- so the skew is real, not hypothetical.
+#
+# shellcheck comes from shellcheck-py, NOT koalaman/shellcheck-precommit: that
+# hook runs shellcheck in DOCKER, and this agent runs as an unprivileged
+# service account on a podman fleet with no docker socket. scripts/gate already
+# falls back to `uvx shellcheck-py` for the same reason.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.13
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck

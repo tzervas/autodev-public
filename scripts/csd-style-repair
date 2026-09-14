@@ -43,6 +43,28 @@ from pathlib import Path
 # three tools for two jobs ruff already does, and three configs to drift apart.
 # The house standard names one toolchain per language; this follows it.
 TOOLS = [
+    # pre-commit FIRST, and it SUBSUMES the rest when a repo declares it. A
+    # .pre-commit-config.yaml is the repo saying, in one place and for every
+    # language, which tools it wants and at which versions -- which is exactly
+    # what `configures()` below has to infer from marker files otherwise, and it
+    # can only infer it for the four entries hard-coded here. A repo that
+    # formats Go, YAML, TOML or Markdown is invisible to this table and fully
+    # visible to pre-commit.
+    #
+    # It also fixes the discovery hole. Every script in this repo is
+    # extensionless, so `ruff check .` walks zero of them; pre-commit chooses
+    # paths with `identify`, which reads SHEBANGS, and hands ruff the Python
+    # ones and shellcheck the shell ones. That is the allow-list defect from
+    # LESSONS.md pattern 1 removed rather than re-listed.
+    #
+    # Running both would run ruff twice at two different versions -- the repo's
+    # own, and the one pre-commit pins -- which is two definitions of correct.
+    (
+        "pre-commit",
+        (".pre-commit-config.yaml", ".pre-commit-config.yml"),
+        ["pre-commit", "run", "--all-files"],
+        ["pre-commit", "run", "--all-files", "--show-diff-on-failure"],
+    ),
     (
         "ruff-format",
         ("ruff.toml", ".ruff.toml", "pyproject.toml"),
@@ -128,7 +150,11 @@ def main() -> int:
 
     before = set(git_dirty(repo))
     ran, skipped, unfixable = [], [], []
+    subsumed = False
     for name, markers, fix, check in TOOLS:
+        if subsumed:
+            skipped.append({"tool": name, "why": "pre-commit runs it"})
+            continue
         if not configures(repo, name, markers):
             skipped.append({"tool": name, "why": "not configured by this repo"})
             continue
@@ -147,13 +173,37 @@ def main() -> int:
             timeout=600,
         )
         rec = {"tool": name, "rc": p.returncode}
-        if p.returncode != 0:
+        failed = p.returncode != 0
+        if failed and name == "pre-commit" and not a.check:
+            # pre-commit exits non-zero for BOTH "a hook repaired a file" and
+            # "a hook found something it cannot repair", and the two demand
+            # opposite responses. Every other entry in TOOLS is a single tool
+            # whose fix-mode exit means only the second.
+            #
+            # Reading them as one would file every successful repair as an
+            # unfixable finding -- a pipeline that halts on formatting, which is
+            # the exact thing this script exists to prevent.
+            #
+            # A second pass settles it, because the repairs from the first are
+            # already applied: clean now means the first exit was repairs. This
+            # is also correct for a run that BOTH repaired some files and failed
+            # on others, which comparing the dirty set before and after is not.
+            again = subprocess.run(
+                fix, cwd=str(repo), capture_output=True, text=True, timeout=600
+            )
+            rec["rerun_rc"] = again.returncode
+            failed = again.returncode != 0
+            if failed:
+                p = again
+        if failed:
             # In fix mode a non-zero exit means findings the tool could not
             # repair itself -- a real disagreement, and the only kind worth a
             # human's attention.
             rec["unfixable"] = (p.stdout or p.stderr or "").strip()[-1500:]
             unfixable.append(rec)
         ran.append(rec)
+        if name == "pre-commit":
+            subsumed = True
 
     after = set(git_dirty(repo))
     changed = sorted(after - before)
