@@ -1,0 +1,105 @@
+# THE DECLARED VIRTUAL KEYS. This file is the intent; Postgres holds the fact.
+#
+# WHY THIS FILE EXISTS SEPARATELY FROM litellm.example.yaml. LiteLLM's
+# config.yaml is declarative and lives in git. Virtual keys, budgets and their
+# model restrictions are NOT in it -- they are rows in Postgres created through
+# `/key/generate`. So the half of the gateway that carries the safety property
+# is runtime state that nothing reconciles against a stated intent, and it
+# drifts without anything going red. That is the shape of every defect in
+# docs/LESSONS.md, so it gets a declaration and a drift check rather than a
+# runbook step someone remembers.
+#
+# THE PROPERTY THIS ENFORCES. docs/AGENT-ORGANISATION.md requires that the
+# reviewer and the implementer never resolve to the same model, because a
+# second opinion from the same weights is a correlated opinion labelled
+# independent. Today that is checked AFTER the fact by csd-autodev-review
+# asking /model/info what two aliases resolved to. A key that cannot reach the
+# implementer's model at all makes it a boundary instead of a check -- the
+# gateway refuses rather than the reviewer noticing.
+#
+# `models` is an ALLOW-LIST here, deliberately, against this repo's own
+# standing preference for deny-lists. The reason a deny-list is normally right
+# is that a new member should be covered on the day it appears; here the
+# opposite is what safety requires -- a new model must NOT become reachable by
+# every role the moment it is added. Widening a role's reach should be a
+# reviewed act, which is the same exception the forge repository allow-list
+# takes.
+#
+# NO KEY VALUES ARE IN THIS FILE AND NEVER WILL BE. It declares what each key
+# may do. The generated secret goes to the agent's vault and is injected by
+# `secret exec`; this file names the vault entry, not the token.
+#
+# ROTATION IS NOT AVAILABLE HERE. `/key/{key}/regenerate` and scheduled
+# rotation are Enterprise. scripts/csd-secret-rotate keeps that job.
+
+version: 1
+
+keys:
+  - alias: autodev-implementer
+    role: implementer
+    vault_entry: gateway/key-implementer
+    models: [coder-deep, coder-fast]
+    max_budget: 25.0
+    budget_duration: 30d
+    rpm_limit: 60
+    note: >
+      The swap-out card's models. Does NOT include `reviewer`: an implementer
+      that can call the review model can mark its own work independent.
+
+  - alias: autodev-reviewer
+    role: reviewer
+    vault_entry: gateway/key-reviewer
+    models: [reviewer]
+    max_budget: 10.0
+    budget_duration: 30d
+    rpm_limit: 30
+    note: >
+      ONE model, and not the implementer's. This is the whole point of the
+      file. If this list ever contains coder-deep, the review gate is
+      returning correlated opinions and reporting them as independent.
+
+  - alias: autodev-planner
+    role: planner
+    vault_entry: gateway/key-planner
+    models: [coder-deep, coder-fast]
+    max_budget: 10.0
+    budget_duration: 30d
+    rpm_limit: 30
+
+  - alias: autodev-utility
+    role: utility
+    vault_entry: gateway/key-utility
+    models: [coder-fast, embed]
+    max_budget: 5.0
+    budget_duration: 30d
+    rpm_limit: 120
+    note: >
+      Commit messages, summaries, embeddings. Cheap model only -- a utility
+      call that reaches the deep model is a budget leak nobody will notice,
+      because it works.
+
+# INVARIANTS the drift check asserts, not suggestions. Each one is a finding
+# if it fails, and the gate is where it should fail rather than a dashboard.
+invariants:
+  - id: reviewer-excludes-implementer
+    why: >
+      The review gate's independence claim rests entirely on this. A reviewer
+      key that can reach any model in the implementer's list makes the gate
+      capable of approving a diff with the weights that wrote it.
+    assert: no_overlap
+    between: [autodev-reviewer, autodev-implementer]
+
+  - id: every-key-is-declared
+    why: >
+      A key present at the gateway and absent here is one nobody agreed to,
+      and it is the only kind that can quietly hold broader access than any
+      role is supposed to have. Absent from this file is not "fine", it is
+      unreviewed.
+    assert: live_keys_subset_of_declared
+
+  - id: every-declared-key-exists
+    why: >
+      The mirror case, and the quieter one: a declared key that was never
+      created means the role is falling back to whatever credential it finds,
+      which is usually the master key. That reads as working.
+    assert: declared_keys_all_live
