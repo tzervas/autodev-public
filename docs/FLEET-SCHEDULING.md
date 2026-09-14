@@ -1,9 +1,14 @@
 # Fleet scheduling: placement, priority, and yielding legibly
 
-**Status: captured, not ratified.** This is destined for `akula-ai-platform`
-as an ADR superseding ADR-0012 on the Kubernetes question. It is written here
-because `akula-ai-platform` is behind Forgejo and a fourth stale document in
-that tree helps nobody. Move it when the sync lands.
+**Status: captured, not ratified.** This is destined for the private
+fleet-platform repository as an ADR superseding its ADR-0012 on the Kubernetes
+question. It is written here because that tree is behind Forgejo and a fourth
+stale document in it helps nobody. Move it when the sync lands.
+
+The repository is not named here, and neither are the fleet's hosts. This tree
+is published, and an architecture document is exactly the kind of artefact that
+reads as harmless while being a map of what exists and where. The private
+counterpart branch carries both.
 
 ---
 
@@ -38,8 +43,8 @@ under it.
 ## What excluding Kubernetes does NOT solve
 
 ADR-0012 chose k3s for **scheduling**, not for containers. Its cited defect was
-two CPU runners carrying byte-identical labels, so jobs targeting the homelab
-executed on the operator's desktop. Dropping Kubernetes leaves that open, and
+two CPU runners carrying byte-identical labels, so jobs targeting the
+services host executed on the operator's desktop. Dropping Kubernetes leaves that open, and
 the current owner of that job — `csd-model-router` plus `fleet-gpu-mode` plus
 flock plus a timer — is exactly what produced it.
 
@@ -55,12 +60,17 @@ the objective above.
 
 ## Topology
 
+Named with this tree's own sanitised host labels, the ones in
+`config/model-router.example.json` and `config/fleet.example.json`. The real
+fleet names stay in the private override — a topology table is exactly the kind
+of thing that reads as harmless and is a map.
+
 | node | role | GPU jobs |
 |---|---|---|
-| homelab | services, **CPU runners only** | no |
-| akula-prime | 3090 Ti, operator's desktop | yes |
-| gpu5080 | 5080 | yes |
-| gpu5080's VFIO guest | 1080 Ti passed through | yes |
+| `host-edge` | services, **CPU runners only** | no |
+| `host-a` | 24 GB card, operator's desktop | yes |
+| `host-gpu-b` | 16 GB card | yes |
+| `host-gpu-b-1080ti` | 11 GB card, VFIO guest on `host-gpu-b` | yes |
 
 Three GPU-capable nodes, one of which is a VM on the second. Host and guest are
 separate scheduler clients; GPU accounting is separate, which is correct because
