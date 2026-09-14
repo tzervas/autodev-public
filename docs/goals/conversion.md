@@ -37,14 +37,45 @@ items below — not in small, tested, single-purpose parsers.
 |---|---|---|
 | G-CVSS-1 | Replace the hand-written CVSS v3.1 arithmetic in `scripts/csd-security-scan` with the `cvss` library. | done |
 | G-STYLE-1 | Make `.pre-commit-config.yaml` the style declaration, subsuming the `TOOLS` table when present. | done |
+| G-PUBLISH-1 | Refuse a substitution table whose distinct patterns share a replacement. | done |
+| G-SCHEMA-1 | Specify the two reply protocols as JSON Schema in `config/reply-schemas.json`. | done |
+| G-UNIT-1 | systemd units for the three GPU modes, exclusivity by `Conflicts=`. | done |
+
+### What the first pass through this queue cost, and why
+
+Recorded because the failure was in the GOALS, not in the implementers, and
+the next batch is written by whoever reads this.
+
+**G-PUBLISH-1 was rejected once.** The first implementation exempted
+`shared_replacement` per RULE rather than per REPLACEMENT, so a marked rule and
+an unmarked rule sharing a replacement passed silently — a guard reporting
+clean for the case it was installed to catch. It passed every acceptance
+criterion, because criterion 2 only exercised a pair the flag *cleared*; "one
+flag of two is enough" was never questioned, so it was never wrong. **Write
+the criterion that would fail, not the one that demonstrates the feature.**
+
+**G-UNIT-1's goal cited a file this repository does not contain.**
+`config/model-router.json` holds the `pool` block with `preempt_autodev` and
+`headroom_mib`, and it is in the PRIVATE tree only — `config/` here has no such
+file. The implementer checked, found it absent, encoded the policy from the
+goal's stated semantics instead, and said so. That is rule 1 of
+`docs/WRITING-GOALS.md` enforced from the other direction, and it is the third
+time a goal has cost a cycle by describing something that is not there. **A
+goal naming a path must be written against the tree it will run in.**
+
+**G-SCHEMA-1's criterion 3 was ill-posed.** It asked the schemas to reject "a
+substitution whose arrow is split across two lines". In JSON there is no arrow
+— that ambiguity existed only because the grammar was prose, which is the
+entire reason the goal exists. The implementer reconstructed the degenerate
+instance the failure collapses to (a `from` with no matching `to`) and
+documented the reinterpretation rather than silently satisfying the words.
 
 ## Open — verifiable without the fleet
 
 | id | goal | state |
 |---|---|---|
-| G-PUBLISH-1 | `scripts/csd-publish` verifies that no ORIGINAL identifier survives into the published tree, and does not verify that DISTINCT originals map to DISTINCT replacements. Nothing checks the substitution table for collisions. This has already corrupted three places in the published tree: `scripts/csd-lab-console:656` reads `if ip not in {HOST_GPU_B_IP, "203.0.113.99", "203.0.113.99"}` where two different real addresses both became `203.0.113.99`, turning a three-element exclusion set into two; and `tests/test_substitutions.py` lines 70 and 91 now assert `"203.0.113.10" in after and "203.0.113.10" not in after`, which cannot hold, so both tests fail at baseline. Add a fail-closed guard that refuses the publish when two substitution rules with DIFFERENT patterns share the same `replacement`, naming every colliding pattern and the replacement they share. Give it the narrow escape hatch this repo uses elsewhere: a rule carrying `"shared_replacement": true` is exempt, because case variants of one hostname legitimately collapse. A rule without it is not. Prove: a table with two distinct patterns sharing a replacement is refused and BOTH patterns are named in the message; the same table with `shared_replacement` on one rule is allowed; a table with no collision is unaffected; and the existing "an original survived" refusal still works. IMPORTANT: `SUBSTITUTIONS` is built by `load_rules()` at MODULE IMPORT time from `config/fleet.json` or `$AUTODEV_FLEET_CONFIG`, so a test must set the environment variable and THEN load the module — and `tests/conftest.py` deletes every `AUTODEV_*` variable in an autouse fixture, which runs BEFORE the test body, so `monkeypatch.setenv` inside the test is what makes it stick. There is no `tests/test_publish.py`; this script is untested. | open |
-| G-SCHEMA-1 | The loop's two reply protocols are defined only by the parser that reads them, so the model cannot check its output against them and strictness relocates the error rather than preventing it — `docs/LESSONS.md` pattern 4. Write them as JSON Schema in `config/reply-schemas.json`: a whole-file proposal (`path` plus `content`) and a substitution proposal (`path` plus `substitutions`, an array of from/to pairs). This is the backend-independent prerequisite for constrained decoding — vLLM takes a schema directly, llama.cpp takes GBNF compiled from one — so the schemas must be data, not code. Prove the schemas against the fixtures that already exist: the `REPLY` constant in `tests/test_substitutions.py` validates, and the whole-file form asserted in `test_a_file_proposal_still_parses` validates. Prove they REJECT the shapes that cost real cycles: a substitution whose from/to arrow is split across two lines, and an object with neither `content` nor `substitutions`. Do NOT change `extract_json`, `parse_substitutions` or any parser — this goal adds the specification, it does not switch anything over to it. `jsonschema` is already a dev dependency. | open |
-| G-UNIT-1 | `scripts/fleet-gpu-mode` hand-rolls container lifecycle that systemd owns: an `flock` on fd 9 with a `9>&-` fix for conmon inheriting it, a `wait_healthy` curl poll, a `gpu-mode.json` state file, and rollback-to-previous-mode. Add declarative systemd units under `deploy/systemd/` for the three modes (`dev`, `review`, `free`) that make mode exclusivity a `Conflicts=` guarantee rather than a lock file, and readiness a unit property rather than a poll. Write plain `.service` units invoking `podman run`, NOT Quadlet `.container` files: Quadlet needs podman >= 4.4 and Debian 12 bookworm ships 4.3.1 with no backport, so a Quadlet unit would not start on the target host. State the Quadlet upgrade path in a comment. Preserve two properties from the script exactly: it passes `--device nvidia.com/gpu=all` (CDI, already the current standard — do not change it to `--gpus`), and `config/model-router.json` sets `"preempt_autodev": false`, so the restart policy must NOT let a crashed review container reclaim a card autodev is using. Prove every unit passes `systemd-analyze verify`. Do NOT delete or modify `scripts/fleet-gpu-mode`: which units the host actually runs is an operator deployment decision, and the script is what works today. | open |
+| G-ONEFILE-1 | `extract_json` in `scripts/csd-autodev-loop` accepts an ARRAY of proposals — its docstring says so, because "the model returns an array whenever the goal touches more than one file". `apply_proposal` writes exactly ONE, which `config/roles.json` already records under `decomposer`: "One file per task is a hard constraint: apply_proposal writes exactly one, so a two-file task lands half and closes anyway." So a two-file reply is parsed successfully, half-applied, and the goal closes as done on a green gate — a failure that reports success, `docs/LESSONS.md` pattern 2. `config/reply-schemas.json` (G-SCHEMA-1) describes a SINGLE object in both protocols and has no array form, so constraining the model to it makes the half-applied reply unrepresentable rather than merely documented. Decide and implement one of: reject an array in `apply_proposal` with a named error so it retries as one file per goal, or apply every element. Do NOT leave it parsing an array and writing one. Prove whichever you choose against a two-element array reply. IMPORTANT: `extract_json` returns `{"_parse_error": ...}` rather than `{}` on failure specifically so the caller can tell "the model proposed no file" from "we could not read what it said" — a rejection here must preserve that distinction rather than collapsing into it. | open |
+| G-PUBLISH-2 | `scripts/csd-publish` has no test coverage of `sanitise()` itself, only of the collision guard added by G-PUBLISH-1 and of the end-to-end refusals. The three corruptions in the published tree were produced BY `sanitise()`, and the guard now catches the table that causes them but nothing asserts what `sanitise()` does to a file. Add tests for `sanitise()` and `redact_sections()` directly. Read them first: `sanitise` applies `re.sub(pattern, replacement, text)` for each rule IN ORDER, so an earlier rule's output is visible to a later rule — prove whether that ordering dependence is intended, and state the answer in the test. | open |
 
 ## Open — blocked on the fleet
 
