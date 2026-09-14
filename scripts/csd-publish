@@ -173,11 +173,66 @@ def redact_sections(text: str, rules: list) -> str:
     return text
 
 
-def sanitise(text: str) -> str:
-    """Apply the private substitution table. With none loaded, a no-op."""
+def sanitise(text: str, seen: dict | None = None) -> str:
+    """Apply the private substitution table. With none loaded, a no-op.
+
+    `seen`, when given, accumulates what was ACTUALLY MATCHED, as
+    `{replacement: {matched_text: {pattern, ...}}}`, for `merged_identifiers()`
+    below. Recorded here because this is the only place that knows it: a
+    pattern is a regex, and what it matched is not recoverable from the rule.
+    """
     for pat, rep in SUBSTITUTIONS:
-        text = re.sub(pat, rep, text)
+        if seen is None:
+            text = re.sub(pat, rep, text)
+            continue
+
+        def _record(m: re.Match, _pat: str = pat, _rep: str = rep) -> str:
+            seen.setdefault(_rep, {}).setdefault(m.group(0), set()).add(_pat)
+            return _rep
+
+        text = re.sub(pat, _record, text)
     return text
+
+
+def merged_identifiers(seen: dict, rules: list) -> list[tuple[str, list[str]]]:
+    """Replacements that two or more DISTINCT original strings actually became.
+
+    WHY THIS EXISTS ALONGSIDE find_collisions. That one reads the TABLE, which
+    is the right place to fail fast -- before a byte is copied -- and it cannot
+    see the case where ONE rule merges two originals by itself. Patterns are
+    regexes fed to `re.sub`, so a single unmarked rule `host-gpu-[ab]` mapping
+    to one placeholder collapses two hosts with no second table entry to group
+    against. Measured: that table publishes `203.0.113.99 and 203.0.113.99`
+    from two distinct hosts, exits 0, and prints "verified: no original
+    identifier survives" -- because none did, they merged, which the verifier
+    has no vocabulary for.
+
+    So this checks the OUTPUT instead of the config, which is the discipline
+    docs/LESSONS.md #5 states as "before trusting a check, ask what it looked
+    at". It costs one extra bookkeeping dict over text already being read.
+
+    The exemption is the same one and is applied the same way: a replacement is
+    excused only when EVERY rule that reached it carries `shared_replacement`.
+    `HOST-A` and `host-a` collapsing onto one hostname is correct and marked;
+    an unmarked rule joining them is the defect, whether it arrived as a second
+    row or as an alternation inside the first.
+    """
+    marked = {
+        r.get("pattern")
+        for r in rules
+        if r.get("shared_replacement") and r.get("pattern") is not None
+    }
+    out = []
+    for replacement, matches in seen.items():
+        if len(matches) < 2:
+            continue
+        contributing: set[str] = set()
+        for pats in matches.values():
+            contributing |= pats
+        if contributing and contributing <= marked:
+            continue
+        out.append((replacement, sorted(matches)))
+    return sorted(out)
 
 
 def find_collisions(rules: list) -> list[tuple[str, list[tuple[str, bool]]]]:
@@ -288,6 +343,7 @@ def main() -> int:
     files = [f for f in r.stdout.split() if f]
 
     withheld, copied = [], []
+    matched: dict = {}
     if not a.check_only:
         if dest.exists():
             shutil.rmtree(dest)
@@ -307,7 +363,7 @@ def main() -> int:
                 body = s.read_text(encoding="utf-8")
                 if rel in REDACTIONS:
                     body = redact_sections(body, REDACTIONS[rel])
-                d.write_text(sanitise(body), encoding="utf-8")
+                d.write_text(sanitise(body, matched), encoding="utf-8")
                 d.chmod(s.stat().st_mode & 0o777)
                 continue
             except UnicodeDecodeError:
@@ -320,6 +376,27 @@ def main() -> int:
 
     if a.check_only:
         return 0
+
+    # MERGE CHECK, before the leak check, because the two failures are
+    # different and the second cannot see the first. `leaked` asks whether an
+    # original SURVIVED; this asks whether two originals arrived as the same
+    # string. Nothing original survives a merge, so the verifier below reports
+    # success on exactly the corruption this repository has already shipped
+    # three times.
+    merged = merged_identifiers(matched, SUBSTITUTION_RULES)
+    if merged:
+        print(f"\n  SANITISER FAILED — {len(merged)} replacement(s) merged:")
+        for replacement, originals in merged:
+            print(f"    {', '.join(repr(o) for o in originals)} -> {replacement!r}")
+        print(
+            "\n  Two different originals became the SAME string in the "
+            "published tree. Nothing original leaked, so the verifier below "
+            "would have passed this. Give each original its own replacement, "
+            'or mark EVERY rule that reaches one with "shared_replacement": '
+            "true if the collapse is deliberate."
+            "\n  The publication tree is NOT safe. Nothing was pushed."
+        )
+        return 1
 
     # VERIFY. A sanitiser nobody checks is one that missed something, and here
     # "missed something" means published it.

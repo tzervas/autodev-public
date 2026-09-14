@@ -226,6 +226,72 @@ def test_one_marked_rule_out_of_two_still_refuses_via_main(tmp_path, monkeypatch
 # --------------------------------------------------------------------------- #
 # 3. A table with no collision is unaffected -- the ordinary run succeeds.
 # --------------------------------------------------------------------------- #
+def test_one_rule_merging_two_originals_by_alternation_is_refused(
+    tmp_path, monkeypatch, capsys
+):
+    """The table check cannot see this, and it is the same corruption.
+
+    `find_collisions` groups rules by replacement, so it needs TWO entries to
+    have anything to compare. A single regex `host-gpu-[ab]` mapping to one
+    placeholder merges two hosts with no second row to group against -- and
+    before this, that table published `203.0.113.99 and 203.0.113.99`, exited
+    0, and printed "verified: no original identifier survives". Which was
+    true: none survived, they MERGED, and the verifier has no vocabulary for
+    that.
+
+    So the second half of the guard reads the OUTPUT rather than the config.
+    Anyone who hits the table refusal and "fixes" it by folding two rules into
+    one alternation would otherwise get silence.
+    """
+    fleet = write_fleet(
+        tmp_path,
+        [{"pattern": "host-gpu-[ab]", "replacement": "203.0.113.99"}],
+        forbidden=["host-gpu-a", "host-gpu-b"],
+    )
+    mod = load_publish(monkeypatch, fleet)
+    assert mod.find_collisions(mod.SUBSTITUTION_RULES) == [], (
+        "the TABLE is clean -- one rule, one replacement -- which is the point"
+    )
+    src = make_repo(tmp_path, "src", {"a.txt": "host-gpu-a and host-gpu-b live here\n"})
+    monkeypatch.setattr(sys, "argv", ["csd-publish", str(src), str(tmp_path / "dest")])
+
+    rc = mod.main()
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "replacement(s) merged" in out
+    assert "'host-gpu-a', 'host-gpu-b'" in out
+    assert "NOT safe" in out
+
+
+def test_a_marked_alternation_is_allowed(tmp_path, monkeypatch, capsys):
+    """The exemption reaches the output check too, or it would be unusable.
+
+    A rule deliberately collapsing case variants of one hostname is correct.
+    Excusing it in the half of the guard that reads the table and then
+    refusing it in the half that reads matched text would make
+    `shared_replacement` mean nothing.
+    """
+    fleet = write_fleet(
+        tmp_path,
+        [
+            {
+                "pattern": "[Hh]ost-a",
+                "replacement": "host-a",
+                "shared_replacement": True,
+            }
+        ],
+    )
+    mod = load_publish(monkeypatch, fleet)
+    src = make_repo(tmp_path, "src", {"a.txt": "Host-a and host-a are one host\n"})
+    monkeypatch.setattr(sys, "argv", ["csd-publish", str(src), str(tmp_path / "dest")])
+
+    rc = mod.main()
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "merged" not in out
+    assert (tmp_path / "dest" / "a.txt").read_text() == "host-a and host-a are one host\n"
+
+
 def test_a_table_with_no_collision_publishes_cleanly(tmp_path, monkeypatch, capsys):
     fleet = write_fleet(
         tmp_path,
