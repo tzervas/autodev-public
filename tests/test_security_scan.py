@@ -605,7 +605,7 @@ def test_a_cvss_vector_is_scored_not_guessed(tmp_path, monkeypatch):
     """
     mod = load_scan()
     vector = "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:C/C:L/I:L/A:L"
-    assert mod.cvss3_base_score(vector) == 6.8
+    assert mod.cvss_base_score(vector) == 6.8
     install(mod, monkeypatch, {"osv-scanner"}, {"osv-scanner": (1, osv_out(vector))})
     res = mod.scan(tmp_path, POLICY, "merge")
     assert res["findings"][0]["severity"] == "medium"
@@ -620,22 +620,84 @@ def test_a_critical_cvss_vector_blocks_the_merge_gate(tmp_path, monkeypatch):
     """
     mod = load_scan()
     vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
-    assert mod.cvss3_base_score(vector) == 10.0
+    assert mod.cvss_base_score(vector) == 10.0
     install(mod, monkeypatch, {"osv-scanner"}, {"osv-scanner": (1, osv_out(vector))})
     res = mod.scan(tmp_path, POLICY, "merge")
     assert res["findings"][0]["severity"] == "critical"
     assert ids(res) == ["OSV-FAKE-1"]
 
 
-def test_an_unscoreable_severity_falls_back_to_medium(tmp_path, monkeypatch):
-    """CVSS:4.0 is not attempted, and the fallback must not be "clean".
+def test_a_cvss4_vector_is_scored_now_that_the_maths_is_not_ours(tmp_path, monkeypatch):
+    """v4 was declined while the arithmetic was hand-written. It no longer is.
 
-    A wrong score is worse than no score, but a dropped finding is worse than
-    both: defaulting to medium keeps it in the release gate where a human has
-    to look at it.
+    The reason for skipping v4 was that a wrong score is worse than no score --
+    a sound judgement about code we would have had to write from the spec, and
+    not a reason to refuse a scored standard with a maintained implementation.
+    This vector scores 9.9, a critical, and used to fall back to medium and sit
+    in the release gate instead of blocking the merge.
     """
     mod = load_scan()
-    assert mod.cvss3_base_score("CVSS:4.0/AV:N/AC:L") is None
+    vector = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:N"
+    assert mod.cvss_base_score(vector) == 9.9
+    install(mod, monkeypatch, {"osv-scanner"}, {"osv-scanner": (1, osv_out(vector))})
+    res = mod.scan(tmp_path, POLICY, "merge")
+    assert res["findings"][0]["severity"] == "critical"
+    assert ids(res) == ["OSV-FAKE-1"]
+
+
+def test_the_worst_scoring_of_an_advisory_wins_not_the_first(tmp_path, monkeypatch):
+    """An advisory scored twice must be banded by the WORSE score.
+
+    This is a regression guard on a gate that silently stopped blocking.
+    `osv_severity` returned on the first SCOREABLE entry, which was safe only
+    while the scorer understood v3 alone: a v2 vector returned None, fell
+    through, and the v3 vector below it decided the band. Teaching the scorer
+    v2 and v4 made the first entry authoritative -- and OSV lists entries in
+    database order, which for any pre-2016 CVE is v2 first.
+
+    The vectors below are Heartbleed's own. v2 scores 5.0 (medium, does NOT
+    block a merge); v3 scores 7.5 (high, does). Every legacy advisory in NVD's
+    normal ordering demoted itself across that boundary, on a scan reporting
+    success -- docs/LESSONS.md pattern 2, introduced by the commit that cited
+    it.
+    """
+    mod = load_scan()
+    advisory = {
+        "severity": [
+            {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:N/A:N"},
+            {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"},
+        ]
+    }
+    assert mod.cvss_base_score(advisory["severity"][0]["score"]) == 5.0
+    assert mod.cvss_base_score(advisory["severity"][1]["score"]) == 7.5
+    assert mod.osv_severity(advisory, None) == "high"
+
+    # Order must not matter: the same advisory listed v3-first is still high.
+    assert mod.osv_severity({"severity": advisory["severity"][::-1]}, None) == "high"
+
+    # And a v4 entry ahead of a worse v3 one does not demote it either.
+    v4 = "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:H/VI:L/VA:L/SC:N/SI:N/SA:N"
+    v3 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+    both = {
+        "severity": [
+            {"type": "CVSS_V4", "score": v4},
+            {"type": "CVSS_V3", "score": v3},
+        ]
+    }
+    assert mod.osv_severity(both, None) == "critical"
+
+
+def test_an_unscoreable_severity_falls_back_to_medium(tmp_path, monkeypatch):
+    """A vector that does not parse must not read as "clean".
+
+    `CVSS:4.0/AV:N/AC:L` is a MALFORMED v4 vector -- v4 mandates AT, VC, VI,
+    VA, SC, SI and SA, and this has none of them -- so it is unscoreable even
+    now that v4 is attempted. That is the case this guards: a wrong score is
+    worse than no score, but a dropped finding is worse than both. Defaulting
+    to medium keeps it in the release gate where a human has to look at it.
+    """
+    mod = load_scan()
+    assert mod.cvss_base_score("CVSS:4.0/AV:N/AC:L") is None
     install(
         mod,
         monkeypatch,

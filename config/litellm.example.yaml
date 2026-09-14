@@ -1,0 +1,115 @@
+# LiteLLM proxy configuration. Committed, documentation-safe, same contract as
+# config/fleet.example.json: RFC 5737 addresses only, no credential of any kind.
+# The real config is assembled on the fleet from this shape plus the private
+# fleet.json; see docs/GATEWAY.md for what the gateway is allowed to own.
+#
+# SECRETS NEVER APPEAR HERE. `os.environ/VAR` resolves at runtime, and the
+# variables are filled by `secret exec VAR=name -- litellm ...` from the
+# agent's own vault, so a credential is never in a file, never in argv and
+# never in this repository.
+#
+# WHAT THIS FILE IS ALLOWED TO DECIDE: which alias reaches which endpoint, and
+# what the router does when one misbehaves. WHAT IT MUST NOT: which physical
+# card a model is resident on. LiteLLM has no notion of GPU memory, device
+# swapping or hardware capability matching -- that is config/model-router.json,
+# and restating any of it here creates a second answer that can disagree.
+
+model_list:
+  # ONE ENTRY PER PHYSICAL DEPLOYMENT, not per role. Roles reach these through
+  # model_group_alias below, so a role can be re-pointed without touching the
+  # deployment -- which is what "agent identity is separate from model
+  # identity" means once it is written down rather than asserted.
+  - model_name: coder-deep
+    litellm_params:
+      model: hosted_vllm/qwen3.5-9b
+      api_base: http://203.0.113.10:8001/v1
+      api_key: os.environ/VLLM_API_KEY
+      rpm: 60
+    model_info:
+      runtime: vllm
+      host: host-a
+      structured_output: json_schema
+
+  - model_name: reviewer
+    litellm_params:
+      model: hosted_vllm/nemotron-9b
+      api_base: http://203.0.113.11:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      rpm: 60
+    model_info:
+      runtime: vllm
+      host: host-gpu-b
+      structured_output: json_schema
+      # DELIBERATELY A DIFFERENT HOST from coder-deep, and the reason is not
+      # redundancy. A second opinion from the same weights is a correlated
+      # opinion labelled independent, and a helper sharing the implementer's
+      # backend either queues behind the work it is meant to unblock or forces
+      # a model swap on the card in use. See docs/AGENT-ORGANISATION.md.
+
+  - model_name: coder-fast
+    litellm_params:
+      model: openai/qwen3-4b
+      api_base: http://203.0.113.11:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      rpm: 120
+    model_info:
+      runtime: vllm
+      host: host-gpu-b
+      structured_output: json_schema
+
+  - model_name: embed
+    litellm_params:
+      model: openai/embed-qwen3-0.6b
+      api_base: http://203.0.113.12:8080/v1
+      api_key: os.environ/LLAMACPP_API_KEY
+    model_info:
+      runtime: llama.cpp
+      host: host-gpu-b-1080ti
+      structured_output: gbnf
+
+router_settings:
+  routing_strategy: simple-shuffle
+
+  # THE ROLE TABLE. This is the one place a role maps to a deployment, which
+  # retires `aliases.*.jobs` from the router catalog and the convention in
+  # config/roles.json -- the same mapping in three files is a drift surface
+  # under the one property the review gate depends on (see G-LITELLM-1).
+  model_group_alias:
+    implementer: coder-deep
+    reviewer: reviewer
+    planner: coder-deep
+    doc-engineer: coder-fast
+    utility: coder-fast
+
+  # Replaces demote() in scripts/csd-gateway-complete. A backend that fails
+  # twice in a minute is isolated by the router for five, which is what that
+  # function did by hand and kept in a JSON profile beside it.
+  allowed_fails: 2
+  cooldown_time: 300
+  num_retries: 2
+  timeout: 600
+
+litellm_settings:
+  # A DEAD backend falls back. A STUCK agent does NOT -- that is escalation,
+  # it fires on a green call, and wiring it here would trigger it on the wrong
+  # signal and never on the right one. See docs/GATEWAY.md.
+  fallbacks:
+    - coder-deep: [coder-fast]
+
+  # We do not have this today, and it is free: a prompt that overflows one
+  # deployment's window is retried against a larger one instead of failing.
+  context_window_fallbacks:
+    - coder-fast: [coder-deep]
+
+  # Retires record_call(). Requires the database below.
+  success_callback: [langfuse]
+  failure_callback: [langfuse]
+
+  drop_params: false
+  # false ON PURPOSE. Silently discarding a parameter the backend does not
+  # understand is how `response_format` goes missing and constrained decoding
+  # turns into free text that happens to parse -- until it does not.
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL

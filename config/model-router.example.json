@@ -1,0 +1,173 @@
+{
+  "_comment": [
+    "THE COMMITTED DEFAULTS for the model router, same contract as",
+    "config/fleet.example.json: every value here is documentation-safe (RFC 5737",
+    "TEST-NET-3 addresses, generic host names), so the public tree never carries",
+    "real infrastructure and is publishable by construction rather than by a",
+    "scrub. A private config/model-router.json overrides it and is gitignored.",
+    "",
+    "WHY THIS FILE EXISTS. It did not, and four readers wanted it:",
+    "scripts/csd-model-router, scripts/csd-lab-console (three call sites) and",
+    "scripts/csd-autodev-loop. Two of them fail soft -- `_read_json` returns {}",
+    "-- so on a fresh clone the console reported an empty cluster and ti_ok()",
+    "was unconditionally False, which is what failed eleven tests. The third",
+    "fails closed and says so. A config that only exists on one machine is not a",
+    "default, it is an undeclared dependency.",
+    "",
+    "WHAT THIS FILE OWNS, AND WHAT LITELLM OWNS. Checked against LiteLLM's",
+    "router documentation rather than assumed. LiteLLM natively provides routing",
+    "strategies (simple-shuffle, latency-based, usage-based-v2, least-busy,",
+    "cost-based), deployment `order` and `weight`, `allowed_fails` and",
+    "`cooldown_time`, `num_retries`, `max_parallel_requests`, `rpm`/`tpm`,",
+    "health-check filtering, context-window pre-call checks, `model_group_alias`",
+    "and fallbacks. NONE of that belongs here and none of it is restated here.",
+    "",
+    "LiteLLM has NO notion of GPU memory, model swapping on a device, or",
+    "physical hardware capability matching -- that is this file's whole subject:",
+    "whether a model can be resident on a given card right now, and what must be",
+    "evicted for it to be. `vram_mib`, `safeguard_mib`, `needs_caps`,",
+    "`exclusive_with`, `ttl_s`, `runtime` and the `pool` block have no LiteLLM",
+    "equivalent.",
+    "",
+    "KNOWN DUPLICATION, recorded rather than silently carried. `aliases.*.jobs`",
+    "restates what LiteLLM's `model_group_alias` expresses, and",
+    "`aliases.*.host_pref` restates what `model_list[].litellm_params.api_base`",
+    "already encodes. Role-to-model is therefore stated in THREE places -- here,",
+    "config/roles.json, and the gateway -- which is a drift surface under the",
+    "one property the review gate depends on (reviewer and implementer resolving",
+    "to different weights). Deduplicating it changes this schema, so it is a",
+    "goal rather than an edit: the private file is canonical and its shape must",
+    "not fork from this one.",
+    "",
+    "SECRETS ARE NOT HERE AND NEVER WILL BE. Addresses and capability labels",
+    "only; credentials are injected at run time from the agent's own vault."
+  ],
+  "schema": "csd-model-router/v2",
+  "never_dual_14b": true,
+  "autodev_default": "local/code",
+  "autodev_sticky": true,
+
+  "hosts": {
+    "host-a": {
+      "gpu": "RTX 3090 Ti",
+      "arch": "ampere",
+      "sm": "8.6",
+      "vram_mib": 23028,
+      "safeguard_mib": 20480,
+      "role": "autodev-local-code",
+      "caps": ["gguf-infer", "high-vram", "ampere", "sm_86", "fp16", "bf16", "decode-tight", "kv-cache"],
+      "lacks": ["native-fp8", "fp4", "sm_120", "blackwell", "parallel-batch"],
+      "prefer_jobs": ["autodev", "code", "review", "decode-tight", "chat"],
+      "_comment": "The swap-out card: whichever model is implementing holds it."
+    },
+    "host-gpu-b": {
+      "gpu": "RTX 5080",
+      "arch": "blackwell",
+      "sm": "12.0",
+      "vram_mib": 16303,
+      "safeguard_mib": 14336,
+      "role": "chat-comfy",
+      "caps": ["cuda-eval", "train", "triton", "index", "embed", "fp4", "fp8", "fp16", "bf16", "sm_120", "blackwell", "parallel-batch"],
+      "lacks": ["high-vram"],
+      "prefer_jobs": ["review", "embed", "index", "eval"],
+      "_comment": "Resident, and never the implementer's model -- it answers WHILE the implementer keeps its weights loaded. See docs/AGENT-ORGANISATION.md."
+    },
+    "host-gpu-b-1080ti": {
+      "gpu": "GTX 1080 Ti",
+      "arch": "pascal",
+      "sm": "6.1",
+      "vram_mib": 11264,
+      "safeguard_mib": 10240,
+      "live": true,
+      "installed": true,
+      "guest_ip": "203.0.113.12",
+      "role": "retrieve-index-light",
+      "caps": ["gguf-infer", "embed", "index"],
+      "lacks": ["bf16", "fp8", "fp4", "tensor-cores-modern"],
+      "prefer_jobs": ["embed", "index", "retrieve"],
+      "_comment": "A VFIO guest on host-gpu-b, so it has its own address. `live` is asserted by nvidia-smi in the guest, never inferred: retrieval and indexing move here only when something has SEEN the card, because RAG on the reasoning cards is what this placement exists to avoid."
+    }
+  },
+
+  "runtimes": {
+    "llama.cpp": {
+      "formats": ["gguf"],
+      "caps": ["gguf-infer", "rpc-split"],
+      "best_for": ["tiny-gguf", "autodev", "cpu-offload"],
+      "hosts": ["host-a", "host-gpu-b"],
+      "image": "example.invalid/localai:vX.Y-gpu-nvidia-cuda-12",
+      "license": "MIT",
+      "structured_output": "gbnf",
+      "_comment": "structured_output is the MECHANISM, not whether it works: llama-server converts a subset of JSON Schema to GBNF, and `response_format: json_schema` has documented breakage across versions where `json_object` behaves differently. G-CAPS-1 probes it rather than trusting this field."
+    },
+    "vllm": {
+      "formats": ["safetensors", "hf"],
+      "caps": ["paged-attn", "continuous-batch", "multi-lora", "parallel-batch"],
+      "best_for": ["batched-eval", "multi-lora-specialists", "long-ctx-page"],
+      "needs_caps": ["sm_86"],
+      "hosts": ["host-gpu-b"],
+      "image": "example.invalid/vllm-openai:vX.Y.Z",
+      "license": "Apache-2.0",
+      "structured_output": "json_schema"
+    },
+    "bitnet-cpp": {
+      "formats": ["bitnet-1.58", "w1.58a8"],
+      "caps": ["bitnet-1.58"],
+      "best_for": ["w1.58-specialists", "ternary-micro"],
+      "hosts": ["host-a", "host-gpu-b"],
+      "image": null,
+      "license": "MIT",
+      "structured_output": null,
+      "_comment": "NO IMAGE YET, and the probe reports it missing rather than assuming a default. Best-in-class for BitNet 1.58; do not force vLLM or llama.cpp onto a w1.58 model unless it has been measured. `structured_output: null` means UNKNOWN, not none -- it is a llama.cpp derivative so GBNF is plausible and unverified, which is exactly the distinction an absent image forces you to keep."
+    }
+  },
+
+  "pool": {
+    "enabled": false,
+    "backend": "mixed",
+    "backends": ["llama.cpp", "vllm", "bitnet-cpp"],
+    "combined_mib": 39331,
+    "headroom_mib": 1536,
+    "min_dwell_s": 600,
+    "tight_stays_on_one_card": true,
+    "preempt_autodev": false,
+    "_comment": "preempt_autodev: false is the policy deploy/systemd/fleet-gpu-mode-review.service encodes as `Restart=no`. A review container that restarts itself wins the race for the CDI device and the published port, which is preempting autodev once per crash. headroom_mib is reserved, not usable: `combined_mib` minus headroom is what a pooled model may actually claim."
+  },
+
+  "aliases": {
+    "local/code": {
+      "host_pref": ["host-a"],
+      "class": "14b",
+      "jobs": ["autodev", "code", "review"],
+      "vram_mib": 16500,
+      "ttl_s": 3600,
+      "latency": "tight",
+      "pool_ok": false,
+      "exclusive_with": ["14b", "heavy", "vision", "pooled"],
+      "needs_caps": ["gguf-infer", "high-vram"],
+      "prefer_caps": ["decode-tight"]
+    },
+    "local/fast": {
+      "host_pref": ["host-a"],
+      "class": "14b",
+      "jobs": ["chat", "summary"],
+      "vram_mib": 12000,
+      "ttl_s": 300,
+      "latency": "tight",
+      "pool_ok": false,
+      "exclusive_with": ["14b", "heavy", "vision", "pooled"],
+      "needs_caps": ["gguf-infer"]
+    },
+    "local/embed": {
+      "host_pref": ["host-gpu-b-1080ti", "host-gpu-b"],
+      "class": "small",
+      "jobs": ["embed", "index", "retrieve"],
+      "vram_mib": 2048,
+      "ttl_s": 1800,
+      "latency": "loose",
+      "pool_ok": true,
+      "needs_caps": ["embed"],
+      "_comment": "Ordered preference, not a fallback chain the router invents: the 1080 Ti first so retrieval stays off the two reasoning cards, host-gpu-b only when the guest is not live."
+    }
+  }
+}

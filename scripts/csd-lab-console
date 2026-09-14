@@ -95,7 +95,23 @@ GOALS = ROOT / "docs/program/GOALS.md"
 PHASE1 = Path(
     os.environ.get("CSD_PHASE1_BOARD", str(ROOT / "docs/program/PHASE-1-TASK-BOARD.md"))
 )
-ROUTER_JSON = ROOT / "config/model-router.json"
+
+
+def _router_json() -> Path:
+    """The catalog, private override first, committed example second.
+
+    This was a bare path to config/model-router.json, which is gitignored and
+    therefore absent from every fresh clone. `_read_json` returns {} rather
+    than raising, so the console did not fail -- it reported an empty cluster,
+    no pool VRAM and no runtimes, with every indicator healthy. An absent
+    catalog and a catalog describing nothing are different facts and this
+    reported the second for the first.
+    """
+    real = ROOT / "config/model-router.json"
+    return real if real.is_file() else ROOT / "config/model-router.example.json"
+
+
+ROUTER_JSON = _router_json()
 SCRIPTS = ROOT / "scripts"
 SECRET_BIN = os.environ.get("CSD_SECRET_BIN", "/usr/local/bin/secret")
 HEARTBEAT = Path(
@@ -148,7 +164,17 @@ WAN_BINDS = frozenset({"0.0.0.0", "::", "[::]"})
 PRIME_IP = FLEET.get("events.bind")
 HOST_GPU_B_IP = "203.0.113.11"
 HOMELAB_IP = "203.0.113.20"
-GUEST_IP_RE = re.compile(r"\b(192\.168\.1\.\d+)\b")
+# SANITISED BY HAND, because csd-publish could not see this one. Its verifier
+# looks for forbidden identifiers as TEXT, and a regex source literal spells a
+# dot `\.` -- so a pattern hunting for `192.168.` never matches `192\.168\.`
+# and a real subnet walked straight through a check built to stop exactly that.
+# It was dead code as well as a leak: every address in this tree is in RFC
+# 5737's TEST-NET-3, so the old pattern could not match anything and guest_ip
+# was unconditionally None, which is what failed test_cluster_snapshot_*.
+# The private tree keeps its real range; making the sanitiser cover escaped
+# literals is a separate goal, because the same blind spot covers every regex
+# in every published file.
+GUEST_IP_RE = re.compile(r"\b(203\.0\.113\.\d+)\b")
 
 
 def sh(args: list[str], timeout: int = 20) -> str:
@@ -565,11 +591,7 @@ def live_feed(snap: dict) -> dict:
             "goal": aout.get("goal"),
         }
     cluster = snap.get("cluster") if isinstance(snap.get("cluster"), dict) else {}
-    ti = (
-        cluster.get("host_gpu_c")
-        if isinstance(cluster.get("host_gpu_c"), dict)
-        else {}
-    )
+    ti = cluster.get("host_gpu_c") if isinstance(cluster.get("host_gpu_c"), dict) else {}
     pool = live_pool()
     return {
         "prime": {
@@ -653,7 +675,13 @@ def cluster_snapshot() -> dict:
     guest_ip = None
     for match in GUEST_IP_RE.finditer(raw or ""):
         ip = match.group(1)
-        if ip not in {HOST_GPU_B_IP, "203.0.113.99", "203.0.113.99"}:
+        # Two DISTINCT originals collapsed onto one placeholder here, so this
+        # read `{HOST_GPU_B_IP, "203.0.113.99", "203.0.113.99"}` -- a set that
+        # looks three wide and is two, silently excluding one address fewer
+        # than it names. ruff's B033 flags it; nothing else did. Named
+        # constants rather than literals now, so a future collapse cannot
+        # express itself as a duplicate at all.
+        if ip not in {HOST_GPU_B_IP, HOMELAB_IP}:
             guest_ip = ip
             break
     catalog_guest = stub.get("guest_ip")
@@ -661,10 +689,10 @@ def cluster_snapshot() -> dict:
         guest_ip = catalog_guest.strip()
     live = bool(stub.get("live"))
     rag = "retrieve-index-light" if live else "5080-embed-or-prime until live=true"
-    prime_spec = (
-        hosts.get("host-a") if isinstance(hosts.get("host-a"), dict) else {}
+    prime_spec = hosts.get("host-a") if isinstance(hosts.get("host-a"), dict) else {}
+    gpu_spec = (
+        hosts.get("host-gpu-b") if isinstance(hosts.get("host-gpu-b"), dict) else {}
     )
-    gpu_spec = hosts.get("host-gpu-b") if isinstance(hosts.get("host-gpu-b"), dict) else {}
     backends = [
         {
             "id": "host-a",
@@ -767,11 +795,7 @@ def snapshot() -> dict:
         lai = "unreachable"
     cluster = cluster_snapshot()
     guest_ip = None
-    ti = (
-        cluster.get("host_gpu_c")
-        if isinstance(cluster.get("host_gpu_c"), dict)
-        else {}
-    )
+    ti = cluster.get("host_gpu_c") if isinstance(cluster.get("host_gpu_c"), dict) else {}
     guest_raw = ti.get("guest_ip")
     if isinstance(guest_raw, str) and guest_raw.strip():
         guest_ip = guest_raw.strip()

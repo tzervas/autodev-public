@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import pathlib
 import time
 from pathlib import Path
 from typing import Any
@@ -608,7 +609,11 @@ def test_live_feed_pool_excludes_1080ti_when_not_live(
 ) -> None:
     """1080 Ti VRAM is omitted when catalog live is not true."""
     mod = load_lab(tmp_path, monkeypatch)
-    cat = json.loads((ROOT / "config" / "model-router.json").read_text(encoding="utf-8"))
+    # Read through the module's OWN resolution (private override, else the
+    # committed example) rather than the private path directly. Hardcoding it
+    # here meant the test could only run on a machine carrying the gitignored
+    # file -- a test that passes for its author and errors for everyone else.
+    cat = json.loads(pathlib.Path(mod.ROUTER_JSON).read_text(encoding="utf-8"))
     cat["hosts"]["host-gpu-b-1080ti"]["live"] = False
     path = tmp_path / "model-router.json"
     path.write_text(json.dumps(cat), encoding="utf-8")

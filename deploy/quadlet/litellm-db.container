@@ -1,0 +1,34 @@
+# Postgres for the LiteLLM proxy. REQUIRED, not optional: virtual keys, budgets
+# and spend tracking are database-backed, and those are the features that make
+# the gateway a boundary rather than a passthrough (see docs/GATEWAY.md).
+# Without it the proxy still routes, and every per-role budget and model
+# restriction silently does not exist.
+[Unit]
+Description=LiteLLM Postgres
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=docker.io/library/postgres:vX.Y   # PIN TO A DIGEST
+ContainerName=litellm-db
+Network=autodev.network
+Volume=litellm-db.volume:/var/lib/postgresql/data:Z
+
+Environment=POSTGRES_USER=litellm
+Environment=POSTGRES_DB=litellm
+Secret=litellm-db-password,type=env,target=POSTGRES_PASSWORD
+
+# NOT PUBLISHED. The database is reachable only from autodev.network, so no
+# PublishPort here at all -- a port published "just for psql" is how a database
+# ends up on a LAN address nobody audited.
+HealthCmd=pg_isready -U litellm -d litellm
+HealthInterval=10s
+HealthStartPeriod=30s
+HealthRetries=5
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

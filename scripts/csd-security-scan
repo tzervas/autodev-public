@@ -40,13 +40,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from cvss import CVSS2, CVSS3, CVSS4
+from cvss.exceptions import CVSSError
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "config" / "security-policy.json"
@@ -114,73 +116,44 @@ def run_command(cmd: list[str], cwd: Path, timeout: int = 900) -> tuple[int, str
 # --------------------------------------------------------------------------- #
 # Severity
 # --------------------------------------------------------------------------- #
-CVSS3_WEIGHTS = {
-    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
-    "AC": {"L": 0.77, "H": 0.44},
-    "UI": {"N": 0.85, "R": 0.62},
-    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
-    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
-    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
-}
-CVSS3_PR = {
-    "U": {"N": 0.85, "L": 0.62, "H": 0.27},
-    "C": {"N": 0.85, "L": 0.68, "H": 0.50},
-}
+def cvss_base_score(vector: str) -> float | None:
+    """Base score from a CVSS vector string, or None if it is not scoreable.
 
-
-def cvss3_base_score(vector: str) -> float | None:
-    """Base score from a CVSS:3.x vector string, or None if it is not one.
-
-    Computed rather than looked up because osv-scanner reports severity as the
+    Computed rather than guessed because osv-scanner reports severity as the
     VECTOR -- `CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:C/C:L/I:L/A:L` -- and a band
     guessed from the vector's shape would put a 6.8 in whichever bucket the
-    guess favoured. Verified against that exact vector, which osv independently
-    scores 6.8.
+    guess favoured. That vector scores 6.8, which osv independently agrees.
 
-    CVSS:4.0 is deliberately not attempted: a wrong score is worse than no
-    score, and the callers already have a documented fallback for None.
+    The arithmetic is the `cvss` library's (RedHatProductSecurity, pure Python,
+    no runtime dependencies), not ours. It was ours: v2/v3's weight tables, the
+    scope-dependent impact formula and CVSS 3.1's round-up -- which is neither
+    round-half-up nor ceil -- reimplemented from the specification. That is a
+    standard with a maintained implementation, and a subtly wrong severity is
+    the kind of defect that reads as a correct one.
+
+    CVSS:4.0 IS NOW ATTEMPTED. It was declined here on the grounds that a wrong
+    score is worse than no score, which was the right call about code we would
+    have had to write and is not a reason to decline a scored standard someone
+    else maintains. A vector that does not parse still returns None, and the
+    callers keep their documented fallback -- the guarantee that matters is
+    that an unscoreable severity never reads as clean.
+
+    `base_score` is a Decimal. It is returned as a float deliberately: callers
+    compare against float thresholds, and `Decimal("6.8") == 6.8` is False.
     """
-    parts = vector.strip().split("/")
-    if not parts or not parts[0].startswith("CVSS:3"):
-        return None
-    m = {}
-    for part in parts[1:]:
-        if ":" in part:
-            k, v = part.split(":", 1)
-            m[k] = v
-    try:
-        scope = m["S"]
-        exploitability = (
-            8.22
-            * CVSS3_WEIGHTS["AV"][m["AV"]]
-            * CVSS3_WEIGHTS["AC"][m["AC"]]
-            * CVSS3_PR[scope][m["PR"]]
-            * CVSS3_WEIGHTS["UI"][m["UI"]]
-        )
-        iss = 1 - (
-            (1 - CVSS3_WEIGHTS["C"][m["C"]])
-            * (1 - CVSS3_WEIGHTS["I"][m["I"]])
-            * (1 - CVSS3_WEIGHTS["A"][m["A"]])
-        )
-    except KeyError:
-        return None
-    if scope == "U":
-        impact = 6.42 * iss
-        raw = impact + exploitability
+    text = vector.strip()
+    if text.startswith("CVSS:3"):
+        cls = CVSS3
+    elif text.startswith("CVSS:4"):
+        cls = CVSS4
+    elif text.startswith("AV:"):
+        cls = CVSS2  # v2 vectors carry no version prefix
     else:
-        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
-        raw = 1.08 * (impact + exploitability)
-    if impact <= 0:
-        return 0.0
-    return roundup(min(raw, 10.0))
-
-
-def roundup(x: float) -> float:
-    """CVSS 3.1's round-up, which is not round-half-up and not ceil-to-int."""
-    i = round(x * 100000)
-    if i % 10000 == 0:
-        return i / 100000.0
-    return (math.floor(i / 10000) + 1) / 10.0
+        return None
+    try:
+        return float(cls(text).base_score)
+    except CVSSError:
+        return None
 
 
 def band(score: float) -> str:
@@ -321,16 +294,40 @@ def osv_severity(vuln: dict, group_max: str | None) -> str:
     The order matters: `database_specific.severity` is absent from PYSEC rows
     and present on GHSA ones for the SAME advisory, so preferring the label
     would score one alias of a vulnerability and not the other.
+
+    EVERY entry is scored and the WORST wins. This used to return on the first
+    SCOREABLE one, which was safe only while `cvss_base_score` understood a
+    single version: a v2 vector returned None, fell through, and the v3 vector
+    below it decided the band. Teaching the scorer v2 and v4 silently made the
+    first entry authoritative instead -- and OSV lists entries in database
+    order, which for any pre-2016 CVE is v2 first.
+
+    That LOOSENED this gate, which is the direction that matters. Heartbleed's
+    own advisory carries `AV:N/AC:L/Au:N/C:P/I:N/A:N` (v2, 5.0, medium) ahead of
+    `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` (v3, 7.5, high). `high`
+    blocks a merge and `medium` does not, so every legacy advisory in NVD's
+    normal ordering quietly stopped blocking. A v4-first advisory scoring 6.9
+    alongside a 10.0 v3 vector did the same.
+
+    "First entry wins" is a defensible rule for a display. It is not one for a
+    fail-closed gate, where two scorings of one vulnerability disagreeing means
+    take the worse and let a person argue it down.
     """
+    scores = [
+        s
+        for s in (
+            cvss_base_score(str(entry.get("score", "")))
+            for entry in vuln.get("severity") or []
+        )
+        if s is not None
+    ]
     for entry in vuln.get("severity") or []:
-        score = str(entry.get("score", ""))
-        computed = cvss3_base_score(score)
-        if computed is not None:
-            return band(computed)
         try:
-            return band(float(score))
+            scores.append(float(str(entry.get("score", ""))))
         except ValueError:
             continue
+    if scores:
+        return band(max(scores))
     label = severity_from_label((vuln.get("database_specific") or {}).get("severity", ""))
     if label:
         return label
@@ -382,7 +379,7 @@ def parse_cargo_audit(payload, spec, repo) -> list[dict]:
         pkg = entry.get("package") or {}
         cvss = adv.get("cvss")
         sev = "medium"
-        score = cvss3_base_score(cvss) if isinstance(cvss, str) else None
+        score = cvss_base_score(cvss) if isinstance(cvss, str) else None
         if score is not None:
             sev = band(score)
         out.append(

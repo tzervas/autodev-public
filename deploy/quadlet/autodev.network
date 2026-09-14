@@ -1,0 +1,13 @@
+# The stack's own network, so containers address each other by name instead of
+# by an IP somebody has to keep correct in four files.
+#
+# INTERNAL=false because the gateway must reach model backends that are NOT in
+# this network -- vLLM on another host, llama.cpp on a third. Containers that
+# genuinely need no egress say so individually rather than by living here.
+[Unit]
+Description=autodev stack network
+
+[Network]
+NetworkName=autodev
+Subnet=10.89.0.0/24
+Gateway=10.89.0.1

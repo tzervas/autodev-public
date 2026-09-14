@@ -1,0 +1,4 @@
+[Unit]
+Description=LiteLLM proxy Postgres data
+[Volume]
+VolumeName=litellm-db
