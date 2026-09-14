@@ -14,6 +14,14 @@ counterpart branch carries both.
 
 ## Kubernetes is excluded, for a better reason than the usual one
 
+> **Corrected by `docs/QUADLET-CLUSTER.md`, option E.** This section's
+> conclusion is stated too broadly. Multi-node rootless Kubernetes DOES exist —
+> `KubeletInUserNamespace` is beta in v1.37 and Usernetes forms multi-node
+> rootless clusters over Flannel VXLAN. What follows is true **of k3s**, which
+> is the implementation that does not support it. Read it as *exclude rootless
+> k3s*, not *exclude Kubernetes*.
+
+
 The common objection — "Kubernetes needs root" — is **not true**.
 `KubeletInUserNamespace` (rootless mode) graduated to **beta in Kubernetes
 v1.37**, and rootless k3s does not require rootless Docker underneath.

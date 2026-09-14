@@ -112,6 +112,77 @@ unresolved question, and the objective here is that *nothing* holds root. B and
 C are not exclusive: B is the declarative layer, and C could later own
 placement without changing how anything is authored.
 
+## Option E — close the gaps instead of working around them
+
+**Added after the options above, and it supersedes the recommendation.** B was
+the right answer to "a declarative single release without Kubernetes". It is
+the wrong answer to "replicas, horizontal and vertical scaling, real
+elasticity", because Quadlet guarantees lifecycle **within one host** and no
+amount of rendering changes that. Those semantics need a real orchestrator.
+
+Three facts make the gap far narrower than it looks.
+
+**Kubernetes already does not use Docker.** dockershim was removed in v1.24 in
+2022. Kubernetes has required a CRI runtime ever since — containerd or CRI-O.
+So "Kubernetes but podman instead of Docker" is answering a question that was
+closed four years ago; Docker is not in the picture either way.
+
+**podman is not a CRI runtime, and does not need to be — CRI-O is.** CRI-O
+shares podman's entire stack: `containers/image`, `containers/storage`,
+`containers/common`, `conmon`, and `crun` as the OCI runtime. It is podman's
+guts exposed through the CRI gRPC API, from the same ecosystem, with the same
+security model. Running Kubernetes on CRI-O **is** running it on podman's
+container stack. ADR-0012 was right that podman cannot be a CRI runtime and
+chose containerd+runc; CRI-O is the choice that keeps the posture it was
+reaching for.
+
+**Rootless is no longer the blocker it was when ADR-0002 was written.**
+`KubeletInUserNamespace` graduated to **beta in Kubernetes v1.37**: kubelet,
+the CRI and OCI runtimes, the CNI plugins and kube-proxy all run as a non-root
+user in a Linux user namespace. **Usernetes** forms real multi-node clusters
+over Flannel VXLAN from rootless Docker, **Podman** or nerdctl nodes; Gen2
+(2023–2026) ran Kubernetes-in-Docker, Gen3 (2026–) adds
+Kubernetes-in-Kubernetes. Its own framing is "can potentially be used for
+production", which is an honest hedge rather than a recommendation.
+
+### A correction to `docs/FLEET-SCHEDULING.md`
+
+That document concluded "exclude Kubernetes", on the grounds that multi-node
+rootless is unsupported. That is true **of k3s specifically** and was stated
+too broadly. Multi-node rootless Kubernetes exists; k3s is the implementation
+that does not do it. The exclusion should be read as *exclude rootless k3s*,
+not *exclude Kubernetes*.
+
+### So what is actually left to close
+
+Not an orchestrator. The remaining work is narrow, and it is the intersection
+nobody has finished:
+
+**Rootless user namespaces + GPU device plugins on heterogeneous nodes.**
+
+The NVIDIA device plugin needs device access; a user namespace is exactly what
+constrains it, and rootless k3s' documentation already flags "CSI drivers that
+require direct host device access" as the category that may not work. Add that
+the fleet's drivers are deliberately heterogeneous — a Pascal card pinned to a
+driver that caps at CUDA 12.2 alongside Blackwell and Ampere — and this is a
+real, specific, contributable gap rather than a platform to build.
+
+That is a far better use of effort than a new orchestrator, and it is the only
+part of this that nobody else has already done.
+
+### What it costs, honestly
+
+| | |
+|---|---|
+| **gets you** | genuine replicas, HPA and VPA, real elasticity, node labels and affinity for heterogeneous placement, and the whole Kubernetes ecosystem — on podman's container stack, rootless |
+| **costs** | Usernetes is maturing rather than settled; `KubeletInUserNamespace` is beta not GA; the GPU-in-userns question is unresolved and is the one that decides feasibility |
+| **the trap** | if GPU device plugins do not work under a user namespace, the whole thing fails at exactly the workload the fleet exists for — so **probe that first**, before any other work |
+
+**Recommended sequence:** prove a GPU pod scheduling and running under
+`KubeletInUserNamespace` with CRI-O on ONE node. If that works, Usernetes
+multi-node is the next step and the design is sound. If it does not, that is
+the gap to close, and it is worth closing because it is the only one left.
+
 ## Prior art to evaluate before writing anything
 
 - **quad-ops** (`trly/quad-ops`) — GitOps for Quadlet, converts Compose to
