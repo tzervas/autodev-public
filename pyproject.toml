@@ -30,6 +30,7 @@ csd = "csd_client.cli:main"
 
 [dependency-groups]
 dev = [
+    "jsonschema>=4.26.0",
     "pytest>=8.3.5,<9",
     "pytest-asyncio>=1.4.0",
 ]
