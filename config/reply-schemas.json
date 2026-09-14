@@ -1,0 +1,125 @@
+{
+  "_comment": [
+    "THE LOOP'S TWO REPLY PROTOCOLS, AS DATA. G-SCHEMA-1.",
+    "",
+    "csd-autodev-loop asks a model for one of two things -- a whole file, or a",
+    "list of literal substitutions to make in a file that already exists -- and",
+    "until now the ONLY definition of either shape was the parser that reads it",
+    "(extract_json / parse_substitutions / fenced_block in scripts/csd-autodev-loop).",
+    "A model cannot check its output against a parser it cannot see, so being",
+    "strict there does not prevent a malformed reply, it only relocates the",
+    "failure to nine identical retries and an invalidated goal. That is",
+    "docs/LESSONS.md pattern 4, and both of its examples are the two failures",
+    "these schemas exist to make structurally impossible once something reads",
+    "the model's output AGAINST them instead of merely hoping:",
+    "  - fenced_block's docstring: a markdown reply's own ```bash block closed",
+    "    the fence early and 239 of RUNBOOK.md's 250 lines were thrown away.",
+    "  - parse_substitutions's docstring: asked for a one-line `from => to` pair",
+    "    across a multi-line passage, the model put the arrow on its own line --",
+    "    sensible, unparseable by the strict grammar, retried nine times.",
+    "",
+    "This file is the backend-independent prerequisite for CONSTRAINED decoding:",
+    "vLLM accepts a JSON Schema for `response_format` directly; llama.cpp compiles",
+    "GBNF from one. Either way the schema has to be data, not the Python in",
+    "scripts/csd-autodev-loop, or only one of the two backends could ever use it.",
+    "Nothing in the loop reads this file yet -- wiring a backend to request",
+    "against it, or switching the text protocol over, is a separate goal. This",
+    "one only writes the specification down where it can be checked, and adds a",
+    "test suite that checks it -- a specification nothing checks is a comment.",
+    "",
+    "DERIVED FROM THE PARSER, NOT FROM THE GOAL DESCRIPTION THAT ASKED FOR THIS",
+    "FILE (house rule: describe behaviour that exists). Two divergences worth",
+    "recording:",
+    "  - `to` may be an empty string but `from` may not: apply_substitutions's",
+    "    docstring treats an empty FROM as matching everywhere (never something a",
+    "    model should be able to ask for) and an empty TO as a legitimate",
+    "    deletion of the matched text. minLength:1 on `from` only encodes that.",
+    "  - the parser's internal representation of a substitution is a bare",
+    "    (from, to) TUPLE, produced by both the one-line `a => b` grammar and the",
+    "    line-broken `<<<FROM/===TO/>>>` and bare-arrow forms in",
+    "    parse_substitutions. JSON has no tuple type, and a 2-element array is",
+    "    exactly as capable of silently drifting apart (which element was which,",
+    "    once nothing names them) as the text grammar it replaces. Naming the",
+    "    two sides `from`/`to` on an object is the one part of the protocol that",
+    "    is intentionally NOT a literal transcription of the parser's runtime",
+    "    shape -- see tests/test_reply_schemas.py for why.",
+    "",
+    "CONSTRAINTS PRESENT ONLY FOR OPENAI STRICT STRUCTURED-OUTPUT COMPATIBILITY",
+    "(the design note this goal was written under), not because the protocol",
+    "itself needs them -- called out individually below rather than left for",
+    "someone to guess at:",
+    "  - `additionalProperties: false` on every object. The protocol would be no",
+    "    less well-defined without it (an extra key the parser does not look at",
+    "    is simply ignored today), but strict mode requires it be set explicitly",
+    "    on every object in the schema or refuses the whole payload.",
+    "  - every property listed in `required`, including ones a hand-written",
+    "    schema would leave optional. Strict mode requires every key in",
+    "    `properties` to appear in `required`; there is no `optional` in this",
+    "    dialect. `to` is REQUIRED for that reason even though the empty string",
+    "    it is allowed to hold is doing the actual optionality.",
+    "  - no `$ref`, anywhere, including to a `$defs` block in this same file:",
+    "    the design note calls for something usable verbatim as the `schema`",
+    "    value inside an OpenAI `response_format: {\"type\": \"json_schema\", ...}`",
+    "    payload, and a $ref -- even a same-document one -- is one more thing a",
+    "    given backend's structured-output support might not implement. The",
+    "    substitution object is small enough that inlining it costs nothing."
+  ],
+  "version": 1,
+
+  "whole_file_proposal": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "WholeFileProposal",
+    "description": "Replace the entire content of one file. Matches the `PATH: <path>` plus fenced-block reply that extract_json/fenced_block parse today, and the bare {\"path\", \"content\"} object extract_json also accepts directly. Choosing this form for a file that must be edited rather than restated is the OTHER half of pattern 4: a 272-line file asked to be re-emitted with 8 words changed came back as a 28-line summary, three attempts running -- not a parser failure, a protocol-choice one. is_substitution_goal in scripts/csd-autodev-loop is what steers a goal away from this form; this schema only says what a reply in this form must look like.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["path", "content"],
+    "properties": {
+      "path": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Repo-relative path, e.g. docs/RUNBOOK.md. apply_proposal refuses an absolute path or one containing '..' -- both escape the worktree -- but a schema cannot express 'no path traversal' as a syntactic constraint over an arbitrary relative path, so that check stays in apply_proposal. This schema only rules out the empty string, which is not a path at all."
+      },
+      "content": {
+        "type": "string",
+        "description": "The file's COMPLETE new contents, verbatim -- not a diff, not a summary. May be empty (creating an empty file is legitimate; apply_proposal only refuses when neither `content` nor `substitutions` is present at all, not when content is the empty string)."
+      }
+    }
+  },
+
+  "substitution_proposal": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "SubstitutionProposal",
+    "description": "Change a file that already exists by literal find/replace, without restating anything the pairs do not name. Matches the `SUBSTITUTIONS: <path>` plus fenced-block reply that parse_substitutions parses today -- the one-line `from => to` form, the `<<<FROM/===TO/>>>` block form for a multi-line passage, and the form the model actually produced when given both a multi-line passage and a one-line grammar (the arrow on its own line between two multi-line blocks; see ARROW_ON_ITS_OWN_LINE in tests/test_substitutions.py). All three text forms collapse to the same (from, to) pairs; this schema describes that shared result, not any one of the three spellings -- once something asks a model for JSON matching this schema directly instead of free text, none of the three text spellings is produced at all, which is the whole point: the ambiguity that put the arrow on its own line existed only because the grammar was prose, not structure.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["path", "substitutions"],
+    "properties": {
+      "path": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Repo-relative path to a file that must ALREADY EXIST -- apply_substitutions refuses to substitute into a file that is not there (there is nothing to preserve, and creating one from a substitution list would lose the goal). A schema cannot check the filesystem, so that refusal, like path-traversal, stays in apply_proposal."
+      },
+      "substitutions": {
+        "type": "array",
+        "minItems": 1,
+        "description": "One or more literal replacements, applied in order. apply_substitutions additionally requires that at least one pair MATCH SOMETHING in the file (a pair matching nothing means the model quoted text the file does not contain) and that the result differ from the input (matching everything but changing nothing is refused as a no-op) -- both are properties of the file's contents at apply time, not of the reply's shape, so neither is expressible here.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to"],
+          "properties": {
+            "from": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Text to find, quoted EXACTLY as it appears in the target file. Must be non-empty: an empty `from` would match at every position in the file, which is never a real substitution -- see apply_substitutions's own comment on why an empty LEFT is treated differently from an empty RIGHT."
+            },
+            "to": {
+              "type": "string",
+              "description": "Replacement text. MAY be empty -- deleting the matched text outright is a legitimate substitution, per apply_substitutions. `to` is listed in `required` only because strict structured-output mode has no concept of an optional property; the actual optionality is carried by the empty string this field is allowed to hold, not by the key being absent."
+            }
+          }
+        }
+      }
+    }
+  }
+}
