@@ -294,16 +294,40 @@ def osv_severity(vuln: dict, group_max: str | None) -> str:
     The order matters: `database_specific.severity` is absent from PYSEC rows
     and present on GHSA ones for the SAME advisory, so preferring the label
     would score one alias of a vulnerability and not the other.
+
+    EVERY entry is scored and the WORST wins. This used to return on the first
+    SCOREABLE one, which was safe only while `cvss_base_score` understood a
+    single version: a v2 vector returned None, fell through, and the v3 vector
+    below it decided the band. Teaching the scorer v2 and v4 silently made the
+    first entry authoritative instead -- and OSV lists entries in database
+    order, which for any pre-2016 CVE is v2 first.
+
+    That LOOSENED this gate, which is the direction that matters. Heartbleed's
+    own advisory carries `AV:N/AC:L/Au:N/C:P/I:N/A:N` (v2, 5.0, medium) ahead of
+    `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` (v3, 7.5, high). `high`
+    blocks a merge and `medium` does not, so every legacy advisory in NVD's
+    normal ordering quietly stopped blocking. A v4-first advisory scoring 6.9
+    alongside a 10.0 v3 vector did the same.
+
+    "First entry wins" is a defensible rule for a display. It is not one for a
+    fail-closed gate, where two scorings of one vulnerability disagreeing means
+    take the worse and let a person argue it down.
     """
+    scores = [
+        s
+        for s in (
+            cvss_base_score(str(entry.get("score", "")))
+            for entry in vuln.get("severity") or []
+        )
+        if s is not None
+    ]
     for entry in vuln.get("severity") or []:
-        score = str(entry.get("score", ""))
-        computed = cvss_base_score(score)
-        if computed is not None:
-            return band(computed)
         try:
-            return band(float(score))
+            scores.append(float(str(entry.get("score", ""))))
         except ValueError:
             continue
+    if scores:
+        return band(max(scores))
     label = severity_from_label((vuln.get("database_specific") or {}).get("severity", ""))
     if label:
         return label

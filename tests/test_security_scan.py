@@ -645,6 +645,48 @@ def test_a_cvss4_vector_is_scored_now_that_the_maths_is_not_ours(tmp_path, monke
     assert ids(res) == ["OSV-FAKE-1"]
 
 
+def test_the_worst_scoring_of_an_advisory_wins_not_the_first(tmp_path, monkeypatch):
+    """An advisory scored twice must be banded by the WORSE score.
+
+    This is a regression guard on a gate that silently stopped blocking.
+    `osv_severity` returned on the first SCOREABLE entry, which was safe only
+    while the scorer understood v3 alone: a v2 vector returned None, fell
+    through, and the v3 vector below it decided the band. Teaching the scorer
+    v2 and v4 made the first entry authoritative -- and OSV lists entries in
+    database order, which for any pre-2016 CVE is v2 first.
+
+    The vectors below are Heartbleed's own. v2 scores 5.0 (medium, does NOT
+    block a merge); v3 scores 7.5 (high, does). Every legacy advisory in NVD's
+    normal ordering demoted itself across that boundary, on a scan reporting
+    success -- docs/LESSONS.md pattern 2, introduced by the commit that cited
+    it.
+    """
+    mod = load_scan()
+    advisory = {
+        "severity": [
+            {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:N/A:N"},
+            {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"},
+        ]
+    }
+    assert mod.cvss_base_score(advisory["severity"][0]["score"]) == 5.0
+    assert mod.cvss_base_score(advisory["severity"][1]["score"]) == 7.5
+    assert mod.osv_severity(advisory, None) == "high"
+
+    # Order must not matter: the same advisory listed v3-first is still high.
+    assert mod.osv_severity({"severity": advisory["severity"][::-1]}, None) == "high"
+
+    # And a v4 entry ahead of a worse v3 one does not demote it either.
+    v4 = "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:H/VI:L/VA:L/SC:N/SI:N/SA:N"
+    v3 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+    both = {
+        "severity": [
+            {"type": "CVSS_V4", "score": v4},
+            {"type": "CVSS_V3", "score": v3},
+        ]
+    }
+    assert mod.osv_severity(both, None) == "critical"
+
+
 def test_an_unscoreable_severity_falls_back_to_medium(tmp_path, monkeypatch):
     """A vector that does not parse must not read as "clean".
 
