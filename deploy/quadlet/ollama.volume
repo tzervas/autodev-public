@@ -1,0 +1,4 @@
+[Unit]
+Description=Ollama model store
+[Volume]
+VolumeName=ollama-models

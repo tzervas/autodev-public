@@ -1,0 +1,41 @@
+# 9Router. EVALUATION ONLY, and NOT a replacement for the gateway.
+#
+# WHY NOT A REPLACEMENT. Its subject is 60+ EXTERNAL providers behind one
+# endpoint; this fleet's direction is entirely self-hosted local models, which
+# is the opposite problem. More to the point, the gateway feature that changes
+# a safety property here -- a per-role virtual key whose model allow-list makes
+# reviewer-is-not-implementer a BOUNDARY rather than an after-the-fact check --
+# is LiteLLM's, and no equivalent has been confirmed for 9Router. Swapping the
+# gateway would trade a proven property for an unproven one.
+#
+# WHY IT IS HERE ANYWAY. RTK Token Saver compresses git diffs, grep output and
+# file trees losslessly, claimed at 20-40% on input. That is not a generic
+# saving -- it is precisely what repo_context(), symbol_source() and the
+# reviewer's diff are MADE of, and context budget is this loop's most expensive
+# recurring problem. Worth measuring as a PRE-PROCESSOR in front of LiteLLM.
+#
+# "Losslessly" is the claim to test first, and on real payloads: a compressor
+# that drops a line from a diff produces a wrong review that passes every gate.
+# Compare against Headroom, which is lossy-by-design and says so.
+[Unit]
+Description=9Router (evaluation only -- see docs/GATEWAY.md)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/decolua/9router:vX.Y.Z   # PIN; confirm the real registry path
+ContainerName=9router
+Network=autodev.network
+PublishPort=203.0.113.20:8090:8080
+Volume=9router.volume:/app/data:Z
+
+HealthCmd=curl -fsS http://localhost:8080/health || exit 1
+HealthInterval=30s
+HealthStartPeriod=45s
+
+[Service]
+Restart=no
+
+# NO [Install] SECTION. Evaluation units are started deliberately, never
+# enabled -- two gateways both claiming to be the one every call crosses is a
+# question nobody wants to debug at 2am.

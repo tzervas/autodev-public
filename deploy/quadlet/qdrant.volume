@@ -1,0 +1,4 @@
+[Unit]
+Description=Qdrant vector store
+[Volume]
+VolumeName=qdrant-storage

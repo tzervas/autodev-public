@@ -1,0 +1,36 @@
+# Headroom: context compression in front of the gateway.
+#
+# WHY IT IS A CANDIDATE. Every context budget in the loop is hand-tuned
+# TRUNCATION -- repo_context(budget=24000), discover_docs(budget=6000),
+# GOALS_PREAMBLE_MAX, plan_budget(). Truncation discards the tail; compression
+# prioritises. And Kompress-base runs on CPU (20-80ms), so it does not contend
+# for a card, which matters once CSD training shares the fleet.
+#
+# WHY IT IS NOT YET IN THE PATH. It is an ML classifier deciding what the
+# implementer gets to SEE. On prose, a dropped sentence degrades gracefully; on
+# code, a dropped line is a wrong diff that passes CI. This repository's own
+# standard is that a guard is only real once you have seen it fail, so measure
+# it against a held-out set of real repo_context payloads BEFORE anything
+# routes through it. NO GPU is requested here deliberately.
+[Unit]
+Description=Headroom context compression
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/example-org/headroom:vX.Y.Z   # PIN; confirm the real registry path
+ContainerName=headroom
+Network=autodev.network
+PublishPort=203.0.113.20:8088:8088
+Environment=HEADROOM_UPSTREAM=http://litellm:4000/v1
+Environment=HEADROOM_PORT=8088
+
+HealthCmd=curl -fsS http://localhost:8088/health || exit 1
+HealthInterval=30s
+HealthStartPeriod=45s
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

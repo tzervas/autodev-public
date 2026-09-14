@@ -1,0 +1,32 @@
+# Qdrant. JWT RBAC is ON here, which is the point of this unit.
+#
+# scripts/csd-autodev-rag-gateway (203 lines) exists because "Qdrant has no
+# native auth on the loopback deployment" -- true of THAT deployment, not of
+# Qdrant. Granular per-collection read/write keys are built on JWT and need
+# only the two settings below (Qdrant >= 1.9). With them, the hand-written
+# egress proxy is replaceable by configuration. Confirm the installed version
+# before retiring it.
+[Unit]
+Description=Qdrant
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=docker.io/qdrant/qdrant:vX.Y.Z   # PIN TO A DIGEST
+ContainerName=qdrant
+Network=autodev.network
+PublishPort=203.0.113.20:6333:6333
+Volume=qdrant.volume:/qdrant/storage:Z
+
+Environment=QDRANT__SERVICE__JWT_RBAC=true
+Secret=qdrant-api-key,type=env,target=QDRANT__SERVICE__API_KEY
+
+HealthCmd=curl -fsS http://localhost:6333/healthz || exit 1
+HealthInterval=20s
+HealthStartPeriod=30s
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

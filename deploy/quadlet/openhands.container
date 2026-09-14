@@ -1,0 +1,38 @@
+# OpenHands. NOT ENABLED BY DEFAULT and deliberately not wired to the loop.
+#
+# OpenHands and Google ADK both want to own the inner loop -- goal to diff,
+# tool calling, the sandbox. Running both against one forge means every failure
+# is first a question of which one did it, which is the reason
+# docs/AGENT-BUILD-PLAN.md's phase 3 says ONE agent. This unit exists so the
+# comparison can be run, not so both can run.
+#
+# IT NEEDS THE PODMAN SOCKET to start its own runtime containers. That is a
+# real privilege escalation surface: anything that can reach that socket can
+# start a container as this account. Rootless keeps it to the service account
+# rather than root, and it is the reason this file does not enable itself.
+[Unit]
+Description=OpenHands (evaluation only -- see docs/GATEWAY.md)
+After=network-online.target litellm.service
+Wants=network-online.target
+
+[Container]
+Image=docker.io/allhands/openhands:vX.Y.Z   # PIN TO A DIGEST
+ContainerName=openhands
+Network=autodev.network
+PublishPort=203.0.113.20:3000:3000
+Volume=%t/podman/podman.sock:/var/run/docker.sock:Z
+Volume=%h/.local/share/openhands:/.openhands:Z
+
+Environment=LLM_BASE_URL=http://litellm:4000/v1
+Environment=LLM_MODEL=openai/implementer
+Secret=litellm-openhands-key,type=env,target=LLM_API_KEY
+# A DEDICATED virtual key, not the master key. Per docs/GATEWAY.md the key is
+# what bounds which models a component may reach; handing an agent the master
+# key removes every restriction the gateway was configured to apply.
+
+[Service]
+Restart=no
+# Restart=no on purpose: an evaluation service that resurrects itself competes
+# for the forge and the cards with the loop it is being compared against.
+
+# NO [Install] SECTION. This unit is started deliberately, never enabled.

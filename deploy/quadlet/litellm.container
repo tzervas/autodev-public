@@ -1,0 +1,39 @@
+# The gateway. Load-bearing: every model call in the fleet crosses it, and it
+# owns alias->deployment, cooldowns, fallbacks, spend and the per-role virtual
+# keys. docs/GATEWAY.md is the audit of what it is allowed to own and what
+# stays in config/model-router.json.
+[Unit]
+Description=LiteLLM proxy
+After=network-online.target litellm-db.service
+Wants=network-online.target
+# REQUIRES, not Wants: the proxy starting without its database is the case
+# where budgets and key restrictions silently do not apply. Fail loudly.
+Requires=litellm-db.service
+
+[Container]
+Image=ghcr.io/berriai/litellm:vX.Y.Z   # PIN TO A DIGEST
+ContainerName=litellm
+Network=autodev.network
+PublishPort=203.0.113.20:4000:4000
+
+# Config as code. The file is committed and documentation-safe; the private
+# overlay is assembled at deploy time and mounted read-only.
+Volume=%h/.config/autodev/litellm.yaml:/etc/litellm/config.yaml:ro,Z
+Exec=--config /etc/litellm/config.yaml --port 4000
+
+Secret=litellm-master-key,type=env,target=LITELLM_MASTER_KEY
+Secret=litellm-db-url,type=env,target=DATABASE_URL
+Secret=vllm-api-key,type=env,target=VLLM_API_KEY
+Secret=llamacpp-api-key,type=env,target=LLAMACPP_API_KEY
+
+HealthCmd=curl -fsS http://localhost:4000/health/liveliness || exit 1
+HealthInterval=15s
+HealthStartPeriod=60s
+HealthRetries=4
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target
