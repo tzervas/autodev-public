@@ -51,8 +51,16 @@ from pathlib import Path
 # script contains no identifier at all; without the private config it withholds
 # the evidence directories and rewrites nothing, and SAYS SO rather than
 # reporting a clean run it did not perform.
-def load_rules() -> tuple[list, list, list]:
-    """Substitutions, withheld paths, and forbidden patterns, from the private config."""
+def load_rules() -> tuple[list, list, list, dict, list]:
+    """Substitutions, withheld paths, forbidden patterns, redactions, from
+    the private config -- plus the RAW substitution rule dicts.
+
+    The raw rules travel separately from the `(pattern, replacement)` tuples
+    `sanitise()` applies because `find_collisions()` needs a field
+    `sanitise()` does not: `shared_replacement`. Collapsing to tuples first
+    and recovering the flag later would mean re-reading the same config a
+    second time, which is exactly the kind of duplicated parsing that drifts.
+    """
     cfg = {}
     for candidate in (
         Path(os.environ.get("AUTODEV_FLEET_CONFIG", ""))
@@ -68,7 +76,8 @@ def load_rules() -> tuple[list, list, list]:
                 continue
     pub = cfg.get("publish") or {}
     redactions = pub.get("redact_sections", {})
-    subs = [(r["pattern"], r["replacement"]) for r in pub.get("substitutions", [])]
+    rules = pub.get("substitutions", [])
+    subs = [(r["pattern"], r["replacement"]) for r in rules]
     withhold = pub.get(
         "withhold",
         [
@@ -79,10 +88,10 @@ def load_rules() -> tuple[list, list, list]:
         ],
     )
     forbidden = pub.get("forbidden", [])
-    return subs, withhold, forbidden, redactions
+    return subs, withhold, forbidden, redactions, rules
 
 
-SUBSTITUTIONS, WITHHOLD, FORBIDDEN, REDACTIONS = load_rules()
+SUBSTITUTIONS, WITHHOLD, FORBIDDEN, REDACTIONS, SUBSTITUTION_RULES = load_rules()
 
 # Suffixes that are DEFINITELY binary. Everything else is tried as UTF-8 text
 # and sanitised if it decodes, which is the safe direction: a new kind of text
@@ -171,6 +180,70 @@ def sanitise(text: str) -> str:
     return text
 
 
+def find_collisions(rules: list) -> list[tuple[str, list[tuple[str, bool]]]]:
+    """Substitution rules whose DIFFERENT patterns land on the SAME replacement.
+
+    WHY THIS MATTERS. The verifier at the bottom of `main` proves that no
+    ORIGINAL identifier survived. It says nothing about whether two originals
+    survived as the SAME thing. That gap already corrupted the published tree
+    twice from one root cause: two real GPU host addresses were both rewritten
+    to 203.0.113.99. `scripts/csd-lab-console` merged into
+    `{HOST_GPU_B_IP, "203.0.113.99", "203.0.113.99"}` -- syntactically a
+    three-element set, actually two, so the authorization check it guards
+    silently stopped excluding one of the two hosts it named. Nothing failed
+    loudly: the set built without error, the script ran, and the exclusion
+    was just quietly short by one address. A verifier that only checks "did
+    an original leak" cannot catch this, because nothing original leaked --
+    two originals leaked as INDISTINGUISHABLE, which is worse, because the
+    reader has no way to know a merge happened at all.
+
+    `shared_replacement: true` exempts a REPLACEMENT, not a RULE -- and only
+    when EVERY rule that reaches that replacement carries it. This function
+    used to skip marked rules before grouping, which meant a marked rule left
+    NO TRACE for anything else to collide with: `HOST-A` / `host-a`, marked
+    correctly as one hostname's case variants, made an unmarked `gpu-c`
+    landing on that same replacement six months later look ALONE in its
+    group -- one pattern, not a collision, passed silently. That is the exact
+    corruption this guard exists to catch, now hiding behind a guard that
+    reports clean for it. A marked rule sharing its replacement with an
+    unmarked one is not "case variants collapsing"; it is one reviewed claim
+    with one unreviewed collision riding along beside it, and the unreviewed
+    one is what the flag was never asked about. So every rule reaching a
+    replacement is grouped FIRST, marked and unmarked alike, and the group
+    clears ONLY when every member of it is marked -- matching the stub
+    audit's `INTENTIONAL` marker and the goal-claims escape hatch elsewhere in
+    this repo, where an unmarked instance gets no benefit of the doubt even
+    when a marked one sits right next to it.
+
+    Returns one `(replacement, [(pattern, marked), ...])` entry per
+    replacement reached by two or more distinct patterns, UNLESS every one of
+    those patterns' rules is marked `shared_replacement`. `marked` travels
+    with each pattern so the caller can report exactly which pattern in the
+    group is the one that is NOT covered by the exemption. Patterns sorted
+    for a stable, diffable message. Rules missing a `pattern` or
+    `replacement` are not this function's problem -- `sanitise()` will raise
+    on those via `SUBSTITUTIONS` the same way it always has -- so they are
+    skipped here rather than duplicating that failure with a different
+    message.
+    """
+    by_replacement: dict[str, dict[str, bool]] = {}
+    for rule in rules:
+        pattern, replacement = rule.get("pattern"), rule.get("replacement")
+        if pattern is None or replacement is None:
+            continue
+        marks = by_replacement.setdefault(replacement, {})
+        # A pattern repeated across rules is exempt only if EVERY occurrence
+        # of it is marked -- `or` alone would let one marked duplicate cover
+        # an unmarked one for the same exact pattern. `.get(pattern, True)`
+        # makes the first sighting of a pattern just adopt its own mark.
+        marks[pattern] = marks.get(pattern, True) and bool(rule.get("shared_replacement"))
+    return sorted(
+        (replacement, sorted(marks.items()))
+        for replacement, marks in by_replacement.items()
+        if len(marks) > 1 and not all(marks.values())
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -179,6 +252,28 @@ def main() -> int:
     ap.add_argument("dest")
     ap.add_argument("--check-only", action="store_true")
     a = ap.parse_args()
+
+    # Checked before anything touches a filesystem. A colliding table is
+    # broken regardless of what src/dest happen to be, and fail-closed means
+    # refusing before a single file is copied, not after.
+    collisions = find_collisions(SUBSTITUTION_RULES)
+    if collisions:
+        print("\n  SANITISER FAILED — substitution table has collisions:")
+        for replacement, patterns in collisions:
+            # Marked entries are labelled so the unmarked one -- the pattern
+            # that actually broke the group -- is the one that stands out.
+            named = ", ".join(
+                f"{p!r} (shared_replacement)" if marked else repr(p)
+                for p, marked in patterns
+            )
+            print(f"    {named} -> {replacement!r}")
+        print(
+            "\n  Two different originals would become the SAME thing in the "
+            "published tree. Mark a genuine case-variant collapse with "
+            '"shared_replacement": true on that rule; give every other '
+            "pattern its own replacement. Nothing was published."
+        )
+        return 1
 
     src, dest = Path(a.src).resolve(), Path(a.dest).resolve()
     # .git is a FILE in a worktree, not a directory -- checking is_dir() refused
