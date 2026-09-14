@@ -1,0 +1,84 @@
+[Unit]
+Description=3090 Ti in FREE mode -- card released for CSD training via gpu-pack
+Documentation=file:///opt/autodev/scripts/fleet-gpu-mode
+# Alternative to scripts/fleet-gpu-mode, not a replacement -- see
+# docs/goals/conversion.md G-UNIT-1.
+After=network-online.target
+Wants=network-online.target
+
+# Exclusivity: same Conflicts= guarantee as the other two modes (symmetric per
+# systemd.unit(5); spelled out here too so this file stands alone). Starting
+# "free" is how an operator or gpu-pack explicitly reclaims the card: it tears
+# down whichever of dev/review was active, in the same transaction, the same
+# way starting either of THEM tears this one down.
+Conflicts=fleet-gpu-mode-dev.service fleet-gpu-mode-review.service
+
+# No [Install] section -- see fleet-gpu-mode-dev.service for why: which mode
+# is active is a live decision, not a boot-time fact to re-assert every
+# restart. `systemctl is-active fleet-gpu-mode-{dev,review,free}.service`
+# replaces `fleet-gpu-mode status`'s read of gpu-mode.json.
+
+[Service]
+# oneshot + RemainAfterExit: there is no long-running process to supervise in
+# this mode -- that IS the mode. Without RemainAfterExit=yes this unit would
+# run its ExecStart and immediately report "inactive (dead)" again, which
+# would make `systemctl is-active fleet-gpu-mode-free.service` useless for
+# telling "free" apart from "nothing has been decided yet". With it, "free"
+# is a real, queryable active state, exactly on a par with dev and review
+# being active -- this is the "declared absence" the top-level house rules
+# ask for: the card being idle here is not a unit silently doing nothing, it
+# is a unit doing its one job (releasing the card) and then correctly
+# reporting itself as done-and-active.
+Type=oneshot
+RemainAfterExit=yes
+
+# --ignore, and the leading `-`, twice over: this must succeed whether or not
+# a container is present, because "free" starting from "already free" is not
+# an error. Force-remove with no grace period, exactly like stop_vllm() in
+# scripts/fleet-gpu-mode. This also reaches a container left behind by the
+# raw script -- it uses the identical name `fleet-vllm-deep` -- which
+# Conflicts= alone cannot: systemd only stops UNITS it knows about, and a
+# container the script started by hand was never one. Sharing the name is
+# what makes the two lifecycle managers interoperable enough to coexist on
+# the same host during a transition between them.
+ExecStart=-/usr/bin/podman rm -f --ignore fleet-vllm-deep
+
+# WHAT THE SCRIPT DOES ON FAILURE THAT NO UNIT HERE CAN.
+#
+# scripts/fleet-gpu-mode's cmd_set, on a wait_healthy timeout, actively rolls
+# back: it tears down the container it just failed to bring up and starts
+# whatever mode was previously active, restoring the card to a known-good
+# state without an operator having to notice and act. That is stateful
+# behaviour -- it needs to remember what "previous" was -- and systemd units
+# have no equivalent. A .service file's Restart= can only ever restart
+# ITSELF; there is no "on failure, activate a DIFFERENT, previously-active
+# unit" directive, because units don't carry history and Conflicts=/Restart=
+# are both static, declared at write time, not computed from "what was
+# running a minute ago".
+#
+# So this conversion trades the script's convenience (automatic rollback) for
+# a structural guarantee the script never had (review cannot re-claim the
+# card from a crash, dev needs no lock to swap safely, "current mode" cannot
+# drift from a JSON file). What replaces rollback is smaller and more
+# honest: a crashed mode fails visibly (`systemctl status` shows failed;
+# fleet-gpu-mode-review.service additionally just stays down, by design, per
+# its Restart=no) and the card sits in whatever state that failure left it in
+# -- free if the crash happened before anything claimed the device, or simply
+# not serving if it happened after -- until an operator, a monitoring rule, or
+# a future model-router (see the open G-CAPS-1/G-ROUTER-1 goals) explicitly
+# starts a mode again. If automatic "restore the last good mode" behaviour is
+# wanted on top of this, it belongs in that future model-router, driven by
+# `systemctl is-active` and `podman inspect` the way this file's other
+# comments describe -- not hand-rolled back into a unit file, which is the
+# same trap scripts/fleet-gpu-mode is already in.
+#
+# QUADLET UPGRADE PATH: on podman >= 4.4 this becomes
+# deploy/systemd/fleet-gpu-mode-free.container with the same Conflicts= in
+# its pass-through [Unit] section, a [Container] Exec= of nothing (or this
+# unit can simply stay a plain .service, since it runs no container and gains
+# nothing from Quadlet -- Quadlet's value here is entirely in the dev/review
+# units' Notify=healthy, per those files' own Quadlet notes). Kept as a plain
+# .service now for the same podman-4.3.1-on-Debian-12 reason as the other two,
+# and for symmetry: all three modes are expressed the same way, so a reader
+# comparing them sees the SAME mechanism (Conflicts=) doing exclusivity, not
+# two different mechanisms for two different file formats.

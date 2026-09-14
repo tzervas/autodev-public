@@ -1,0 +1,236 @@
+[Unit]
+Description=3090 Ti in DEV mode -- qwen3.5-9b vLLM server for the implementer/deep tier
+Documentation=file:///opt/autodev/scripts/fleet-gpu-mode
+# This is an ALTERNATIVE to scripts/fleet-gpu-mode, not a replacement for it --
+# see docs/goals/conversion.md G-UNIT-1. Which one a host actually runs is an
+# operator deployment decision; the script is untouched and still works. This
+# file exists so that decision can be "systemd" instead of "the script" without
+# rewriting anything that already works.
+After=network-online.target
+Wants=network-online.target
+
+# THE WHOLE POINT: exclusivity as a unit property, not a flock.
+#
+# scripts/fleet-gpu-mode serialises swaps with `flock -w 900 9` on
+# /fleet-data/autodev/gpu-mode.lock, taken on fd 9 and held across the podman
+# invocation. `podman run -d` backgrounds podman and forks conmon, and conmon
+# INHERITS fd 9 -- podman itself exits once the container is up, but conmon
+# lives for the container's entire lifetime, so it keeps sitting on the lock
+# long after the script that took it has exited. Per the script's own comment
+# (measured 2026-09-07): the FIRST swap works, because the lock file starts
+# unheld. Every swap after that blocks on flock until the 900s timeout,
+# because the previous conmon never let go. `9>&-` in stop_vllm() patches one
+# symptom of this; it does not fix the mechanism, because the mechanism is "a
+# kernel object that an unrelated grandchild process can inherit and never
+# give back", and that is true of any fd-based lock a forking supervisor
+# spawns children under.
+#
+# Conflicts= has no equivalent failure mode, because it isn't a resource a
+# process can hold onto at all -- it's systemd's own record of which UNITS are
+# allowed to be active together, enforced by systemd stopping the loser as
+# part of the SAME transaction that starts the winner. There is no fd, so
+# there is nothing for a conmon three layers down to inherit and forget to
+# close. Per systemd.unit(5), Conflicts= is symmetric by construction: unit A
+# listing Conflicts=B also gives B an implicit Conflicts=A, even though B's own
+# file never mentions A. This unit, review.service and free.service each spell
+# out the full set anyway -- redundant given that symmetry, but a reader
+# looking at just this file should be able to see the whole exclusivity
+# picture without having to know that fact and go check the other two files.
+Conflicts=fleet-gpu-mode-review.service fleet-gpu-mode-free.service
+
+# No [Install] section, on purpose. These three units are not meant to be
+# `systemctl enable`d at boot: which one should be active is a decision an
+# operator or (per the open G-CAPS-1 / model-router goals) a future
+# model-router makes, not a fact about the machine that holds across reboots.
+# Enabling one would silently re-assert that decision after every reboot
+# regardless of what was actually true before the reboot -- an unattended
+# card-mode change is a worse failure than a card that comes up in "free"
+# (nothing running) until something deliberately claims it. Start/stop these
+# by name (`systemctl start fleet-gpu-mode-dev.service`); query the live mode
+# with `systemctl is-active fleet-gpu-mode-dev.service
+# fleet-gpu-mode-review.service fleet-gpu-mode-free.service`, which replaces
+# `fleet-gpu-mode status`'s read of gpu-mode.json -- there is no separate
+# state file here to fall out of sync with reality, because unit state IS the
+# state.
+
+[Service]
+Type=notify
+NotifyAccess=all
+# Bounds how long systemd waits for conmon's READY=1 -- NOT how long it waits
+# for the model to finish loading (that is --health-start-period below, which
+# only gates the container's own health status, not this unit's "active"
+# state; see the long readiness comment further down). The image is already
+# local -- nothing here waits on a pull -- so conmon should signal READY
+# within seconds of the container actually starting; this just needs to be
+# comfortably above that, not above 420s of model load.
+TimeoutStartSec=60s
+
+# Preserved EXACTLY from stop_vllm() in scripts/fleet-gpu-mode: force-remove,
+# no grace period, run unconditionally before every start. vLLM has no drain
+# protocol worth waiting for here, and the fleet's whole design already
+# assumes a mode swap interrupts in-flight requests -- there is nothing this
+# unit could wait for on stop that the script waited for either. Running it as
+# ExecStartPre too (not just ExecStop) means starting this unit clears out a
+# same-named container left behind by ANYTHING -- a previous run of this unit,
+# a crash that skipped ExecStop, or the raw script itself, since both use the
+# identical container name `fleet-vllm-deep`. That shared name is a second,
+# independent guard against a double-launch even in a window where systemd's
+# Conflicts= stop of the other mode hasn't finished yet: podman refuses to
+# `run --name` a name that's still in use, so a race here fails loudly (a
+# start error in `systemctl status`) rather than silently running two vLLM
+# processes against the same GPU.
+ExecStartPre=-/usr/bin/podman rm -f --ignore fleet-vllm-deep
+ExecStop=/usr/bin/podman rm -f --ignore fleet-vllm-deep
+
+# NOT `podman run -d`. Backgrounding podman is what let conmon become an
+# orphaned, untracked supervisor in the first place -- the exact setup that
+# inherited fd 9. Running podman in the FOREGROUND makes ITS process the thing
+# systemd itself starts, tracks by cgroup, and can restart: the container's
+# lifetime and the unit's lifetime are now the same fact, not two facts (a
+# flock, a gpu-mode.json write) that a crash between them can pull apart.
+#
+# --device nvidia.com/gpu=all is CDI, copied byte-for-byte from the script on
+# purpose -- see docs/goals/conversion.md G-UNIT-1. Do NOT change this to
+# --gpus=all; that's the pre-CDI flag this fleet already moved off of.
+#
+# `secret exec`, not a bare `-e VLLM_API_KEY` relying on an inherited shell: a
+# systemd service has no interactive shell to inherit an env var from. This
+# repo's own convention (fleet.example.json's secrets comment;
+# autodev-events.service's ExecStart) is that credentials come from the vault
+# at exec time, never sitting in a unit file or in argv. `-e VLLM_API_KEY`
+# (no `=value`) on the podman run line is UNCHANGED from the script -- it
+# still just means "pass this var through from my own environment"; `secret
+# exec` is what populates that environment now, instead of whatever the
+# operator's shell happened to have when they ran the script by hand.
+# `vllm/api-key` is a NEW vault entry name this unit introduces --
+# fleet.example.json does not name an existing one for vLLM's own inbound API
+# key (only forgejo/token, forgejo/webhook-secret and inference/gateway-key
+# exist there), so an operator adopting this unit needs to provision it.
+#
+# Host, port and image are the same documentation-safe values already public
+# in scripts/fleet-gpu-mode and config/fleet.example.json (203.0.113.10:8001
+# is fleet.example.json's hosts.primary; 609a5b463503 is the script's own
+# image reference, not an address) -- nothing new is being made public here.
+ExecStart=/usr/local/bin/secret exec VLLM_API_KEY=vllm/api-key -- \
+    /usr/bin/podman run --rm --replace --sdnotify=conmon \
+    --name fleet-vllm-deep \
+    --device nvidia.com/gpu=all --ipc=host \
+    -v /fleet-data/hf-cache:/hf:z -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e VLLM_API_KEY \
+    -p 203.0.113.10:8001:8001 \
+    --health-cmd="python3 -c 'import urllib.request as u,sys;sys.exit(u.urlopen(\"http://127.0.0.1:8001/health\",timeout=3).getcode()!=200)'" \
+    --health-interval=5s --health-timeout=3s --health-retries=3 \
+    --health-start-period=420s --health-on-failure=kill \
+    609a5b463503 \
+    --model QuantTrio/Qwen3.5-9B-AWQ --served-model-name qwen3.5-9b \
+    --host 0.0.0.0 --port 8001 \
+    --gpu-memory-utilization 0.82 \
+    --max-model-len 131072 --max-num-seqs 16 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
+
+# READINESS, THE PART THAT WAS A CURL LOOP.
+#
+# scripts/fleet-gpu-mode's wait_healthy() polls GET /health every 5s for up to
+# 420s in bash, tracking its own deadline with `date +%s` and handing the
+# caller a bare exit code to remember to check. --health-cmd above asks podman
+# to run the SAME check -- same endpoint, same 3s timeout as the script's
+# `curl -m3` -- but as a declared property of the container instead of a loop
+# this unit's author has to get right, one that stays queryable afterwards the
+# standard way (`podman inspect --format '{{.State.Health}}'`, `podman ps`)
+# instead of living only in whatever the script happened to print at the time.
+# --health-start-period=420s reproduces the script's 420s grace window
+# exactly: failures during that window don't count against --health-retries,
+# so a model still loading weights at second 300 isn't penalised for not
+# answering yet, the same way wait_healthy's loop never gave up before 420s.
+#
+# WHAT THIS DOES NOT DO: it does not make the UNIT wait for the model to
+# become healthy before reporting "active". Type=notify above is satisfied by
+# conmon's READY (the container PROCESS exists), not by health -- plain
+# `podman run` on the podman this host actually has (4.3.1; see the Quadlet
+# note below) has no way to gate sd_notify on container health. That landed as
+# `--sdnotify=healthy` in Podman 5.0 (containers/podman#19353), one major
+# version past what Debian 12 bookworm ships. So there is a real, honest gap
+# versus the script: `systemctl start` can return success seconds before the
+# model can serve a request, where `fleet-gpu-mode dev` would still be
+# sitting in wait_healthy. Until the Quadlet upgrade below closes it, "is it
+# actually serving" is `podman inspect`'s question to answer, not
+# `systemctl is-active`'s.
+#
+# WHAT HAPPENS IF THE MODEL NEVER BECOMES HEALTHY: after the 420s grace
+# period, 3 consecutive failures 5s apart (~15s) flip the container to
+# unhealthy, and --health-on-failure=kill kills it. Because ExecStart runs
+# podman in the foreground, that kill takes down the tracked process, which
+# systemd sees as this unit's main process exiting -- a genuine, visible
+# failure (`systemctl status` shows failed; journald has the kill and
+# whatever vLLM logged before it), not a silent "still active" the way a
+# forgotten `&` would be. Restart=on-failure below then retries it. This is
+# NOT the script's rollback-to-previous-mode -- see the note at the bottom of
+# fleet-gpu-mode-free.service for what that gap means in practice.
+Restart=on-failure
+RestartSec=10s
+# No StartLimitIntervalSec/StartLimitBurst override here, unlike
+# autodev-tick.service. That override exists there because the tick has a
+# legitimate reason to restart itself dozens of times an hour during healthy
+# operation. This unit doesn't: a dev-mode vLLM container that keeps failing
+# every ~10s has nothing legitimate to retry into, so systemd's own default
+# (5 starts / 10s) is the right backstop, not a permissive one this file needs
+# to widen.
+
+# ENCODING preempt_autodev: false.
+#
+# This is the DEV unit -- the mode config/model-router.json's pool block
+# protects when it sets "preempt_autodev": false (docs/goals/conversion.md
+# G-UNIT-1). Restart=on-failure here is deliberate and asymmetric with
+# fleet-gpu-mode-review.service, which sets Restart=no: autodev's own
+# workload is the thing preempt_autodev exists to defend, so a crash of THIS
+# container gets ordinary resilience -- systemd just brings it back. That
+# asymmetry is the whole encoding: nothing needs to positively favour dev,
+# review just isn't allowed to un-favour it by clawing the card back on its
+# own after a crash (see fleet-gpu-mode-review.service). Conflicts= only ever
+# fires here when something explicitly starts THIS unit -- an operator, or a
+# future model-router acting on preempt_autodev's behalf -- so a healthy
+# review container already holding the card is never touched by dev
+# restarting after its own, unrelated failure.
+#
+# QUADLET UPGRADE PATH.
+#
+# This is a plain .service unit invoking `podman run` directly, not a Quadlet
+# `.container` file, because Quadlet needs podman >= 4.4 (the
+# podman-system-generator support that turns .container files into units) and
+# Debian 12 bookworm ships podman 4.3.1 with no backport. A Quadlet unit
+# dropped into /etc/containers/systemd/ on THIS host would simply never be
+# generated -- no error, no warning, just a mode that never comes up -- which
+# is exactly the "absent is not clean, a unit that silently does nothing is
+# the failure mode this repo is built to catch" house rule. Plain units are
+# the correct choice for the host this goal targets, not a stopgap for it.
+#
+# On Debian 13 trixie, which ships podman 5.4.2, this becomes
+# deploy/systemd/fleet-gpu-mode-dev.container:
+#   [Unit] / [Install]     pass through unchanged, Conflicts= included --
+#                          Quadlet's [Unit] section is a straight pass-through
+#                          to the generated unit, so the exclusivity story
+#                          does not change, only who is typing `Conflicts=`.
+#   [Container]
+#     Image=609a5b463503
+#     ContainerName=fleet-vllm-deep
+#     Exec=--model QuantTrio/Qwen3.5-9B-AWQ --served-model-name qwen3.5-9b \
+#          --host 0.0.0.0 --port 8001 --gpu-memory-utilization 0.82 \
+#          --max-model-len 131072 --max-num-seqs 16 \
+#          --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+#          --reasoning-parser qwen3
+#     PodmanArgs=--device nvidia.com/gpu=all --ipc=host
+#     Volume=/fleet-data/hf-cache:/hf:z
+#     Environment=HF_HOME=/hf HF_HUB_OFFLINE=1
+#     Secret=vllm/api-key,type=env,target=VLLM_API_KEY
+#     PublishPort=203.0.113.10:8001:8001
+#     HealthCmd=/HealthInterval=/HealthTimeout=/HealthRetries=/
+#       HealthStartPeriod=/HealthOnFailure=   map 1:1 from the --health-*
+#       flags above.
+#     Notify=healthy
+#   The actual improvement is that last key, not the syntax change: Notify=
+#   healthy (podman >= 5.0, containers/podman#19353) lets Quadlet gate the
+#   GENERATED unit's own "active" state on the container's health check
+#   passing -- closing exactly the gap documented above, where
+#   `systemctl start` can return before the model can serve a request. On
+#   Debian 13, `systemctl start fleet-gpu-mode-dev.service` and
+#   `fleet-gpu-mode dev` finally mean the same thing: neither returns until
+#   the model is actually answering.

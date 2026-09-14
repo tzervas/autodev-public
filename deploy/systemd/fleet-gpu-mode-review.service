@@ -1,0 +1,124 @@
+[Unit]
+Description=3090 Ti in REVIEW mode -- nemotron-9b vLLM server for the independent reviewer
+Documentation=file:///opt/autodev/scripts/fleet-gpu-mode
+# Alternative to scripts/fleet-gpu-mode, not a replacement -- see
+# docs/goals/conversion.md G-UNIT-1 and fleet-gpu-mode-dev.service's [Unit]
+# comment for the full flock/fd9/conmon story this design sidesteps.
+After=network-online.target
+Wants=network-online.target
+
+# Exclusivity: same Conflicts= guarantee as fleet-gpu-mode-dev.service, spelled
+# out here too (Conflicts= is symmetric per systemd.unit(5), so this is
+# strictly redundant with that file's declaration -- kept explicit so this
+# file is readable on its own). Starting this unit is what tears dev or free
+# down, in the same transaction, with no lock file either side could leak.
+Conflicts=fleet-gpu-mode-dev.service fleet-gpu-mode-free.service
+
+# No [Install] section -- see fleet-gpu-mode-dev.service for why. Query the
+# live mode with `systemctl is-active fleet-gpu-mode-{dev,review,free}.service`,
+# not a gpu-mode.json that could disagree with reality.
+
+[Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=60s
+
+# Preserved exactly from stop_vllm(): force-remove, no grace period, run
+# before every start regardless of who (or what crash) left a container
+# behind. See fleet-gpu-mode-dev.service for the full rationale, including why
+# the shared container name `fleet-vllm-deep` is itself a second guard against
+# a double-launch independent of Conflicts= timing.
+ExecStartPre=-/usr/bin/podman rm -f --ignore fleet-vllm-deep
+ExecStop=/usr/bin/podman rm -f --ignore fleet-vllm-deep
+
+# Foreground podman, CDI device unchanged, `secret exec` for the API key --
+# all for the same reasons as fleet-gpu-mode-dev.service. Only the model
+# table differs below, copied from the script's MODEL/SERVED/UTIL/MAXLEN/EXTRA
+# associative arrays for the `review` key, values and comments intact.
+ExecStart=/usr/local/bin/secret exec VLLM_API_KEY=vllm/api-key -- \
+    /usr/bin/podman run --rm --replace --sdnotify=conmon \
+    --name fleet-vllm-deep \
+    --device nvidia.com/gpu=all --ipc=host \
+    -v /fleet-data/hf-cache:/hf:z -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e VLLM_API_KEY \
+    -p 203.0.113.10:8001:8001 \
+    --health-cmd="python3 -c 'import urllib.request as u,sys;sys.exit(u.urlopen(\"http://127.0.0.1:8001/health\",timeout=3).getcode()!=200)'" \
+    --health-interval=5s --health-timeout=3s --health-retries=3 \
+    --health-start-period=420s --health-on-failure=kill \
+    609a5b463503 \
+    --model nvidia/NVIDIA-Nemotron-Nano-9B-v2 --served-model-name nemotron-9b \
+    --host 0.0.0.0 --port 8001 \
+    --gpu-memory-utilization 0.93 \
+    --max-model-len 32768 --max-num-seqs 16 \
+    --reasoning-parser nemotron_v3
+# gpu-memory-utilization 0.93, not the more obvious 0.90: MEASURED
+# 2026-09-07 in the script this unit mirrors. Nemotron's bf16 weights
+# (17.78 GB) plus its Mamba recurrent state left only 0.85 GiB for KV at
+# 0.90, and the engine refused to start rather than degrade. 0.95 failed a
+# DIFFERENT way: utilisation is a fraction of TOTAL VRAM, and the desktop
+# session on this card holds ~1.3 GB, so only 0.941 was ever actually
+# reachable. 0.93 works: 1.54 GiB KV = 63,855 tokens. Do not "round" this
+# back to 0.90 or up to 0.95 without re-measuring -- both were tried and both
+# failed, for different reasons, on this exact model and card.
+#
+# max-model-len 32768, not vLLM's own computed ceiling: vLLM itself reported
+# 36736 as the maximum at 0.90 utilisation; 32768 sits under that with margin
+# once utilisation moves to 0.95 [sic, superseded by 0.93 above]. A reviewer
+# reading PR diffs wants long context, so this is the first number to revisit
+# if reviews start truncating.
+#
+# No --enable-auto-tool-choice / --tool-call-parser here: vLLM 0.28 ships a
+# nemotron_v3 REASONING parser but no Nemotron TOOL parser. The reviewer runs
+# without tool-calling and returns findings via guided/structured output
+# instead, which the script's author notes is the better shape for a
+# reviewer anyway -- a fixed findings schema beats free-form tool calls for
+# this job. Do not add a tool-call-parser flag here to "match" dev; there
+# isn't one for this model in this vLLM version.
+
+# Readiness: identical mechanism and identical 420s grace period to
+# fleet-gpu-mode-dev.service -- see that file for the full readiness
+# discussion, the honest gap on podman 4.3.1 (unit "active" != model healthy),
+# and what happens on a health-check failure (kill, then Restart= decides).
+
+# ENCODING preempt_autodev: false. THIS is the directive that encodes it.
+#
+# config/model-router.json's pool block sets "preempt_autodev": false
+# (docs/goals/conversion.md G-UNIT-1): review must never reclaim a card
+# autodev is using. Restart=no is the direct, structural expression of that.
+#
+# Consider what Restart=on-failure (or =always) would do here instead: review
+# crashes -- OOM, a bad request storm, a driver hiccup, doesn't matter --
+# and systemd immediately re-execs `podman run`, re-acquiring the CDI device
+# and the port before anyone decided it should. The fleet's actual recovery
+# path for a crashed review container is to hand the card BACK to dev -- a
+# decision an operator or the model-router makes, not one review is entitled
+# to veto by resurrecting itself first. An auto-restarting review unit wins
+# that race every time it fires: it reasserts its own claim on the GPU before
+# `systemctl start fleet-gpu-mode-dev.service` can run, and even though
+# Conflicts= would eventually tear it back down again once dev DOES start,
+# every such cycle is a preempt_autodev:false violation in miniature -- review
+# holding VRAM autodev should have -- and turns one clean, visible failure
+# into a restart storm an operator has to notice and interrupt by hand.
+#
+# Restart=no means: review crashes ONCE, stays down, and the card sits idle
+# -- visibly `systemctl status`-failed, not silently retrying -- until
+# something explicitly starts a mode again. That "something" defaults to
+# giving the card back to dev, precisely because review never gets to
+# nominate itself. This is a STRONGER guarantee than the script's own
+# behaviour: fleet-gpu-mode's cmd_set actively rolls back to whatever mode was
+# previously active on a health-check timeout, which is more convenient but
+# means the script itself briefly holds and then must release the card during
+# its own rollback attempt. A statically-declared Restart=no can't roll back
+# to "whatever was previously active" at all -- systemd units have no notion
+# of history -- so this can't reproduce that convenience. It reproduces the
+# half of it that preempt_autodev actually requires: review is structurally
+# incapable of re-claiming the card on its own. See the note at the bottom of
+# fleet-gpu-mode-free.service for the rollback gap stated plainly.
+#
+# QUADLET UPGRADE PATH: identical to fleet-gpu-mode-dev.service's -- podman
+# >= 4.4 for Quadlet itself (Debian 12 ships 4.3.1, no backport), podman
+# >= 5.0 for Notify=healthy to close the "active but not yet healthy" gap
+# above (Debian 13 trixie ships 5.4.2). The [Container] block is the same
+# shape with this file's Exec=/gpu-memory-utilization/max-model-len values
+# substituted in, ContainerName=fleet-vllm-deep unchanged, and Restart= moves
+# to Quadlet's own [Service] Restart=no pass-through -- preempt_autodev's
+# encoding does not change with the upgrade, only the file format does.
