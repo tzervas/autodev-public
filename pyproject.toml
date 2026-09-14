@@ -9,6 +9,7 @@ description = "Self-hosted autodev harness (loop, lab, Forgejo). Not CogSynDelta
 requires-python = ">=3.12,<3.14"
 license = {text = "MIT"}
 dependencies = [
+    "cvss>=3.6",
     "textual>=8.2.8",
 ]
 

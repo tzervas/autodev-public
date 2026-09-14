@@ -605,7 +605,7 @@ def test_a_cvss_vector_is_scored_not_guessed(tmp_path, monkeypatch):
     """
     mod = load_scan()
     vector = "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:C/C:L/I:L/A:L"
-    assert mod.cvss3_base_score(vector) == 6.8
+    assert mod.cvss_base_score(vector) == 6.8
     install(mod, monkeypatch, {"osv-scanner"}, {"osv-scanner": (1, osv_out(vector))})
     res = mod.scan(tmp_path, POLICY, "merge")
     assert res["findings"][0]["severity"] == "medium"
@@ -620,7 +620,25 @@ def test_a_critical_cvss_vector_blocks_the_merge_gate(tmp_path, monkeypatch):
     """
     mod = load_scan()
     vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
-    assert mod.cvss3_base_score(vector) == 10.0
+    assert mod.cvss_base_score(vector) == 10.0
+    install(mod, monkeypatch, {"osv-scanner"}, {"osv-scanner": (1, osv_out(vector))})
+    res = mod.scan(tmp_path, POLICY, "merge")
+    assert res["findings"][0]["severity"] == "critical"
+    assert ids(res) == ["OSV-FAKE-1"]
+
+
+def test_a_cvss4_vector_is_scored_now_that_the_maths_is_not_ours(tmp_path, monkeypatch):
+    """v4 was declined while the arithmetic was hand-written. It no longer is.
+
+    The reason for skipping v4 was that a wrong score is worse than no score --
+    a sound judgement about code we would have had to write from the spec, and
+    not a reason to refuse a scored standard with a maintained implementation.
+    This vector scores 9.9, a critical, and used to fall back to medium and sit
+    in the release gate instead of blocking the merge.
+    """
+    mod = load_scan()
+    vector = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:N"
+    assert mod.cvss_base_score(vector) == 9.9
     install(mod, monkeypatch, {"osv-scanner"}, {"osv-scanner": (1, osv_out(vector))})
     res = mod.scan(tmp_path, POLICY, "merge")
     assert res["findings"][0]["severity"] == "critical"
@@ -628,14 +646,16 @@ def test_a_critical_cvss_vector_blocks_the_merge_gate(tmp_path, monkeypatch):
 
 
 def test_an_unscoreable_severity_falls_back_to_medium(tmp_path, monkeypatch):
-    """CVSS:4.0 is not attempted, and the fallback must not be "clean".
+    """A vector that does not parse must not read as "clean".
 
-    A wrong score is worse than no score, but a dropped finding is worse than
-    both: defaulting to medium keeps it in the release gate where a human has
-    to look at it.
+    `CVSS:4.0/AV:N/AC:L` is a MALFORMED v4 vector -- v4 mandates AT, VC, VI,
+    VA, SC, SI and SA, and this has none of them -- so it is unscoreable even
+    now that v4 is attempted. That is the case this guards: a wrong score is
+    worse than no score, but a dropped finding is worse than both. Defaulting
+    to medium keeps it in the release gate where a human has to look at it.
     """
     mod = load_scan()
-    assert mod.cvss3_base_score("CVSS:4.0/AV:N/AC:L") is None
+    assert mod.cvss_base_score("CVSS:4.0/AV:N/AC:L") is None
     install(
         mod,
         monkeypatch,
