@@ -20,10 +20,17 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "csd-autodev-loop"
 
+# EVERY PAIR HERE MUST HAVE from != to, and test_no_fixture_pair_is_degenerate
+# below enforces it. This fixture arrived from csd-publish with both sides of
+# both pairs collapsed onto one placeholder -- two distinct originals mapped to
+# the same replacement -- which made it a no-op substitution and made the
+# assertions downstream read `X in after` AND `X not in after`. The values are
+# config/fleet.example.json's own (hosts.primary -> hosts.secondary, RFC 5737)
+# and RFC 2606's reserved example.net, so nothing here is a real address.
 REPLY = """SUBSTITUTIONS: docs/EVENT-DRIVEN.md
 ```
-203.0.113.10 => 203.0.113.10
-git.example.com => git.example.com
+203.0.113.10 => 203.0.113.11
+git.example.com => forge.example.net
 ```
 """
 
@@ -37,13 +44,38 @@ def load() -> Any:
     return mod
 
 
+def test_no_fixture_pair_is_degenerate() -> None:
+    """Every from/to pair in every fixture here must actually change something.
+
+    THE TRIPWIRE. These fixtures are published through csd-publish, which
+    rewrites identifiers on the way out. It verifies that no ORIGINAL survives;
+    until G-PUBLISH-1 it did not verify that DISTINCT originals stayed distinct.
+    Two of them landed on one placeholder, which turned both pairs below into
+    `X => X` and left two assertions reading `X in after` AND `X not in after`.
+    Those failed loudly, which was luck: BLOCK_REPLY's pair collapsed the same
+    way and its test went GREEN AND VACUOUS, because `assert subs[k] == k`
+    cannot detect a parser that swapped the two sides -- the only thing "neither
+    may swallow the other" exists to catch.
+
+    A degenerate pair is not a wrong value, it is a fixture that has stopped
+    testing anything. This asserts the property directly, so the next collapse
+    is one red test naming the pair rather than a silent loss of coverage.
+    """
+    mod = load()
+    for name, reply in (("REPLY", REPLY), ("BLOCK_REPLY", BLOCK_REPLY)):
+        pairs = mod.extract_json(reply)["substitutions"]
+        assert pairs, f"{name} parsed to no substitutions at all"
+        for frm, to in pairs:
+            assert frm != to, f"{name}: degenerate pair {frm!r} => {to!r}"
+
+
 def test_a_substitution_reply_parses() -> None:
     mod = load()
     got = mod.extract_json(REPLY)
     assert got["path"] == "docs/EVENT-DRIVEN.md"
     assert got["substitutions"] == [
-        ("203.0.113.10", "203.0.113.10"),
-        ("git.example.com", "git.example.com"),
+        ("203.0.113.10", "203.0.113.11"),
+        ("git.example.com", "forge.example.net"),
     ]
 
 
@@ -70,7 +102,7 @@ def test_substituting_keeps_everything_else(tmp_path: Path) -> None:
     assert got["ok"] is True
     after = doc.read_text()
     assert len(after.splitlines()) == len(body.splitlines())
-    assert "203.0.113.10" in after and "git.example.com" in after
+    assert "203.0.113.11" in after and "forge.example.net" in after
     assert "203.0.113.10" not in after and "git.example.com" not in after
     assert "line 0" in after and "line 135" in after
 
@@ -89,8 +121,8 @@ def test_an_unmatched_pair_is_reported_not_fatal(tmp_path: Path) -> None:
 
     got = mod.apply_proposal(mod.extract_json(REPLY), tmp_path, goal="Substitute.")
     assert got["ok"] is True
-    assert doc.read_text() == "only 203.0.113.10 here\n"
-    assert got["substituted"] == [{"from": "203.0.113.10", "to": "203.0.113.10", "n": 1}]
+    assert doc.read_text() == "only 203.0.113.11 here\n"
+    assert got["substituted"] == [{"from": "203.0.113.10", "to": "203.0.113.11", "n": 1}]
 
 
 def test_when_nothing_matches_it_is_refused(tmp_path: Path) -> None:
@@ -230,7 +262,7 @@ BLOCK_REPLY = """SUBSTITUTIONS: docs/ARCHITECTURE.md
 ===TO
 - `shrink_check` — Refuses a whole-file write that deletes most of a file.
 >>>
-203.0.113.10 => 203.0.113.10
+203.0.113.10 => 203.0.113.11
 ```
 """
 
@@ -255,7 +287,7 @@ def test_block_and_line_forms_mix() -> None:
     """One reply may need both; neither may swallow the other."""
     mod = load()
     subs = dict(mod.extract_json(BLOCK_REPLY)["substitutions"])
-    assert subs.get("203.0.113.10") == "203.0.113.10"
+    assert subs.get("203.0.113.10") == "203.0.113.11"
     assert len(subs) == 2
 
 
@@ -278,7 +310,15 @@ def test_a_block_edit_keeps_the_rest_of_the_file(tmp_path: Path) -> None:
     assert "deletes most of a file" in after
     assert "introduce bloat" not in after
     assert "keep me" in after and "keep me too" in after
-    assert "203.0.113.10" in after
+    # The line-form pair in BLOCK_REPLY applies here too, so the trailing line
+    # is REWRITTEN rather than preserved. This read `"203.0.113.10" in after`
+    # and passed only because the pair was degenerate: from == to made "the
+    # substitution applied" and "the line was untouched" indistinguishable.
+    # What the test means to prove is that a block edit leaves the rest of the
+    # file intact, so it asserts both halves now -- the old value is gone and
+    # the new one is in its place, on a line the block never named.
+    assert "203.0.113.10" not in after
+    assert "203.0.113.11" in after
 
 
 def test_an_unterminated_block_is_still_read(tmp_path: Path) -> None:
